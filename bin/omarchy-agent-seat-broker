@@ -8,10 +8,12 @@
 # Hyprland. It forwards their windows to Hyprland untouched, so they are real
 # windows in the user's session, but it owns their input:
 #
-# - Events from the user's seat (the physical mouse and keyboard) are dropped,
-#   and the agent's pointer and keyboard are delivered in their place. Every
-#   app still sees exactly one ordinary seat, so apps that only ever bind the
-#   first seat (Chromium, Electron, Kitty) work.
+# - The agent gets its own pointer and keyboard, delivered by the broker, which
+#   reach nothing but agent apps. The user's own mouse and keyboard still work
+#   on agent windows too, at the same time: the broker moves each app's focus
+#   between the two as they act. Every app still sees exactly one ordinary
+#   seat, so apps that only ever bind the first seat (Chromium, Electron,
+#   Kitty) work.
 # - Only an allowlist of globals is advertised. Agent apps cannot inject
 #   input, capture the screen, read the clipboard, list windows, draw overlays
 #   or steal focus, and binding a hidden global disconnects the app.
@@ -22,6 +24,7 @@
 # reach and that is never mounted into the sandbox.
 
 import array
+import collections
 import ctypes
 import ctypes.util
 import glob
@@ -253,9 +256,8 @@ class Channel:
 class Keymap:
   """A compiled XKB keymap plus the reverse lookup from characters to keys."""
 
-  def __init__(self):
+  def __init__(self, text=None):
     xkb = ctypes.CDLL(ctypes.util.find_library("xkbcommon"))
-    libc = ctypes.CDLL(None)
 
     class RuleNames(ctypes.Structure):
       _fields_ = [(name, ctypes.c_char_p) for name in ("rules", "model", "layout", "variant", "options")]
@@ -263,22 +265,22 @@ class Keymap:
     xkb.xkb_context_new.restype = ctypes.c_void_p
     xkb.xkb_keymap_new_from_names.restype = ctypes.c_void_p
     xkb.xkb_keymap_new_from_names.argtypes = [ctypes.c_void_p, ctypes.POINTER(RuleNames), ctypes.c_int]
-    xkb.xkb_keymap_get_as_string.restype = ctypes.c_void_p
-    xkb.xkb_keymap_get_as_string.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    xkb.xkb_keymap_new_from_string.restype = ctypes.c_void_p
+    xkb.xkb_keymap_new_from_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
     xkb.xkb_keymap_min_keycode.argtypes = xkb.xkb_keymap_max_keycode.argtypes = [ctypes.c_void_p]
     xkb.xkb_keymap_num_levels_for_key.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
     xkb.xkb_keymap_key_get_syms_by_level.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.POINTER(ctypes.c_uint32))]
     xkb.xkb_keymap_mod_get_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     xkb.xkb_keysym_from_name.argtypes = [ctypes.c_char_p, ctypes.c_int]
     xkb.xkb_utf32_to_keysym.argtypes = [ctypes.c_uint32]
-    libc.free.argtypes = [ctypes.c_void_p]
     self.xkb = xkb
 
+    # The keymap Hyprland gives the user's keyboard, so the agent's keys mean
+    # the same thing to apps; US until Hyprland has sent one.
     context = xkb.xkb_context_new(0)
-    keymap = xkb.xkb_keymap_new_from_names(context, ctypes.byref(RuleNames(b"evdev", b"pc105", b"us", b"", b"")), 0)
-    text = xkb.xkb_keymap_get_as_string(keymap, 1)
-    self.text = ctypes.string_at(text) + b"\0"
-    libc.free(text)
+    keymap = xkb.xkb_keymap_new_from_string(context, text.rstrip(b"\0"), 1, 0) if text else None
+    keymap = keymap or xkb.xkb_keymap_new_from_names(context, ctypes.byref(RuleNames(b"evdev", b"pc105", b"us", b"", b"")), 0)
+    self.text = text
 
     self.modifiers = {name: 1 << xkb.xkb_keymap_mod_get_index(keymap, xkb_name) for name, xkb_name in (("shift", b"Shift"), ("ctrl", b"Control"), ("alt", b"Mod1"), ("super", b"Mod4"))}
     self.keys = {}
@@ -287,11 +289,6 @@ class Keymap:
       for level in range(min(2, xkb.xkb_keymap_num_levels_for_key(keymap, keycode, 0))):
         for index in range(xkb.xkb_keymap_key_get_syms_by_level(keymap, keycode, 0, level, ctypes.byref(syms))):
           self.keys.setdefault(syms[index], (keycode - 8, level))
-
-  def fd(self):
-    fd = os.memfd_create("agent-seat-keymap", os.MFD_CLOEXEC)
-    os.write(fd, self.text)
-    return fd
 
   def for_char(self, char):
     return self.keys.get(self.xkb.xkb_utf32_to_keysym(ord(char)))
@@ -339,16 +336,14 @@ class Client:
     self.advertised = {}
     self.placeholders = set()  # objects that only exist between the app and the broker
     self.standins = set()  # wl_callbacks that hold their ids upstream until Hyprland frees them
-    self.pointers, self.keyboards = set(), set()
+    self.pointers, self.keyboards = {}, {}  # object -> the surface this app believes it is focused on
     self.surfaces, self.regions, self.buffers, self.pools = {}, {}, {}, {}
     self.roles = {}  # role object (subsurface, viewport, xdg_surface, toplevel, popup) -> surface id or xdg surface id
     self.xdg_surfaces = {}  # xdg_surface -> {"surface", "geometry", "popups"}
     self.toplevels = {}  # xdg_toplevel -> {"xdg", "window", "title", "app_id"}
     self.popups = {}  # xdg_popup -> {"xdg", "parent", "position"}
-    # What the user's seat last told this app, replayed when the user takes control.
-    self.user_keymap = None
-    self.user_keyboard_focus = None
-    self.user_pointer_focus = None
+    self.user_keyboard = None  # where the user's seat has keyboard focus in this app
+    self.user_pointer = None  # (surface, x, y) of the user's pointer in this app
 
   # Plumbing
 
@@ -432,39 +427,36 @@ class Client:
     return False
 
   def request_wl_seat_get_pointer(self, _, args):
-    self.pointers.add(args[0])
+    self.pointers[args[0]] = None
     return True
 
   def request_wl_seat_get_keyboard(self, _, args):
     keyboard = args[0]
-    self.keyboards.add(keyboard)
-    self.send_event(keyboard, "keymap", 1, self.broker.keymap.fd(), len(self.broker.keymap.text))
-    if self.objects[keyboard][1] >= 4:
-      self.send_event(keyboard, "repeat_info", 0, 0)
+    self.keyboards[keyboard] = None
     return True
 
   def find_request(self, interface, name, object_id):
     opcode, (_, signature, _) = next((i, m) for i, m in enumerate(PROTOCOLS[interface]["requests"]) if m[0] == name)
     return object_id, opcode, signature
 
-  # These carry a serial from an input event. The agent's serials mean nothing
-  # to Hyprland (popups still work without a grab), so they only go through
-  # while the user has taken control and the serials are Hyprland's own.
+  # These carry the serial of an input event. Only serials from the user's
+  # seat mean anything to Hyprland; the agent's stay with the broker (popups
+  # work without a grab).
 
-  def request_wl_pointer_set_cursor(self, *_):
-    return self.broker.user_control
+  def request_wl_pointer_set_cursor(self, _, args):
+    return args[0] in self.broker.user_serials
 
-  def request_xdg_popup_grab(self, *_):
-    return self.broker.user_control
+  def request_xdg_popup_grab(self, _, args):
+    return args[1] in self.broker.user_serials
 
-  def request_xdg_toplevel_move(self, *_):
-    return self.broker.user_control
+  def request_xdg_toplevel_move(self, _, args):
+    return args[1] in self.broker.user_serials
 
-  def request_xdg_toplevel_resize(self, *_):
-    return self.broker.user_control
+  def request_xdg_toplevel_resize(self, _, args):
+    return args[1] in self.broker.user_serials
 
-  def request_xdg_toplevel_show_window_menu(self, *_):
-    return self.broker.user_control
+  def request_xdg_toplevel_show_window_menu(self, _, args):
+    return args[1] in self.broker.user_serials
 
   def request_xdg_toplevel_set_app_id(self, toplevel, args):
     window = self.toplevels[toplevel]
@@ -574,8 +566,8 @@ class Client:
     handler = getattr(self, f"event_{interface}_{name}", None)
     result = handler(object_id, args) if handler else True
 
-    if interface in ("wl_pointer", "wl_keyboard", "wl_touch") and not self.broker.user_control:
-      result = False  # the user's seat only reaches agent apps once the user takes control
+    if interface == "wl_pointer" and name not in ("enter", "leave", "motion") and self.user_pointer:
+      self.focus_pointer(object_id, *self.user_pointer)  # the agent may have moved this app's focus
 
     if result is True:
       self.down.queue(*encode(object_id, opcode, signature, args))
@@ -619,57 +611,80 @@ class Client:
     args[2] = array.array("I", states + [XDG_STATE_ACTIVATED]).tobytes()
     return True
 
+  # The user's seat. Events pass through, but each app's focus follows whoever
+  # acted last, so the broker re-enters the user's surface when needed.
+
   def event_wl_keyboard_keymap(self, _, args):
-    self.user_keymap = (args[0], os.pread(args[1], args[2], 0))
+    self.broker.adopt_keymap(os.pread(args[1], args[2], 0))
     return True
 
-  def event_wl_keyboard_enter(self, _, args):
-    self.user_keyboard_focus = args[1]
+  def event_wl_keyboard_enter(self, keyboard, args):
+    self.broker.user_serials.append(args[0])
+    self.user_keyboard = args[1]
+    self.focus_keyboard(keyboard, args[1], args[0])
+    return False
+
+  def event_wl_keyboard_leave(self, keyboard, args):
+    self.user_keyboard = None
+    if self.keyboards.get(keyboard) != args[1]:
+      return False
+    self.keyboards[keyboard] = None
     return True
 
-  def event_wl_keyboard_leave(self, _, args):
-    self.user_keyboard_focus = None
+  def event_wl_keyboard_key(self, keyboard, args):
+    self.broker.user_serials.append(args[0])
+    if self.user_keyboard:
+      self.focus_keyboard(keyboard, self.user_keyboard)
+    return self.keyboards.get(keyboard) is not None
+
+  def event_wl_keyboard_modifiers(self, keyboard, args):
+    return self.event_wl_keyboard_key(keyboard, args)
+
+  def event_wl_pointer_enter(self, pointer, args):
+    self.broker.user_serials.append(args[0])
+    self.user_pointer = (args[1], args[2], args[3])
+    self.focus_pointer(pointer, *self.user_pointer, args[0])
+    return False
+
+  def event_wl_pointer_leave(self, pointer, args):
+    self.user_pointer = None
+    if self.pointers.get(pointer) != args[1]:
+      return False
+    self.pointers[pointer] = None
     return True
 
-  def event_wl_pointer_enter(self, _, args):
-    self.user_pointer_focus = (args[1], args[2], args[3])
+  def event_wl_pointer_motion(self, pointer, args):
+    if self.user_pointer:
+      self.user_pointer = (self.user_pointer[0], args[1], args[2])
+      self.focus_pointer(pointer, *self.user_pointer)
     return True
 
-  def event_wl_pointer_motion(self, _, args):
-    if self.user_pointer_focus:
-      self.user_pointer_focus = (self.user_pointer_focus[0], args[1], args[2])
+  def event_wl_pointer_button(self, _, args):
+    self.broker.user_serials.append(args[0])
     return True
 
-  def event_wl_pointer_leave(self, _, args):
-    self.user_pointer_focus = None
+  def focus_keyboard(self, keyboard, surface, serial=None):
+    """Move one keyboard's focus to surface, leaving the old surface first."""
+    current = self.keyboards.get(keyboard)
+    if current == surface:
+      return
+    if current in self.surfaces:
+      self.send_event(keyboard, "leave", self.broker.next_serial(), current)
+    self.keyboards[keyboard] = surface if surface in self.surfaces else None
+    if self.keyboards[keyboard]:
+      self.send_event(keyboard, "enter", serial or self.broker.next_serial(), surface, b"")
+
+  def focus_pointer(self, pointer, surface, x, y, serial=None):
+    """Move one pointer's focus to surface; True when it had to enter."""
+    current = self.pointers.get(pointer)
+    if current == surface:
+      return False
+    if current in self.surfaces:
+      self.send_event(pointer, "leave", self.broker.next_serial(), current)
+    self.pointers[pointer] = surface if surface in self.surfaces else None
+    if self.pointers[pointer]:
+      self.send_event(pointer, "enter", serial or self.broker.next_serial(), surface, x, y)
     return True
-
-  def hand_over(self, to_user):
-    """Switch this app between the agent's input and the user's, as if focus moved."""
-    keyboard_focus = self.user_keyboard_focus if self.user_keyboard_focus in self.surfaces else None
-    pointer_focus = self.user_pointer_focus if self.user_pointer_focus and self.user_pointer_focus[0] in self.surfaces else None
-
-    if to_user:
-      keymap = self.user_keymap or (1, self.broker.keymap.text)
-      for keyboard in self.keyboards:
-        fd = os.memfd_create("agent-seat-keymap", os.MFD_CLOEXEC)
-        os.write(fd, keymap[1])
-        self.send_event(keyboard, "keymap", keymap[0], fd, len(keymap[1]))
-        if keyboard_focus:
-          self.send_event(keyboard, "enter", self.broker.next_serial(), keyboard_focus, b"")
-      if pointer_focus:
-        for pointer in self.pointers:
-          self.send_event(pointer, "enter", self.broker.next_serial(), *pointer_focus)
-        self.broker.pointer_frame(self)
-    else:
-      for keyboard in self.keyboards:
-        if keyboard_focus:
-          self.send_event(keyboard, "leave", self.broker.next_serial(), keyboard_focus)
-        self.send_event(keyboard, "keymap", 1, self.broker.keymap.fd(), len(self.broker.keymap.text))
-      if pointer_focus:
-        for pointer in self.pointers:
-          self.send_event(pointer, "leave", self.broker.next_serial(), pointer_focus[0])
-        self.broker.pointer_frame(self)
 
   def event_xdg_popup_configure(self, popup, args):
     self.popups[popup]["position"] = (args[0], args[1])
@@ -679,8 +694,8 @@ class Client:
     self.objects.pop(object_id, None)
     for table in (self.surfaces, self.regions, self.buffers, self.pools, self.roles, self.xdg_surfaces, self.popups):
       table.pop(object_id, None)
-    self.pointers.discard(object_id)
-    self.keyboards.discard(object_id)
+    self.pointers.pop(object_id, None)
+    self.keyboards.pop(object_id, None)
     if object_id in self.toplevels:
       self.broker.remove_window(self.toplevels.pop(object_id)["window"])
 
@@ -788,10 +803,8 @@ class Broker:
     self.clients = []
     self.windows = {}
     self.next_window = 1
-    self.serial = 1
-    self.pointer_focus = None  # (client, surface)
-    self.keyboard_focus = None
-    self.user_control = False
+    self.serial = 0x40000000  # kept apart from Hyprland's serials
+    self.user_serials = collections.deque(maxlen=256)  # recent serials from the user's seat
     self.stopping = False
     self.captures = {}  # window -> (left, top, scale) of its last screenshot
 
@@ -853,10 +866,6 @@ class Broker:
         pass
     for window in [w for w, (c, _) in self.windows.items() if c is client]:
       self.remove_window(window)
-    if self.pointer_focus and self.pointer_focus[0] is client:
-      self.pointer_focus = None
-    if self.keyboard_focus and self.keyboard_focus[0] is client:
-      self.keyboard_focus = None
     client.close()
     self.clients.remove(client)
 
@@ -910,8 +919,6 @@ class Broker:
   def window(self, window):
     if int(window) not in self.windows:
       raise ValueError(f"no agent window {window}")
-    if self.user_control:
-      raise ValueError("the user has taken control of the agent seat")
     return self.windows[int(window)]
 
   def hyprland_windows(self):
@@ -958,18 +965,11 @@ class Broker:
     return any(client.xdg_surfaces.get(popup["xdg"], {}).get("surface") == surface for popup in client.popups.values())
 
   def do_status(self):
-    return {"pid": os.getpid(), "control": "user" if self.user_control else "agent", "apps": len(self.clients), "windows": len(self.windows)}
+    return {"pid": os.getpid(), "apps": len(self.clients), "windows": len(self.windows)}
 
-  def do_control(self, user=None):
-    user = not self.user_control if user is None else bool(user)
-    if user != self.user_control:
-      if user:
-        self.leave_pointer()
-        self.leave_keyboard()
-      self.user_control = user
-      for client in self.clients:
-        client.hand_over(user)
-    return self.do_status()
+  def adopt_keymap(self, text):
+    if text != self.keymap.text:
+      self.keymap = Keymap(text)
 
   def do_stop(self):
     self.stopping = True
@@ -977,40 +977,21 @@ class Broker:
   def do_focus(self, window):
     client, toplevel = self.window(window)
     surface = client.xdg_surfaces[client.toplevels[toplevel]["xdg"]]["surface"]
-    if self.keyboard_focus == (client, surface):
-      return
-    self.leave_keyboard()
-    self.keyboard_focus = (client, surface)
     for keyboard in client.keyboards:
-      client.send_event(keyboard, "enter", self.next_serial(), surface, b"")
-      client.send_event(keyboard, "modifiers", self.next_serial(), 0, 0, 0, 0)
-
-  def leave_keyboard(self):
-    if self.keyboard_focus:
-      client, surface = self.keyboard_focus
-      if surface in client.surfaces:
-        for keyboard in client.keyboards:
-          client.send_event(keyboard, "leave", self.next_serial(), surface)
-      self.keyboard_focus = None
+      if client.keyboards[keyboard] != surface:
+        client.focus_keyboard(keyboard, surface)
+        client.send_event(keyboard, "modifiers", self.next_serial(), 0, 0, 0, 0)
+    return client
 
   def pointer_frame(self, client):
     for pointer in client.pointers:
       if client.objects[pointer][1] >= 5:
         client.send_event(pointer, "frame")
 
-  def leave_pointer(self):
-    if self.pointer_focus:
-      client, surface = self.pointer_focus
-      if surface in client.surfaces:
-        for pointer in client.pointers:
-          client.send_event(pointer, "leave", self.next_serial(), surface)
-        self.pointer_frame(client)
-      self.pointer_focus = None
-
   # Pointer coordinates are pixels of the window's screenshot.
 
   def do_move(self, window, x, y):
-    self.move(window, *self.to_logical(window, x, y))
+    return self.move(window, *self.to_logical(window, x, y))
 
   def move(self, window, x, y):
     client, toplevel = self.window(window)
@@ -1019,20 +1000,15 @@ class Broker:
       raise ValueError(f"nothing to point at there in window {window}")
     surface, lx, ly = target
 
-    if self.pointer_focus != (client, surface):
-      self.leave_pointer()
-      for pointer in client.pointers:
-        client.send_event(pointer, "enter", self.next_serial(), surface, lx, ly)
-      self.pointer_focus = (client, surface)
-    else:
-      for pointer in client.pointers:
+    for pointer in client.pointers:
+      if not client.focus_pointer(pointer, surface, lx, ly):
         client.send_event(pointer, "motion", self.now(), lx, ly)
     self.pointer_frame(client)
+    return client
 
   def do_click(self, window, x, y, button="left", double=False):
-    self.do_move(window, x, y)
+    client = self.do_move(window, x, y)
     self.do_focus(window)
-    client = self.pointer_focus[0]
     for _ in range(2 if double else 1):
       for state in (1, 0):
         for pointer in client.pointers:
@@ -1041,8 +1017,7 @@ class Broker:
 
   def do_drag(self, window, x1, y1, x2, y2, button="left", steps=12):
     x1, y1, x2, y2 = self.to_logical(window, x1, y1, x2, y2)
-    self.move(window, x1, y1)
-    client = self.pointer_focus[0]
+    client = self.move(window, x1, y1)
     for pointer in client.pointers:
       client.send_event(pointer, "button", self.next_serial(), self.now(), BUTTONS[button], 1)
     self.pointer_frame(client)
@@ -1053,8 +1028,7 @@ class Broker:
     self.pointer_frame(client)
 
   def do_scroll(self, window, x, y, dy=0, dx=0):
-    self.do_move(window, x, y)
-    client = self.pointer_focus[0]
+    client = self.do_move(window, x, y)
     for axis, notches in ((0, dy), (1, dx)):
       if not notches:
         continue
@@ -1079,8 +1053,7 @@ class Broker:
       self.send_modifiers(client, 0)
 
   def do_type(self, window, text):
-    self.do_focus(window)
-    client = self.keyboard_focus[0]
+    client = self.do_focus(window)
     missing = [char for char in text if not self.keymap.for_char(char)]
     if missing:
       raise ValueError(f"cannot type {''.join(sorted(set(missing)))!r} with the agent keymap")
@@ -1089,8 +1062,7 @@ class Broker:
       self.tap(client, key, self.keymap.modifiers["shift"] if level else 0)
 
   def do_key(self, window, combo):
-    self.do_focus(window)
-    client = self.keyboard_focus[0]
+    client = self.do_focus(window)
     *modifiers, name = combo.split("+")
     unknown = [m for m in modifiers if m.lower() not in self.keymap.modifiers]
     if unknown:

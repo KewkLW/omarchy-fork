@@ -1,7 +1,9 @@
 #!/bin/bash
 
-# omarchy:summary=Show whether the agent seat is running and who controls it
+# omarchy:summary=Show whether the agent seat is running and what is on it
 # omarchy:args=[--json]
+
+# Exits non-zero when the seat is stopped, so it can guard menu entries.
 
 if ! status=$(omarchy-agent-seat-broker call '{"command":"status"}' 2>/dev/null); then
   status='{"running": false}'
@@ -12,7 +14,9 @@ fi
 if [[ $1 == "--json" ]]; then
   echo "$status"
 elif [[ $(jq -r '.running' <<<"$status") == "true" ]]; then
-  jq -r '"Agent seat: running\n  control:  \(.control)\n  apps:     \(.apps)\n  windows:  \(.windows)"' <<<"$status"
+  jq -r '"Agent seat: running\n  apps:     \(.apps)\n  windows:  \(.windows)"' <<<"$status"
 else
   echo "Agent seat: stopped"
 fi
+
+[[ $(jq -r '.running' <<<"$status") == "true" ]]

@@ -4,6 +4,7 @@ source "$(dirname "$0")/base-test.sh"
 
 require_command python3
 require_command jq
+require_command xkbcli
 
 test_dir=$(mktemp -d)
 mkdir -p "$test_dir/bin" "$test_dir/runtime"
@@ -62,7 +63,7 @@ EOF
 # device manager and a virtual pointer manager, answers wl_display.sync,
 # plays a user pointer entering every surface it can, and logs what reaches it.
 cat >"$test_dir/compositor.py" <<'EOF'
-import os, socket, struct, sys
+import array, os, socket, struct, subprocess, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from wire import Connection, message, string, read_string
 
@@ -102,15 +103,27 @@ while True:
             # The user's pointer arrives: this must never reach an agent app.
             conn.send(message(pointer, 2, struct.pack("<Iii", 0, 256, 256)))
         elif kind == "wl_seat" and opcode == 1:
-            objects[struct.unpack("<I", body)[0]] = "wl_keyboard"
+            keyboard = struct.unpack("<I", body)[0]
+            objects[keyboard] = "wl_keyboard"
+            keymap = subprocess.run(["xkbcli", "compile-keymap", "--layout", "us"], capture_output=True).stdout + b"\0"
+            fd = os.memfd_create("keymap")
+            os.write(fd, keymap)
+            conn.sock.sendmsg([message(keyboard, 0, struct.pack("<II", 1, len(keymap)))], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))])
+            os.close(fd)
         elif kind == "wl_compositor" and opcode == 0:
-            objects[struct.unpack("<I", body)[0]] = "wl_surface"
+            surface = struct.unpack("<I", body)[0]
+            objects[surface] = "wl_surface"
         elif kind == "xdg_wm_base" and opcode == 2:
             objects[struct.unpack_from("<I", body)[0]] = "xdg_surface"
         elif kind == "xdg_surface" and opcode == 1:
             objects[struct.unpack("<I", body)[0]] = "xdg_toplevel"
         elif kind == "xdg_toplevel" and opcode == 3:
-            log.write(f"app_id {read_string(body)}\n")
+            app_id = read_string(body)
+            log.write(f"app_id {app_id}\n")
+            if "." in app_id:
+                # The user clicks into the agent window and presses a key.
+                conn.send(message(keyboard, 1, struct.pack("<II", 900, surface) + struct.pack("<I", 0)))
+                conn.send(message(keyboard, 3, struct.pack("<IIII", 901, 0, 30, 1)) + message(keyboard, 3, struct.pack("<IIII", 902, 0, 30, 0)))
         elif kind == "wl_data_device_manager" and opcode == 1:
             log.write("get_data_device\n")
 EOF
@@ -164,10 +177,8 @@ elif step == "seat":
             print("capabilities", struct.unpack("<I", body)[0])
         if object_id == 4 and opcode == 1:
             print("name", read_string(body))
-    conn.send(message(4, 0, struct.pack("<I", 6)) + message(4, 1, struct.pack("<I", 7)))
+    conn.send(message(4, 1, struct.pack("<I", 7)))
     for object_id, opcode, body in roundtrip(8):
-        if object_id == 6:
-            print("user pointer event reached the app")
         if object_id == 7 and opcode == 0:
             print("keymap with fd" if conn.fds else "keymap without fd")
 
@@ -182,14 +193,25 @@ elif step == "window":
     conn.send(message(10, 1, struct.pack("<I", 11)))  # toplevel
     conn.send(message(11, 3, string("foot")))  # set_app_id
     conn.send(message(7, 1, struct.pack("<II", 12, 4)))  # data device
-    roundtrip(13)
+    early = roundtrip(13)
     print("ready", flush=True)
-    keys = 0
-    while (msg := conn.read(timeout=5)) is not None:
-        if msg[0] == 8 and msg[1] == 3:
-            keys += 1
-            if keys == 2:
-                print("agent key reached the app", flush=True)
+    focused, keys = False, []
+
+    def events():
+        yield from early
+        while (msg := conn.read(timeout=5)) is not None:
+            yield msg
+
+    for object_id, opcode, body in events():
+        if object_id == 8 and opcode == 1:
+            focused = True
+        elif object_id == 8 and opcode == 2:
+            focused = False
+        elif object_id == 8 and opcode == 3:
+            serial, _, key, state = struct.unpack("<IIII", body)
+            keys.append((serial < 0x40000000, key, state, focused))
+            if len(keys) in (2, 4):
+                print(" ".join(f"{'user' if user else 'agent'}:{key}:{state}:{'focused' if focus else 'unfocused'}" for user, key, state, focus in keys[-2:]), flush=True)
 EOF
 
 run_broker() {
@@ -221,10 +243,8 @@ seat=$(python3 "$test_dir/app.py" "$socket" seat)
 grep -q "capabilities 3" <<<"$seat" || fail "seat offers the agent's pointer and keyboard" "$seat"
 grep -q "name agent" <<<"$seat" || fail "seat is named agent" "$seat"
 pass "seat is the agent's"
-grep -q "user pointer event" <<<"$seat" && fail "user seat input never reaches agent apps" "$seat"
-pass "user seat input never reaches agent apps"
-grep -q "keymap with fd" <<<"$seat" || fail "agent keyboard gets the broker's keymap" "$seat"
-pass "agent keyboard gets the broker's keymap"
+grep -q "keymap with fd" <<<"$seat" || fail "agent apps get the user's keymap" "$seat"
+pass "agent apps get the user's keymap"
 
 coproc APP { python3 "$test_dir/app.py" "$socket" window; }
 read -r -t 5 ready <&"${APP[0]}"
@@ -241,16 +261,15 @@ windows=$(run_broker omarchy-agent-seat-windows)
 [[ $(jq -r '.[0].app_id' <<<"$windows") == "foot" ]] || fail "windows lists the agent window" "$windows"
 pass "windows lists the agent window"
 
+read -r -t 5 typed <&"${APP[0]}"
+[[ $typed == "user:30:1:focused user:30:0:focused" ]] || fail "the user's keys reach agent apps" "$typed"
+pass "the user's keys reach agent apps"
+
 run_broker omarchy-agent-seat-type 1 "x" || fail "agent can type into its window"
 read -r -t 5 typed <&"${APP[0]}"
-[[ $typed == "agent key reached the app" ]] || fail "agent keystrokes reach the app"
-pass "agent keystrokes reach the app"
+[[ $typed == "agent:45:1:focused agent:45:0:focused" ]] || fail "agent keystrokes reach the app alongside the user's" "$typed"
+pass "agent keystrokes reach the app alongside the user's"
 
-run_broker omarchy-agent-seat-broker call '{"command":"control","args":{"user":true}}' >/dev/null
-run_broker omarchy-agent-seat-type 1 "x" 2>/dev/null && fail "agent input is refused while the user has control"
-pass "agent input is refused while the user has control"
-
-run_broker omarchy-agent-seat-broker call '{"command":"control","args":{"user":false}}' >/dev/null
 run_broker omarchy-agent-seat-type 1 "é" 2>/dev/null && fail "untypeable text is refused"
 run_broker omarchy-agent-seat-type 1 --key hyper+x 2>/dev/null && fail "unknown modifiers are refused"
 pass "bad keys are refused"
