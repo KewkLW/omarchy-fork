@@ -56,6 +56,14 @@ sandbox=(
   --setenv GDK_BACKEND wayland --setenv QT_QPA_PLATFORM wayland --setenv ELECTRON_OZONE_PLATFORM_HINT wayland
 )
 
+# Apps installed outside /usr (an AppImage-style bundle under ~/.local/opt)
+# get their own directory mounted read-only.
+executable=$(realpath -e "$(type -P "$1")" 2>/dev/null)
+if [[ -n $executable && $executable != /usr/* ]]; then
+  sandbox+=(--ro-bind "$(dirname "$executable")" "$(dirname "$executable")")
+  set -- "$executable" "${@:2}"
+fi
+
 setsid -f bwrap "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1
 
 if [[ $wait_for_window == "true" ]]; then
