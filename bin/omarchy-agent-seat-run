@@ -6,8 +6,8 @@
 
 # The app runs in a bubblewrap sandbox whose only way to the desktop is the
 # agent seat broker. It gets no Hyprland IPC, no user Wayland or X11 socket, no
-# D-Bus (so no keyring and no portals), no /dev/uinput and its own home, so it
-# can neither drive nor read the user's seat.
+# D-Bus (so no keyring and no portals), no /dev/uinput, no GPU and its own
+# home, so it can neither drive nor read the user's seat.
 
 wait_for_window=true
 if [[ $1 == "--no-wait" ]]; then
@@ -43,7 +43,7 @@ sandbox=(
   --unshare-all --share-net --new-session
   --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/bin /sbin --symlink usr/lib /lib --symlink usr/lib /lib64
   --ro-bind /etc /etc --ro-bind /sys /sys --ro-bind-try /run/systemd/resolve /run/systemd/resolve
-  --proc /proc --dev /dev --dev-bind /dev/dri /dev/dri --tmpfs /dev/shm --tmpfs /tmp
+  --proc /proc --dev /dev --tmpfs /dev/shm --tmpfs /tmp
   --bind "$agent_home" "$HOME"
   --ro-bind-try "$HOME/.local/share/fonts" "$HOME/.local/share/fonts"
   --ro-bind-try "$HOME/.local/share/icons" "$HOME/.local/share/icons"
@@ -55,10 +55,6 @@ sandbox=(
   --setenv XDG_RUNTIME_DIR "$XDG_RUNTIME_DIR" --setenv WAYLAND_DISPLAY wayland-0 --setenv XDG_SESSION_TYPE wayland
   --setenv GDK_BACKEND wayland --setenv QT_QPA_PLATFORM wayland --setenv ELECTRON_OZONE_PLATFORM_HINT wayland
 )
-
-for device in /dev/nvidia*; do
-  [[ -c $device ]] && sandbox+=(--dev-bind "$device" "$device")
-done
 
 setsid -f bwrap "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1
 

@@ -26,13 +26,17 @@ import ctypes
 import ctypes.util
 import glob
 import json
+import mmap
 import os
+import re
 import selectors
 import socket
 import struct
+import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+import zlib
 
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy", "agent-seat")
 WAYLAND_SOCKET = os.path.join(RUNTIME_DIR, "wayland-0")
@@ -40,7 +44,9 @@ CONTROL_SOCKET = os.path.join(RUNTIME_DIR, "control")
 MAX_FDS_PER_MESSAGE = 28
 DEBUG = bool(os.environ.get("OMARCHY_AGENT_SEAT_DEBUG"))  # libwayland's receive limit
 
-# Everything an app needs to draw windows. Anything not listed is hidden.
+# Everything an app needs to draw windows. Anything not listed is hidden,
+# including GPU buffers: agent apps draw into shared memory, which keeps the GPU
+# out of the sandbox and lets the broker read every surface for screenshots.
 ALLOWED_GLOBALS = {
   "wl_compositor": None,
   "wl_subcompositor": None,
@@ -48,14 +54,11 @@ ALLOWED_GLOBALS = {
   "wl_output": None,
   "wl_seat": 7,
   "wl_data_device_manager": None,
-  "wl_drm": None,
   "xdg_wm_base": None,
   "xdg_wm_dialog_v1": None,
   "zxdg_output_manager_v1": None,
   "zxdg_decoration_manager_v1": None,
   "org_kde_kwin_server_decoration_manager": None,
-  "zwp_linux_dmabuf_v1": None,
-  "wp_linux_drm_syncobj_manager_v1": None,
   "wp_viewporter": None,
   "wp_fractional_scale_manager_v1": None,
   "wp_presentation": None,
@@ -298,6 +301,30 @@ class Keymap:
     return self.keys.get(self.xkb.xkb_keysym_from_name(aliases.get(name.lower(), name).encode(), 1))
 
 
+class Pool:
+  """A dup of an app's shared memory pool, kept while any buffer uses it."""
+
+  def __init__(self, fd, size):
+    self.fd, self.size = fd, size
+
+  def __del__(self):
+    os.close(self.fd)
+
+
+def write_png(path, canvas, width, height):
+  rows, rgb = bytearray(), bytearray(width * 3)
+  for y in range(height):
+    row = canvas[y * width * 4 : (y + 1) * width * 4]
+    rgb[0::3], rgb[1::3], rgb[2::3] = row[2::4], row[1::4], row[0::4]
+    rows += b"\0" + rgb
+
+  def chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+  with open(path, "wb") as png:
+    png.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(rows), 1)) + chunk(b"IEND", b""))
+
+
 # One agent app connection ------------------------------------------------------
 
 
@@ -313,11 +340,15 @@ class Client:
     self.placeholders = set()  # objects that only exist between the app and the broker
     self.standins = set()  # wl_callbacks that hold their ids upstream until Hyprland frees them
     self.pointers, self.keyboards = set(), set()
-    self.surfaces, self.regions, self.buffers, self.params = {}, {}, {}, {}
+    self.surfaces, self.regions, self.buffers, self.pools = {}, {}, {}, {}
     self.roles = {}  # role object (subsurface, viewport, xdg_surface, toplevel, popup) -> surface id or xdg surface id
     self.xdg_surfaces = {}  # xdg_surface -> {"surface", "geometry", "popups"}
     self.toplevels = {}  # xdg_toplevel -> {"xdg", "window", "title", "app_id"}
     self.popups = {}  # xdg_popup -> {"xdg", "parent", "position"}
+    # What the user's seat last told this app, replayed when the user takes control.
+    self.user_keymap = None
+    self.user_keyboard_focus = None
+    self.user_pointer_focus = None
 
   # Plumbing
 
@@ -416,20 +447,24 @@ class Client:
     opcode, (_, signature, _) = next((i, m) for i, m in enumerate(PROTOCOLS[interface]["requests"]) if m[0] == name)
     return object_id, opcode, signature
 
+  # These carry a serial from an input event. The agent's serials mean nothing
+  # to Hyprland (popups still work without a grab), so they only go through
+  # while the user has taken control and the serials are Hyprland's own.
+
   def request_wl_pointer_set_cursor(self, *_):
-    return False
+    return self.broker.user_control
 
   def request_xdg_popup_grab(self, *_):
-    return False  # needs a serial from the user's seat; popups work without it
+    return self.broker.user_control
 
   def request_xdg_toplevel_move(self, *_):
-    return False
+    return self.broker.user_control
 
   def request_xdg_toplevel_resize(self, *_):
-    return False
+    return self.broker.user_control
 
   def request_xdg_toplevel_show_window_menu(self, *_):
-    return False
+    return self.broker.user_control
 
   def request_xdg_toplevel_set_app_id(self, toplevel, args):
     window = self.toplevels[toplevel]
@@ -474,7 +509,7 @@ class Client:
     return True
 
   def request_wl_surface_attach(self, surface, args):
-    self.surfaces[surface]["pending"] = self.buffers.get(args[0], (0, 0)) if args[0] else False
+    self.surfaces[surface]["pending"] = self.buffers.get(args[0], (0, 0, None)) if args[0] else False
     return True
 
   def request_wl_surface_commit(self, surface, _):
@@ -491,20 +526,21 @@ class Client:
     self.surfaces[surface]["input"] = list(self.regions.get(args[0], [])) if args[0] else None
     return True
 
-  def request_wl_shm_pool_create_buffer(self, _, args):
-    self.buffers[args[0]] = (args[2], args[3])
+  def request_wl_shm_create_pool(self, _, args):
+    self.pools[args[0]] = Pool(os.dup(args[1]), args[2])
     return True
 
-  def request_zwp_linux_buffer_params_v1_create(self, params, args):
-    self.params[params] = (args[0], args[1])
+  def request_wl_shm_pool_resize(self, pool, args):
+    self.pools[pool].size = args[0]
     return True
 
-  def request_zwp_linux_buffer_params_v1_create_immed(self, _, args):
-    self.buffers[args[0]] = (args[1], args[2])
+  def request_wl_shm_pool_create_buffer(self, pool, args):
+    new_id, offset, width, height, stride, format = args
+    self.buffers[new_id] = (width, height, (self.pools[pool], offset, stride, format))
     return True
 
   def request_wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(self, _, args):
-    self.buffers[args[0]] = (1, 1)
+    self.buffers[args[0]] = (1, 1, None)
     return True
 
   def request_wp_viewporter_get_viewport(self, _, args):
@@ -538,8 +574,8 @@ class Client:
     handler = getattr(self, f"event_{interface}_{name}", None)
     result = handler(object_id, args) if handler else True
 
-    if interface in ("wl_pointer", "wl_keyboard", "wl_touch"):
-      result = False  # the user's seat never reaches agent apps
+    if interface in ("wl_pointer", "wl_keyboard", "wl_touch") and not self.broker.user_control:
+      result = False  # the user's seat only reaches agent apps once the user takes control
 
     if result is True:
       self.down.queue(*encode(object_id, opcode, signature, args))
@@ -576,10 +612,6 @@ class Client:
     args[0] = "agent"
     return True
 
-  def event_zwp_linux_buffer_params_v1_created(self, params, args):
-    self.buffers[args[0]] = self.params.get(params, (0, 0))
-    return True
-
   def event_xdg_toplevel_configure(self, _, args):
     # Agent windows always look focused and never suspended, so apps keep
     # rendering while workspace 10 is hidden.
@@ -587,13 +619,65 @@ class Client:
     args[2] = array.array("I", states + [XDG_STATE_ACTIVATED]).tobytes()
     return True
 
+  def event_wl_keyboard_keymap(self, _, args):
+    self.user_keymap = (args[0], os.pread(args[1], args[2], 0))
+    return True
+
+  def event_wl_keyboard_enter(self, _, args):
+    self.user_keyboard_focus = args[1]
+    return True
+
+  def event_wl_keyboard_leave(self, _, args):
+    self.user_keyboard_focus = None
+    return True
+
+  def event_wl_pointer_enter(self, _, args):
+    self.user_pointer_focus = (args[1], args[2], args[3])
+    return True
+
+  def event_wl_pointer_motion(self, _, args):
+    if self.user_pointer_focus:
+      self.user_pointer_focus = (self.user_pointer_focus[0], args[1], args[2])
+    return True
+
+  def event_wl_pointer_leave(self, _, args):
+    self.user_pointer_focus = None
+    return True
+
+  def hand_over(self, to_user):
+    """Switch this app between the agent's input and the user's, as if focus moved."""
+    keyboard_focus = self.user_keyboard_focus if self.user_keyboard_focus in self.surfaces else None
+    pointer_focus = self.user_pointer_focus if self.user_pointer_focus and self.user_pointer_focus[0] in self.surfaces else None
+
+    if to_user:
+      keymap = self.user_keymap or (1, self.broker.keymap.text)
+      for keyboard in self.keyboards:
+        fd = os.memfd_create("agent-seat-keymap", os.MFD_CLOEXEC)
+        os.write(fd, keymap[1])
+        self.send_event(keyboard, "keymap", keymap[0], fd, len(keymap[1]))
+        if keyboard_focus:
+          self.send_event(keyboard, "enter", self.broker.next_serial(), keyboard_focus, b"")
+      if pointer_focus:
+        for pointer in self.pointers:
+          self.send_event(pointer, "enter", self.broker.next_serial(), *pointer_focus)
+        self.broker.pointer_frame(self)
+    else:
+      for keyboard in self.keyboards:
+        if keyboard_focus:
+          self.send_event(keyboard, "leave", self.broker.next_serial(), keyboard_focus)
+        self.send_event(keyboard, "keymap", 1, self.broker.keymap.fd(), len(self.broker.keymap.text))
+      if pointer_focus:
+        for pointer in self.pointers:
+          self.send_event(pointer, "leave", self.broker.next_serial(), pointer_focus[0])
+        self.broker.pointer_frame(self)
+
   def event_xdg_popup_configure(self, popup, args):
     self.popups[popup]["position"] = (args[0], args[1])
     return True
 
   def forget(self, object_id):
     self.objects.pop(object_id, None)
-    for table in (self.surfaces, self.regions, self.buffers, self.params, self.roles, self.xdg_surfaces, self.popups):
+    for table in (self.surfaces, self.regions, self.buffers, self.pools, self.roles, self.xdg_surfaces, self.popups):
       table.pop(object_id, None)
     self.pointers.discard(object_id)
     self.keyboards.discard(object_id)
@@ -631,6 +715,52 @@ class Client:
       return state["buffer"][0] / state["scale"], state["buffer"][1] / state["scale"]
     return 0, 0
 
+  def geometry(self, surface):
+    """The window geometry of an xdg surface in surface coordinates, else the whole surface."""
+    for xdg in self.xdg_surfaces.values():
+      if xdg["surface"] == surface and xdg["geometry"]:
+        return xdg["geometry"]
+    return (0, 0, *self.size(surface))
+
+  def scale(self, toplevel):
+    surface = self.xdg_surfaces[self.toplevels[toplevel]["xdg"]]["surface"]
+    width = self.size(surface)[0]
+    return self.surfaces[surface]["buffer"][0] / width if width and self.surfaces[surface]["buffer"] else 1
+
+  def capture(self, toplevel):
+    """Compose the window, its subsurfaces and its popups from their shared memory buffers."""
+    scale = self.scale(toplevel)
+    layers = []
+    for surface, x, y in self.layers(self.toplevels[toplevel]["xdg"], 0, 0):
+      buffer = self.surfaces[surface]["buffer"]
+      if buffer and buffer[2]:
+        gx, gy, gw, gh = self.geometry(surface)
+        layers.append((buffer, buffer[0] / (self.size(surface)[0] or 1), x + gx, y + gy, gx, gy, gw, gh))
+    if not layers:
+      raise ValueError("the window has not drawn anything yet")
+
+    left, top = min(layer[2] for layer in layers), min(layer[3] for layer in layers)
+    width = round((max(layer[2] + layer[6] for layer in layers) - left) * scale)
+    height = round((max(layer[3] + layer[7] for layer in layers) - top) * scale)
+    canvas = bytearray(width * height * 4)
+
+    for (buffer_width, buffer_height, (pool, offset, stride, format)), buffer_scale, x, y, gx, gy, gw, gh in layers:
+      if format not in (0, 1):  # ARGB8888 and XRGB8888, what apps draw with
+        continue
+      sx, sy = round(gx * buffer_scale), round(gy * buffer_scale)
+      dx, dy = round((x - left) * scale), round((y - top) * scale)
+      columns = min(round(gw * buffer_scale), buffer_width - sx, width - dx)
+      rows = min(round(gh * buffer_scale), buffer_height - sy, height - dy)
+      if columns <= 0 or rows <= 0 or dx < 0 or dy < 0:
+        continue
+      with mmap.mmap(pool.fd, pool.size, prot=mmap.PROT_READ) as memory:
+        for row in range(rows):
+          source = offset + (sy + row) * stride + sx * 4
+          target = ((dy + row) * width + dx) * 4
+          canvas[target : target + columns * 4] = memory[source : source + columns * 4]
+
+    return canvas, width, height, (left, top, scale)
+
   def hit(self, toplevel, x, y):
     for surface, sx, sy in reversed(self.layers(self.toplevels[toplevel]["xdg"], 0, 0)):
       width, height = self.size(surface)
@@ -661,7 +791,9 @@ class Broker:
     self.serial = 1
     self.pointer_focus = None  # (client, surface)
     self.keyboard_focus = None
-    self.position = (0, 0)
+    self.user_control = False
+    self.stopping = False
+    self.captures = {}  # window -> (left, top, scale) of its last screenshot
 
   def listen(self, path, mode):
     if os.path.exists(path):
@@ -760,6 +892,12 @@ class Broker:
       conn.sendall(json.dumps(reply).encode() + b"\n")
     for client in self.clients:
       client.flush()
+    if self.stopping:
+      for client in list(self.clients):
+        self.drop(client)
+      for path in (WAYLAND_SOCKET, CONTROL_SOCKET):
+        os.unlink(path)
+      sys.exit(0)
 
   def next_serial(self):
     self.serial += 1
@@ -772,16 +910,69 @@ class Broker:
   def window(self, window):
     if int(window) not in self.windows:
       raise ValueError(f"no agent window {window}")
+    if self.user_control:
+      raise ValueError("the user has taken control of the agent seat")
     return self.windows[int(window)]
 
+  def hyprland_windows(self):
+    """Hyprland's address and workspace for each agent window."""
+    try:
+      clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=5).stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+      return {}
+    found = {}
+    for client in clients:
+      match = re.fullmatch(r"agent-([0-9]+)(\..*)?", client.get("class", ""))
+      if match:
+        found[int(match[1])] = {"address": client["address"], "workspace": client["workspace"]["id"]}
+    return found
+
+  def to_logical(self, window, *coordinates):
+    """Pixels of the window's last screenshot to its logical coordinates."""
+    client, toplevel = self.window(window)
+    left, top, scale = self.captures.get(int(window), (0, 0, client.scale(toplevel)))
+    return [value / scale + (top if index % 2 else left) for index, value in enumerate(coordinates)]
+
+  def do_screenshot(self, window, path):
+    if int(window) not in self.windows:
+      raise ValueError(f"no agent window {window}")
+    client, toplevel = self.windows[int(window)]
+    canvas, width, height, origin = client.capture(toplevel)
+    write_png(path, canvas, width, height)
+    self.captures[int(window)] = origin
+    return {"path": path, "width": width, "height": height}
+
   def do_windows(self):
+    hyprland = self.hyprland_windows()
     windows = []
     for window, (client, toplevel) in sorted(self.windows.items()):
       info = client.toplevels[toplevel]
-      xdg = client.xdg_surfaces.get(info["xdg"], {})
-      geometry = xdg.get("geometry") or (0, 0, *client.size(xdg["surface"])) if xdg else None
-      windows.append({"window": window, "class": f"agent-{window}.{info['app_id']}", "app_id": info["app_id"], "title": info["title"], "size": [round(v) for v in geometry[2:]] if geometry else None})
+      xdg = client.xdg_surfaces.get(info["xdg"])
+      geometry = (xdg["geometry"] or (0, 0, *client.size(xdg["surface"]))) if xdg else None
+      popups = [[round(v) for v in (x, y, *client.size(surface))] for surface, x, y in client.layers(info["xdg"], 0, 0)[1:] if client.surfaces[surface]["buffer"] and self.is_popup(client, surface)] if xdg else []
+      windows.append({"window": window, "app_id": info["app_id"], "title": info["title"], "size": [round(v) for v in geometry[2:]] if geometry else None, "popups": popups, **hyprland.get(window, {})})
     return {"windows": windows}
+
+  @staticmethod
+  def is_popup(client, surface):
+    return any(client.xdg_surfaces.get(popup["xdg"], {}).get("surface") == surface for popup in client.popups.values())
+
+  def do_status(self):
+    return {"pid": os.getpid(), "control": "user" if self.user_control else "agent", "apps": len(self.clients), "windows": len(self.windows)}
+
+  def do_control(self, user=None):
+    user = not self.user_control if user is None else bool(user)
+    if user != self.user_control:
+      if user:
+        self.leave_pointer()
+        self.leave_keyboard()
+      self.user_control = user
+      for client in self.clients:
+        client.hand_over(user)
+    return self.do_status()
+
+  def do_stop(self):
+    self.stopping = True
 
   def do_focus(self, window):
     client, toplevel = self.window(window)
@@ -807,20 +998,29 @@ class Broker:
       if client.objects[pointer][1] >= 5:
         client.send_event(pointer, "frame")
 
+  def leave_pointer(self):
+    if self.pointer_focus:
+      client, surface = self.pointer_focus
+      if surface in client.surfaces:
+        for pointer in client.pointers:
+          client.send_event(pointer, "leave", self.next_serial(), surface)
+        self.pointer_frame(client)
+      self.pointer_focus = None
+
+  # Pointer coordinates are pixels of the window's screenshot.
+
   def do_move(self, window, x, y):
+    self.move(window, *self.to_logical(window, x, y))
+
+  def move(self, window, x, y):
     client, toplevel = self.window(window)
     target = client.hit(toplevel, x, y)
     if not target:
-      raise ValueError(f"nothing at {x},{y} in window {window}")
+      raise ValueError(f"nothing to point at there in window {window}")
     surface, lx, ly = target
 
     if self.pointer_focus != (client, surface):
-      if self.pointer_focus:
-        old_client, old_surface = self.pointer_focus
-        if old_surface in old_client.surfaces:
-          for pointer in old_client.pointers:
-            old_client.send_event(pointer, "leave", self.next_serial(), old_surface)
-          self.pointer_frame(old_client)
+      self.leave_pointer()
       for pointer in client.pointers:
         client.send_event(pointer, "enter", self.next_serial(), surface, lx, ly)
       self.pointer_focus = (client, surface)
@@ -828,7 +1028,6 @@ class Broker:
       for pointer in client.pointers:
         client.send_event(pointer, "motion", self.now(), lx, ly)
     self.pointer_frame(client)
-    self.position = (window, x, y)
 
   def do_click(self, window, x, y, button="left", double=False):
     self.do_move(window, x, y)
@@ -841,13 +1040,14 @@ class Broker:
         self.pointer_frame(client)
 
   def do_drag(self, window, x1, y1, x2, y2, button="left", steps=12):
-    self.do_move(window, x1, y1)
+    x1, y1, x2, y2 = self.to_logical(window, x1, y1, x2, y2)
+    self.move(window, x1, y1)
     client = self.pointer_focus[0]
     for pointer in client.pointers:
       client.send_event(pointer, "button", self.next_serial(), self.now(), BUTTONS[button], 1)
     self.pointer_frame(client)
     for step in range(1, steps + 1):
-      self.do_move(window, x1 + (x2 - x1) * step / steps, y1 + (y2 - y1) * step / steps)
+      self.move(window, x1 + (x2 - x1) * step / steps, y1 + (y2 - y1) * step / steps)
     for pointer in client.pointers:
       client.send_event(pointer, "button", self.next_serial(), self.now(), BUTTONS[button], 0)
     self.pointer_frame(client)

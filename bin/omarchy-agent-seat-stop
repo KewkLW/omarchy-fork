@@ -1,0 +1,6 @@
+#!/bin/bash
+
+# omarchy:summary=Stop the agent seat, closing every app on it
+
+omarchy-agent-seat-broker call '{"command":"stop"}' >/dev/null 2>&1 || true
+echo "Agent seat: stopped"

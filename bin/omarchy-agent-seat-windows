@@ -1,0 +1,5 @@
+#!/bin/bash
+
+# omarchy:summary=List the agent seat's windows as JSON
+
+omarchy-agent-seat-broker call '{"command":"windows"}' | jq '.windows'
