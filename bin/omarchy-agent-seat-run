@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# omarchy:summary=Launch a sandboxed app on the agent seat and print its agent window number
+# omarchy:args=[--no-wait] <command> [args...]
+# omarchy:examples=omarchy agent seat run chromium https://omarchy.org | omarchy agent seat run foot
+
+# The app runs in a bubblewrap sandbox whose only way to the desktop is the
+# agent seat broker. It gets no Hyprland IPC, no user Wayland or X11 socket, no
+# D-Bus (so no keyring and no portals), no /dev/uinput and its own home, so it
+# can neither drive nor read the user's seat.
+
+wait_for_window=true
+if [[ $1 == "--no-wait" ]]; then
+  wait_for_window=false
+  shift
+fi
+
+if (($# == 0)); then
+  echo "Usage: omarchy agent seat run [--no-wait] <command> [args...]" >&2
+  exit 1
+fi
+
+runtime="$XDG_RUNTIME_DIR/omarchy/agent-seat"
+agent_home="$HOME/.local/share/omarchy/agent-seat/home"
+
+windows() {
+  omarchy-agent-seat-broker call '{"command":"windows"}' 2>/dev/null | jq -r '.windows[].window'
+}
+
+if ! omarchy-agent-seat-broker call '{"command":"windows"}' >/dev/null 2>&1; then
+  mkdir -p "$runtime"
+  setsid -f omarchy-agent-seat-broker serve >>"$runtime/broker.log" 2>&1
+  for _ in {1..50}; do
+    [[ -S $runtime/control ]] && break
+    sleep 0.1
+  done
+fi
+
+mkdir -p "$agent_home"
+before=$(windows)
+
+sandbox=(
+  --unshare-all --share-net --new-session
+  --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/bin /sbin --symlink usr/lib /lib --symlink usr/lib /lib64
+  --ro-bind /etc /etc --ro-bind /sys /sys --ro-bind-try /run/systemd/resolve /run/systemd/resolve
+  --proc /proc --dev /dev --dev-bind /dev/dri /dev/dri --tmpfs /dev/shm --tmpfs /tmp
+  --bind "$agent_home" "$HOME"
+  --ro-bind-try "$HOME/.local/share/fonts" "$HOME/.local/share/fonts"
+  --ro-bind-try "$HOME/.local/share/icons" "$HOME/.local/share/icons"
+  --ro-bind-try "$HOME/.config/fontconfig" "$HOME/.config/fontconfig"
+  --dir "$XDG_RUNTIME_DIR" --chmod 0700 "$XDG_RUNTIME_DIR"
+  --bind "$runtime/wayland-0" "$XDG_RUNTIME_DIR/wayland-0"
+  --chdir "$HOME" --clearenv
+  --setenv PATH /usr/local/bin:/usr/bin --setenv HOME "$HOME" --setenv USER "$USER" --setenv LANG "${LANG:-C.UTF-8}"
+  --setenv XDG_RUNTIME_DIR "$XDG_RUNTIME_DIR" --setenv WAYLAND_DISPLAY wayland-0 --setenv XDG_SESSION_TYPE wayland
+  --setenv GDK_BACKEND wayland --setenv QT_QPA_PLATFORM wayland --setenv ELECTRON_OZONE_PLATFORM_HINT wayland
+)
+
+for device in /dev/nvidia*; do
+  [[ -c $device ]] && sandbox+=(--dev-bind "$device" "$device")
+done
+
+setsid -f bwrap "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1
+
+if [[ $wait_for_window == "true" ]]; then
+  for _ in {1..150}; do
+    window=$(comm -13 <(sort <<<"$before") <(windows | sort) | head -1)
+    if [[ -n $window ]]; then
+      echo "$window"
+      exit 0
+    fi
+    sleep 0.1
+  done
+
+  echo "No agent window appeared within 15 seconds (see $runtime/apps.log)" >&2
+  exit 1
+fi
