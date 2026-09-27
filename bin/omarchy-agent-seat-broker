@@ -15,8 +15,10 @@
 #   seat, so apps that only ever bind the first seat (Chromium, Electron,
 #   Kitty) work.
 # - Only an allowlist of globals is advertised. Agent apps cannot inject
-#   input, capture the screen, read the clipboard, list windows, draw overlays
-#   or steal focus, and binding a hidden global disconnects the app.
+#   input, capture the screen, list windows, draw overlays or steal focus, and
+#   binding a hidden global disconnects the app.
+# - The clipboard is the user's. An app reads it only when the user pastes into
+#   it and sets it only from the user's own input, never the agent's.
 # - Every agent window gets the class "agent-<n>.<app id>", so Hyprland rules
 #   can pin it to workspace 10 and outline it.
 # - Apps get no GPU unless the user allows it. An agent asks for it per launch;
@@ -353,7 +355,6 @@ class Client:
     self.advertised = {}
     self.params = {}  # GPU buffer params -> the size of the buffer they will create
     self.placeholders = set()  # objects that only exist between the app and the broker
-    self.standins = set()  # wl_callbacks that hold their ids upstream until Hyprland frees them
     self.pointers, self.keyboards = {}, {}  # object -> the surface this app believes it is focused on
     self.surfaces, self.regions, self.buffers, self.pools = {}, {}, {}, {}
     self.roles = {}  # role object (subsurface, viewport, xdg_surface, toplevel, popup) -> surface id or xdg surface id
@@ -362,6 +363,7 @@ class Client:
     self.popups = {}  # xdg_popup -> {"xdg", "parent", "position"}
     self.user_keyboard = None  # where the user's seat has keyboard focus in this app
     self.user_pointer = None  # (surface, x, y) of the user's pointer in this app
+    self.last_actor = None  # "user" or "agent": whose input this app saw last
 
   # Plumbing
 
@@ -436,13 +438,19 @@ class Client:
         if kind == "fd":
           os.close(value)
 
-  def request_wl_data_device_manager_get_data_device(self, _, args):
-    # A data device would hand the agent app the user's clipboard. Stand it in
-    # upstream with a callback so object ids stay in step, and keep it local.
-    self.placeholders.add(args[0])
-    self.standins.add(args[0])
-    self.up.queue(*encode(1, 0, [("new_id", "wl_callback")], [args[0]]))
-    return False
+  # The clipboard is the user's. An app reads it only while the user's keyboard
+  # is in it and the user acted last, so the agent can't paste it out, and it
+  # only sets it (or starts a drag) from the user's own input, so the agent
+  # can't overwrite it.
+
+  def request_wl_data_offer_receive(self, _, args):
+    return self.user_keyboard is not None and self.last_actor == "user"
+
+  def request_wl_data_device_set_selection(self, _, args):
+    return args[1] in self.broker.user_serials
+
+  def request_wl_data_device_start_drag(self, _, args):
+    return args[3] in self.broker.user_serials
 
   def request_wl_seat_get_pointer(self, _, args):
     self.pointers[args[0]] = None
@@ -592,9 +600,6 @@ class Client:
   # Hyprland -> client
 
   def event(self, object_id, opcode, raw):
-    if object_id in self.standins:
-      return  # the stand-in callback's done
-
     interface, version, name, signature, destructor = self.message(object_id, opcode, "events", self.up)
     args = decode(signature, raw[8:], self.up.infds)
     if DEBUG:
@@ -614,9 +619,6 @@ class Client:
           os.close(value)
 
   def event_wl_display_delete_id(self, _, args):
-    if args[0] in self.standins:
-      self.standins.discard(args[0])
-      return False  # the id stays alive on the app's side
     self.forget(args[0])
     return True
 
@@ -658,6 +660,7 @@ class Client:
   def event_wl_keyboard_enter(self, keyboard, args):
     self.broker.user_serials.append(args[0])
     self.user_keyboard = args[1]
+    self.last_actor = "user"
     self.focus_keyboard(keyboard, args[1], args[0])
     return False
 
@@ -670,6 +673,7 @@ class Client:
 
   def event_wl_keyboard_key(self, keyboard, args):
     self.broker.user_serials.append(args[0])
+    self.last_actor = "user"
     if self.user_keyboard:
       self.focus_keyboard(keyboard, self.user_keyboard)
     return self.keyboards.get(keyboard) is not None
@@ -698,6 +702,7 @@ class Client:
 
   def event_wl_pointer_button(self, _, args):
     self.broker.user_serials.append(args[0])
+    self.last_actor = "user"
     return True
 
   def focus_keyboard(self, keyboard, surface, serial=None):
@@ -1190,6 +1195,7 @@ class Broker:
 
   def do_focus(self, window):
     client, toplevel = self.window(window)
+    client.last_actor = "agent"
     surface = client.xdg_surfaces[client.toplevels[toplevel]["xdg"]]["surface"]
     for keyboard in client.keyboards:
       if client.keyboards[keyboard] != surface:
@@ -1209,6 +1215,7 @@ class Broker:
 
   def move(self, window, x, y):
     client, toplevel = self.window(window)
+    client.last_actor = "agent"
     target = client.hit(toplevel, x, y)
     if not target:
       raise ValueError(f"nothing to point at there in window {window}")

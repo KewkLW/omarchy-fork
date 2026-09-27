@@ -2,7 +2,7 @@
 
 Use the agent seat whenever a task needs a graphical app: clicking through a web page, filling a form, checking how a UI renders, reading what is on screen. Never drive the user's desktop with `ydotool`, `wtype`, `hyprctl dispatch` or `grim` on their session; those move the user's cursor, type into whatever the user has focused, and capture their private windows.
 
-Apps started on the agent seat are real windows on workspace 10, outlined in orange. You drive them with your own pointer and keyboard, which reach nothing else, while the user keeps working. The user can also use these windows with their own mouse and keyboard at the same time. The apps are sandboxed: their own home, no access to the user's windows, screen, clipboard, keyring or files.
+Apps started on the agent seat are real windows on workspace 10, outlined in orange. You drive them with your own pointer and keyboard, which reach nothing else, while the user keeps working. The user can also use these windows with their own mouse and keyboard at the same time. The apps are sandboxed: their own home, no access to the user's windows, screen, keyring or files. The user's clipboard reaches an app only when the user pastes into it themselves; your own paste gets nothing, and your copies never reach the user's clipboard.
 
 ## Workflow
 
@@ -36,6 +36,6 @@ The sandbox sees none of the user's files unless you share them: `--share <path>
 
 ## Limits
 
-- No clipboard, file pickers, drag and drop between apps or audio inside the sandbox, and no GPU without `--gpu` and the user's yes.
+- No clipboard of your own, file pickers or audio inside the sandbox, and no GPU without `--gpu` and the user's yes.
 - Without `--share`, the sandbox cannot see the user's files. Anything the app downloads lands under `~/.local/share/omarchy/agent-seat/home`.
 - `omarchy agent seat stop` closes every app on the seat; `omarchy agent seat status` shows whether it is running.

@@ -131,13 +131,27 @@ while True:
                 # The user clicks into the agent window and presses a key.
                 conn.send(message(keyboard, 1, struct.pack("<II", 900, surface) + struct.pack("<I", 0)))
                 conn.send(message(keyboard, 3, struct.pack("<IIII", 901, 0, 30, 1)) + message(keyboard, 3, struct.pack("<IIII", 902, 0, 30, 0)))
+        elif kind == "wl_data_device_manager" and opcode == 0:
+            objects[struct.unpack("<I", body)[0]] = "wl_data_source"
         elif kind == "wl_data_device_manager" and opcode == 1:
+            device = struct.unpack_from("<I", body)[0]
+            objects[device] = "wl_data_device"
             log.write("get_data_device\n")
+            # The user has something copied: offer it to the focused app.
+            objects[0xFF000001] = "wl_data_offer"
+            conn.send(message(device, 0, struct.pack("<I", 0xFF000001)) + message(0xFF000001, 0, string("text/plain")) + message(device, 5, struct.pack("<I", 0xFF000001)))
+        elif kind == "wl_data_offer" and opcode == 1:
+            log.write("receive\n")
+            fd = conn.fds.pop(0)
+            os.write(fd, b"clipboard-text")
+            os.close(fd)
+        elif kind == "wl_data_device" and opcode == 1:
+            log.write(f"set_selection {struct.unpack_from('<I', body, 4)[0]}\n")
 EOF
 
 # The agent app: connects through the broker and reports what it sees.
 cat >"$test_dir/app.py" <<'EOF'
-import os, socket, struct, sys
+import array, os, select, socket, struct, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from wire import Connection, message, string, read_string
 
@@ -200,9 +214,21 @@ elif step == "window":
     conn.send(message(10, 1, struct.pack("<I", 11)))  # toplevel
     conn.send(message(11, 3, string("foot")))  # set_app_id
     conn.send(message(7, 1, struct.pack("<II", 12, 4)))  # data device
+    conn.send(message(7, 0, struct.pack("<I", 20)))  # data source, for copying
     early = roundtrip(13)
     print("ready", flush=True)
-    focused, keys = False, []
+    focused, keys, offer, pending = False, [], None, []
+
+    # Pastes the offered clipboard and copies, as the app would on the last
+    # key it saw, and reports what came back.
+    def paste_and_copy(serial):
+        read, write = os.pipe()
+        conn.sock.sendmsg([message(offer, 1, string("text/plain"))], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [write]))])
+        os.close(write)
+        data = os.read(read, 100) if select.select([read], [], [], 2)[0] else b"timeout"
+        os.close(read)
+        conn.send(message(12, 1, struct.pack("<II", 20, serial)))
+        print(f"pasted:{data.decode()}", flush=True)
 
     def events():
         yield from early
@@ -219,6 +245,11 @@ elif step == "window":
             keys.append((serial < 0x40000000, key, state, focused))
             if len(keys) in (2, 4):
                 print(" ".join(f"{'user' if user else 'agent'}:{key}:{state}:{'focused' if focus else 'unfocused'}" for user, key, state, focus in keys[-2:]), flush=True)
+                pending.append(serial)
+        elif object_id == 12 and opcode == 5:
+            offer = struct.unpack("<I", body)[0]
+        while pending and offer:
+            paste_and_copy(pending.pop(0))
 EOF
 
 run_broker() {
@@ -298,9 +329,6 @@ read -r -t 5 ready <&"${APP[0]}"
 grep -q "app_id agent-1.foot" "$test_dir/compositor.log" || fail "agent windows are named for Hyprland rules" "$(cat "$test_dir/compositor.log")"
 pass "agent windows are named for Hyprland rules"
 
-grep -q "get_data_device" "$test_dir/compositor.log" && fail "agent apps never get the user's clipboard"
-grep -q "sync 12" "$test_dir/compositor.log" || fail "the data device is stood in upstream" "$(cat "$test_dir/compositor.log")"
-pass "agent apps never get the user's clipboard"
 
 windows=$(run_broker omarchy-agent-seat-windows)
 [[ $(jq -r '.[0].app_id' <<<"$windows") == "foot" ]] || fail "windows lists the agent window" "$windows"
@@ -310,10 +338,21 @@ read -r -t 5 typed <&"${APP[0]}"
 [[ $typed == "user:30:1:focused user:30:0:focused" ]] || fail "the user's keys reach agent apps" "$typed"
 pass "the user's keys reach agent apps"
 
+read -r -t 5 pasted <&"${APP[0]}"
+[[ $pasted == "pasted:clipboard-text" ]] || fail "the user can paste into an agent app" "$pasted"
+grep -q "^set_selection 902$" "$test_dir/compositor.log" || fail "the user can copy out of an agent app" "$(cat "$test_dir/compositor.log")"
+pass "the user can paste into and copy out of an agent app"
+
 run_broker omarchy-agent-seat-type 1 "x" || fail "agent can type into its window"
 read -r -t 5 typed <&"${APP[0]}"
 [[ $typed == "agent:45:1:focused agent:45:0:focused" ]] || fail "agent keystrokes reach the app alongside the user's" "$typed"
 pass "agent keystrokes reach the app alongside the user's"
+
+read -r -t 5 pasted <&"${APP[0]}"
+[[ $pasted == "pasted:" ]] || fail "the agent can't paste the user's clipboard" "$pasted"
+(( $(grep -c "^receive$" "$test_dir/compositor.log") == 1 )) || fail "the agent's paste never reaches Hyprland"
+(( $(grep -c "^set_selection" "$test_dir/compositor.log") == 1 )) || fail "the agent can't set the user's clipboard" "$(cat "$test_dir/compositor.log")"
+pass "the agent can't read or set the user's clipboard"
 
 run_broker omarchy-agent-seat-type 1 "é" 2>/dev/null && fail "untypeable text is refused"
 run_broker omarchy-agent-seat-type 1 --key hyper+x 2>/dev/null && fail "unknown modifiers are refused"
