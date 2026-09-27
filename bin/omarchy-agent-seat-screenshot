@@ -4,7 +4,7 @@
 # omarchy:args=<window> [--output <path>]
 
 # The broker composes the image from the app's own buffers, so it works while
-# workspace 10 is hidden and includes menus that open outside the window.
+# the seat's workspace is hidden and includes menus that open outside the window.
 # Pixels in the image are the coordinates omarchy agent seat pointer takes.
 
 if (($# < 1)); then

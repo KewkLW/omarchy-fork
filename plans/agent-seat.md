@@ -12,7 +12,7 @@ Omarchy ships every major coding agent, and agents increasingly need graphical a
 
 ## Shape
 
-A seat of the agent's own, made in userspace. Apps an agent needs run sandboxed and connect to a small Wayland proxy, the broker, instead of to Hyprland. The broker passes their windows through untouched, so they are real windows in the user's session, pinned to workspace 10 with an orange border. It owns their input: the agent gets its own pointer and keyboard through a private control socket, the user's own mouse and keyboard still work on the same windows, and each app's focus follows whoever acted last. It shows the apps only an allowlist of Wayland protocols, so nothing in the sandbox can inject input, capture the screen, list windows or draw overlays.
+A seat of the agent's own, made in userspace. Apps an agent needs run sandboxed and connect to a small Wayland proxy, the broker, instead of to Hyprland. The broker passes their windows through untouched, so they are real windows in the user's session, on a workspace of their own (10 by default) with an orange border. It owns their input: the agent gets its own pointer and keyboard through a private control socket, the user's own mouse and keyboard still work on the same windows, and each app's focus follows whoever acted last. It shows the apps only an allowlist of Wayland protocols, so nothing in the sandbox can inject input, capture the screen, list windows or draw overlays.
 
 Agents use it through ordinary commands:
 
@@ -58,7 +58,7 @@ An app reads the clipboard only while the user's keyboard is in it and the user 
 
 ### Screenshots and coordinates
 
-`omarchy agent seat screenshot` asks the broker, which keeps a duplicate of each app's shm pools and composes the window, its subsurfaces and its popups into a PNG (about 70 ms). It works while workspace 10 is hidden, and it includes menus that open outside the window, which Hyprland's per-window capture misses. The agent then points in pixels of that screenshot. The broker converts them with the screenshot's origin and scale, then hit-tests surfaces, subsurfaces and popups, respecting input regions.
+`omarchy agent seat screenshot` asks the broker, which keeps a duplicate of each app's shm pools and composes the window, its subsurfaces and its popups into a PNG (about 70 ms). It works while the seat's workspace is hidden, and it includes menus that open outside the window, which Hyprland's per-window capture misses. The agent then points in pixels of that screenshot. The broker converts them with the screenshot's origin and scale, then hit-tests surfaces, subsurfaces and popups, respecting input regions.
 
 ### Keyboard
 
@@ -74,7 +74,8 @@ The broker compiles Hyprland's own keymap (sent to the user's seat) with libxkbc
 
 ### Where it lives
 
-- `default/hypr/apps/agent-seat.lua`: class `agent-[0-9]+(\..*)?` goes to `10 silent`, with `render_unfocused`, `no_initial_focus`, `no_dim` and a 3px orange border. `config/hypr/hyprland.lua` shows how to move it to another workspace.
+- `default/hypr/apps/agent-seat.lua`: class `agent-[0-9]+(\..*)?` gets `render_unfocused`, `no_initial_focus`, `no_dim` and a 3px orange border, and opens silently on the seat's workspace.
+- `default/hypr/agent-workspaces.lua` decides that workspace, shared with the agent room: 10 for the seat and 9 for the room by default, changed with `require("default.hypr.agent-workspaces").set({ seat = 8 })` in the user's `hyprland.lua` (the template there shows how). For people who give each monitor its own bank of workspaces, `per_monitor = 10` gives every monitor its own pair (10, 20, ...), counted from the left or in the order `monitors` lists. The placement is a named window rule rewritten whenever the focused monitor changes, so a new agent window opens on the agent workspace of the monitor the user is on, with no flash on the wrong one.
 - `Super + Ctrl + Alt + A` (or _Trigger > Agents > Agent Seat_ while it runs) jumps to the seat's newest window, wherever its workspace is.
 - Commands under `omarchy agent seat`: `run`, `windows`, `pointer`, `type`, `screenshot`, `show`, `status` and `stop`, with the broker and the sandbox supervisor hidden. `GROUP_DESCRIPTIONS[agent]` mentions the seat.
 - `default/agents/skills/omarchy/agent-seat.md` teaches agents to use the seat and never the user's desktop, and when to hand over to the user (logins, captchas, two-factor).
@@ -96,12 +97,11 @@ The trust boundary is the sandbox plus the allowlist, and the seat is honest abo
 ## Rollout
 
 1. **This PR.** The broker, the commands, the sandbox, the window rule, the menu entry, the skill topic, the manual section and the tests. No migration: the seat starts on first use, and its rule ships under `default/`.
-2. **Together with the agent room** (`plans/agent-room.md`): agents talk in terminals on workspace 9 and use apps on the seat on workspace 10. The two are independent, and seat apps can't reach the room.
-3. **Later:** a visible agent cursor while workspace 10 is shown, and connecting upstream through `wp_security_context_v1` so Hyprland also knows agent apps are sandboxed.
+2. **Together with the agent room** (`plans/agent-room.md`): agents talk in terminals on the room's workspace (9) and use apps on the seat's (10), both set in one place. The two are independent, and seat apps can't reach the room.
+3. **Later:** a visible agent cursor while the seat's workspace is shown, and connecting upstream through `wp_security_context_v1` so Hyprland also knows agent apps are sandboxed.
 
 ## Open questions
 
 - **Size.** The broker is about 1,450 lines of Python. The screenshot composer and the debug tracing could be split out or trimmed. Is that the right size for Omarchy to own?
-- **The workspace.** 10 is a default, overridable in the user's `hyprland.lua`. Should it be a setting instead?
 - **PIDs across the sandbox.** An app that writes its own pid into a shared file writes a pid from the sandbox's namespace. Unreal's hot-reload tripped on this. Sharing `/proc` would fix it but loosens the sandbox.
 - **Unicode typing.** Characters outside the user's layout are refused. An input-method fallback would type anything, but it means advertising one more protocol.

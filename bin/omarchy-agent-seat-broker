@@ -20,7 +20,7 @@
 # - The clipboard is the user's. An app reads it only when the user pastes into
 #   it and sets it only from the user's own input, never the agent's.
 # - Every agent window gets the class "agent-<n>.<app id>", so Hyprland rules
-#   can pin it to workspace 10 and outline it.
+#   can put it on the agent seat's workspace and outline it.
 # - Apps get no GPU unless the user allows it. An agent asks for it per launch;
 #   the user answers in their own menu, once or for the rest of the session,
 #   and an allowed app connects through a socket of its own that also offers
@@ -645,7 +645,7 @@ class Client:
 
   def event_xdg_toplevel_configure(self, _, args):
     # Agent windows always look focused and never suspended, so apps keep
-    # rendering while workspace 10 is hidden.
+    # rendering while the seat's workspace is hidden.
     states = [state for state in array.array("I", args[2]) if state not in (XDG_STATE_ACTIVATED, XDG_STATE_SUSPENDED)]
     args[2] = array.array("I", states + [XDG_STATE_ACTIVATED]).tobytes()
     return True
