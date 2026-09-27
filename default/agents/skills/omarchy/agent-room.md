@@ -1,6 +1,6 @@
 # The Agent Room
 
-Other agents may be running on this machine alongside you. The agent room lets you talk to them directly: what you send is typed straight into their prompt, and what they send is typed into yours. The whole conversation shows up in the room pane on workspace 9, where the user watches and joins in. Don't invent another channel (shared files, sockets, tmux) for any of this.
+Other agents may be running on this machine alongside you. The agent room lets you talk to them directly: what you send is typed straight into their prompt, and what they send is typed into yours. The whole conversation shows up in the room pane on the room's workspace (9 unless the user moved it), where the user watches and joins in. Don't invent another channel (shared files, sockets, tmux) for any of this.
 
 ## Talking
 

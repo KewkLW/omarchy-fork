@@ -119,15 +119,15 @@ This is the one place the room reads an agent's private files. None of it is a p
 
 ### Workspace 9
 
-One window rule file, `default/hypr/apps/agents.lua`:
+The room's windows are placed by `default/hypr/agent-workspaces.lua`, shared with the agent seat:
 
-- `org.omarchy.agent` (terminals from the keybinding and `omarchy agent`) opens on workspace 9 and takes you there.
-- `org.omarchy.agent-room` opens on workspace 9 too.
+- `org.omarchy.agent` (terminals from the keybinding and `omarchy agent`) opens on the room's workspace and takes you there.
+- `org.omarchy.agent-room` opens there too.
 - `org.omarchy.agent-watch`, the subagent terminals, open there silently.
-- Nothing else goes there. Workspace 9 is for watching agents work, so it holds only their terminals and the room pane. The agent seat's GUI apps keep workspace 10, where they don't crowd the terminals.
+- Nothing else goes there. The room's workspace is for watching agents work, so it holds only their terminals and the room pane. The agent seat's GUI apps keep their own workspace (10), where they don't crowd the terminals.
 - The Quake console agent stays on the scratchpad. Its exec rule pins the workspace, and a drop-down console that jumps you elsewhere would defeat it. It still joins the room as a participant.
 
-The workspace is one constant in that file, for users who keep 9 for something else.
+The room is 9 by default. `require("default.hypr.agent-workspaces").set({ room = 7 })` in the user's `hyprland.lua` moves it; the template there shows how. For people who give each monitor its own bank of workspaces (1–10 on one, 11–20 on the next), `per_monitor = 10` gives every monitor its own room and seat (9 and 10, then 19 and 20), counted from the left or in the order `monitors` lists, and an agent opens in the room of the monitor the user is on. The placement is a named window rule that the module rewrites whenever the focused monitor changes, so the window opens in the right place rather than flashing on the wrong one first.
 
 ### Security
 
@@ -147,7 +147,7 @@ The trust boundary is the Unix user, and this plan doesn't pretend otherwise. Wh
 
 ## Rollout
 
-1. **This PR.** The messaging commands, the room pane, the pty relay wired into `omarchy-agent`, the workspace 9 rules, the skill topic (`default/agents/skills/omarchy/agent-room.md`, linked from `SKILL.md`), and a manual section in `manual/17-ai.md`. No migration: the runtime state is new, and the rules ship under `default/`.
+1. **This PR.** The messaging commands, the room pane, the pty relay wired into `omarchy-agent`, the shared agent workspace placement, the skill topic (`default/agents/skills/omarchy/agent-room.md`, linked from `SKILL.md`), and a manual section in `manual/17-ai.md`. No migration: the runtime state is new, and the rules ship under `default/`.
 2. **Later, if wanted:** an agents-panel section in the bar listing who's in the room, an MCP shim for agents that prefer tools to shell, and remote control (below).
 
 ## Follow-up: remote control
