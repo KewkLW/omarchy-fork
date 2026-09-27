@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 # omarchy:summary=Shared core behind the agent room commands
-# omarchy:args=whoami|whois|list|send|pause|resume|name|log|register [args...]
+# omarchy:args=whoami|list|send|pause|resume|name|log [args...]
 # omarchy:hidden=true
 
 # The agent room lets agents running as this user talk to each other directly,
@@ -9,7 +9,8 @@
 # user can join in. There is no daemon: identity comes from the process tree,
 # each agent's pty relay types what it is sent into its prompt, and every
 # message is appended to a log the room pane follows. The
-# omarchy-agent-{list,send,name,log} wrappers all land here.
+# omarchy-agent-{list,send,name,log} wrappers all land here, and each relay
+# imports this file to act for its agent.
 
 import argparse
 import datetime
@@ -33,12 +34,20 @@ AGENT_KINDS = {
 }
 INTERPRETERS = re.compile(r"^(node|nodejs|bun|deno|python[0-9.]*)$")
 
-RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "omarchy", "agents")
+BASE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "omarchy")
+RUNTIME = os.path.join(BASE, "agents")
+# Each relay's agent drops its room requests here for the relay to carry out.
+# It is the one place a sandboxed agent needs to be able to write.
+OUTBOXES = os.path.join(BASE, "agent-outbox")
+OUTBOX_ENV = "OMARCHY_AGENT_ROOM_OUTBOX"
 STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "omarchy", "agents")
 LOG_DIR = os.path.join(STATE, "log")
 LOG_DAYS = 30
 USER = "user"
 PAUSED = os.path.join(RUNTIME, "paused")
+# The pid namespace the relays run in, which is the one the room's pids mean
+# anything in. A caller in another one (a sandbox) can't see the process tree.
+PIDNS = os.path.join(RUNTIME, "pidns")
 
 # Two agents answering each other can talk forever. Past this many messages a
 # minute an agent is told to slow down, and the user can pause the room outright.
@@ -47,9 +56,16 @@ RATE_LIMIT = 10
 os.umask(0o077)
 
 
-def fail(message, code=1):
-    print(message, file=sys.stderr)
-    sys.exit(code)
+class RoomError(Exception):
+    pass
+
+
+def fail(message):
+    raise RoomError(message)
+
+
+# Set by a relay while it carries out a request from its own agent.
+CALLER_OVERRIDE = None
 
 
 # Processes
@@ -95,22 +111,44 @@ def alive(pid, start):
     return stat is not None and stat["start"] == start
 
 
+def my_pidns():
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return None
+
+
 # Identity: the nearest agent above the caller, or the user when there is none.
 # A pty relay registers its agent up front, so a registered pid wins even when
 # the agent runs under a name this list doesn't know.
 
 def caller():
+    if CALLER_OVERRIDE is not None:
+        return CALLER_OVERRIDE
+    try:
+        with open(PIDNS) as f:
+            host = f.read().strip()
+    except OSError:
+        host = None
+    if host and host != my_pidns():
+        fail("You're in a sandbox that hides other processes, so the room can't tell who you are. "
+             "Agents started with omarchy agent talk through their relay, which works from any sandbox.")
     return identify(os.getppid())
 
 
 def identify(pid):
-    registered = {a["pid"]: a for a in agents()}
+    live = agents()
+    registered = {a["pid"]: a for a in live}
+    # A relay delivering for its agent speaks as that agent.
+    relays = {a["relay_pid"]: a for a in live if a.get("relay_pid")}
     while pid > 1:
         stat = read_stat(pid)
         if stat is None:
             break
         if pid in registered:
             return registered[pid]
+        if pid in relays:
+            return relays[pid]
         kind = agent_kind(pid, stat)
         if kind:
             return register(kind, pid, stat["start"])
@@ -122,15 +160,12 @@ def agent_dir(agent_id):
     return os.path.join(RUNTIME, agent_id)
 
 
-def register(kind, pid, start, relay=False):
+def register(kind, pid, start, relay_pid=None):
     agent_id = f"{kind}-{pid}"
     path = agent_dir(agent_id)
     meta_path = os.path.join(path, "agent.json")
     existing = load_json(meta_path)
     if existing and existing.get("start") == start:
-        if relay and not existing.get("relay"):
-            existing["relay"] = True
-            write_json(meta_path, existing)
         return existing
     # A leftover directory under a recycled pid belongs to a dead agent.
     shutil.rmtree(path, ignore_errors=True)
@@ -146,7 +181,9 @@ def register(kind, pid, start, relay=False):
         "start": start,
         "name": None,
         "cwd": cwd,
-        "relay": relay,
+        "relay": relay_pid is not None,
+        "relay_pid": relay_pid,
+        "pidns": my_pidns(),
         "since": now(),
     }
     write_json(meta_path, meta)
@@ -163,7 +200,10 @@ def agents():
         meta = load_json(os.path.join(RUNTIME, entry, "agent.json"))
         if meta is None:
             continue
-        if alive(meta["pid"], meta["start"]):
+        # Only a caller that sees the same processes can tell a dead agent.
+        if meta.get("pidns") and meta["pidns"] != my_pidns():
+            found.append(meta)
+        elif alive(meta["pid"], meta["start"]):
             found.append(meta)
         else:
             shutil.rmtree(os.path.join(RUNTIME, entry), ignore_errors=True)
@@ -274,11 +314,6 @@ def notify_user(message):
 def cmd_whoami(args):
     me = caller()
     print(json.dumps(me) if args.json else me["id"])
-
-
-# The pty relay asks this about each peer, to stamp what it types with the sender.
-def cmd_whois(args):
-    print(json.dumps(identify(args.pid)))
 
 
 def cmd_list(args):
@@ -440,24 +475,36 @@ def cmd_log(args):
         time.sleep(0.25)
 
 
-def cmd_register(args):
-    stat = read_stat(args.pid)
-    if stat is None:
-        fail(f"No process {args.pid}")
-    print(json.dumps(register(args.kind, args.pid, stat["start"], relay=True)))
+# Requests an agent can make of its relay. The relay runs outside any sandbox the
+# agent is in, and knows which agent it runs, so it answers for it.
+RELAYED = {"whoami", "list", "send", "name", "pause", "resume"}
 
 
-def main():
+def forward(outbox, argv):
+    if argv[0] == "send" and len(argv) == 2:
+        argv.append(sys.stdin.read())
+    request = f"{time.time_ns()}-{os.getpid()}"
+    write_json(os.path.join(outbox, f"{request}.req"), {"argv": argv})
+    answer = os.path.join(outbox, f"{request}.out")
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        reply = load_json(answer)
+        if reply is not None:
+            os.unlink(answer)
+            sys.stdout.write(reply["out"])
+            sys.stderr.write(reply["err"])
+            sys.exit(reply["code"])
+        time.sleep(0.05)
+    fail("Your relay didn't answer")
+
+
+def build_parser():
     parser = argparse.ArgumentParser(prog="omarchy-agent-room-core")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("whoami")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_whoami)
-
-    p = sub.add_parser("whois")
-    p.add_argument("pid", type=int)
-    p.set_defaults(func=cmd_whois)
 
     p = sub.add_parser("list")
     p.add_argument("--json", action="store_true")
@@ -482,18 +529,25 @@ def main():
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_log)
 
-    p = sub.add_parser("register")
-    p.add_argument("kind")
-    p.add_argument("pid", type=int)
-    p.set_defaults(func=cmd_register)
+    return parser
 
-    args = parser.parse_args()
+
+def main():
+    argv = sys.argv[1:]
     try:
+        outbox = os.environ.get(OUTBOX_ENV)
+        if outbox and argv and argv[0] in RELAYED:
+            forward(outbox, argv)
+        args = build_parser().parse_args(argv)
         args.func(args)
+    except RoomError as error:
+        print(error, file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
     except BrokenPipeError:
         sys.exit(0)
 
 
-main()
+if __name__ == "__main__":
+    main()

@@ -143,6 +143,25 @@ wait_for "the user's message is typed into the agent" \
   heard reviewer '[Agent room] The user says: hold off on the migration (Answer in the room: omarchy agent send user "...")'
 pass "the user speaks to an agent from the room"
 
+# Agents like Codex run their commands in a sandbox that can't see other
+# processes or open sockets. A pid namespace stands in for one here.
+if unshare -rpf --mount-proc true 2>/dev/null; then
+  [[ $(as_agent frontend 'unshare -rpf --mount-proc omarchy-agent-send reviewer "sent from a sandbox"') == "status=0" ]] ||
+    fail "an agent in a sandbox talks through its relay" "$(tail -n3 "$test_dir/frontend.said")"
+  wait_for "a sandboxed agent's message arrives" heard reviewer "[Agent room] frontend ($frontend) says: sent from a sandbox"
+  pass "an agent in a sandbox talks through its relay, as itself"
+
+  if env -u OMARCHY_AGENT_ROOM_OUTBOX unshare -rpf --mount-proc omarchy-agent-send reviewer "who am I" 2>"$test_dir/err"; then
+    fail "a sandboxed caller without a relay is refused rather than taken for the user"
+  fi
+  grep -q "sandbox" "$test_dir/err" || fail "a refused sandboxed caller is told why" "$(cat "$test_dir/err")"
+  env -u OMARCHY_AGENT_ROOM_OUTBOX unshare -rpf --mount-proc omarchy-agent-list >/dev/null 2>&1
+  [[ -d $room/$reviewer && -d $room/$frontend ]] || fail "a sandboxed caller never clears agents it can't see"
+  pass "a sandboxed caller without a relay is refused, not taken for the user"
+else
+  skip "agents in a sandbox (unprivileged pid namespaces are unavailable)"
+fi
+
 omarchy-agent-send all "Stop and summarise" >/dev/null
 wait_for "a message to all reaches the first agent" heard reviewer "The user says: Stop and summarise"
 wait_for "a message to all reaches the second agent" heard frontend "The user says: Stop and summarise"

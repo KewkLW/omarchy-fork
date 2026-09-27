@@ -92,7 +92,9 @@ openclaw)
   [[ -n ${prompt:-} ]] && command+=(--message "$prompt")
   ;;
 codex)
-  command=(codex --approve-for-me)
+  # Codex's sandbox can't see the agent room, so it gets write access to the one
+  # folder its relay reads room commands from, and nothing else beyond its usual.
+  command=(codex --approve-for-me -c "sandbox_workspace_write.writable_roots=[\"$XDG_RUNTIME_DIR/omarchy/agent-outbox\"]")
   [[ -n ${prompt:-} ]] && command+=(-- "$prompt")
   ;;
 cursor-agent)
