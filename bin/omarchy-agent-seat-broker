@@ -19,6 +19,10 @@
 #   or steal focus, and binding a hidden global disconnects the app.
 # - Every agent window gets the class "agent-<n>.<app id>", so Hyprland rules
 #   can pin it to workspace 10 and outline it.
+# - Apps get no GPU unless the user allows it. An agent asks for it per launch;
+#   the user answers in their own menu, once or for the rest of the session,
+#   and an allowed app connects through a socket of its own that also offers
+#   GPU buffers.
 #
 # The agent drives the seat through a control socket that only this user can
 # reach and that is never mounted into the sandbox.
@@ -32,6 +36,7 @@ import json
 import mmap
 import os
 import re
+import secrets
 import selectors
 import socket
 import struct
@@ -72,6 +77,16 @@ ALLOWED_GLOBALS = {
   "wp_alpha_modifier_v1": None,
   "wp_color_manager_v1": None,
 }
+
+# Added for apps the user let use the GPU. Their windows draw into GPU buffers
+# the broker cannot read, so their screenshots come from Hyprland instead.
+GPU_GLOBALS = {
+  "zwp_linux_dmabuf_v1": None,
+  "wp_linux_drm_syncobj_manager_v1": None,
+}
+GPU_CHOICES = {"Allow once": "once", "Allow for this session": "session"}
+GPU_GRANT_UNUSED_SECONDS = 60  # an allowed launch that never connects gives its socket back
+GPU_GRANT_IDLE_SECONDS = 10  # and one whose app has gone, after a grace for apps that reconnect
 
 BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112}
 XDG_STATE_ACTIVATED = 4
@@ -326,14 +341,17 @@ def write_png(path, canvas, width, height):
 
 
 class Client:
-  def __init__(self, broker, sock, upstream_path):
+  def __init__(self, broker, sock, upstream_path, grant=None):
     self.broker = broker
+    self.grant = grant  # the user's GPU grant this app connected through, if any
+    self.allowed = {**ALLOWED_GLOBALS, **GPU_GLOBALS} if grant else ALLOWED_GLOBALS
     self.down = Channel(sock)
     upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     upstream.connect(upstream_path)
     self.up = Channel(upstream)
     self.objects = {1: ("wl_display", 1)}
     self.advertised = {}
+    self.params = {}  # GPU buffer params -> the size of the buffer they will create
     self.placeholders = set()  # objects that only exist between the app and the broker
     self.standins = set()  # wl_callbacks that hold their ids upstream until Hyprland frees them
     self.pointers, self.keyboards = {}, {}  # object -> the surface this app believes it is focused on
@@ -396,7 +414,7 @@ class Client:
       bound, requested_version, new_id = args[1]
       if self.advertised.get(args[0]) != bound:
         raise PermissionError(f"tried to bind hidden global {bound}")
-      cap = ALLOWED_GLOBALS[bound]
+      cap = self.allowed[bound]
       if cap and requested_version > cap:
         args[1] = (bound, cap, new_id)
 
@@ -535,6 +553,25 @@ class Client:
     self.buffers[args[0]] = (1, 1, None)
     return True
 
+  # GPU buffers are opaque to the broker, but their size still places the
+  # agent's pointer on the window.
+
+  def request_zwp_linux_dmabuf_v1_create_params(self, _, args):
+    self.params[args[0]] = (0, 0)
+    return True
+
+  def request_zwp_linux_buffer_params_v1_create(self, params, args):
+    self.params[params] = (args[0], args[1])
+    return True
+
+  def request_zwp_linux_buffer_params_v1_create_immed(self, _, args):
+    self.buffers[args[0]] = (args[1], args[2], None)
+    return True
+
+  def event_zwp_linux_buffer_params_v1_created(self, params, args):
+    self.buffers[args[0]] = (*self.params.get(params, (0, 0)), None)
+    return True
+
   def request_wp_viewporter_get_viewport(self, _, args):
     self.roles[args[0]] = args[1]
     return True
@@ -585,10 +622,10 @@ class Client:
 
   def event_wl_registry_global(self, _, args):
     name, interface, version = args
-    if interface not in ALLOWED_GLOBALS or interface not in PROTOCOLS:
+    if interface not in self.allowed or interface not in PROTOCOLS:
       return False
     self.advertised[name] = interface
-    cap = ALLOWED_GLOBALS[interface]
+    cap = self.allowed[interface]
     if cap and version > cap:
       args[2] = cap
     return True
@@ -692,7 +729,7 @@ class Client:
 
   def forget(self, object_id):
     self.objects.pop(object_id, None)
-    for table in (self.surfaces, self.regions, self.buffers, self.pools, self.roles, self.xdg_surfaces, self.popups):
+    for table in (self.surfaces, self.regions, self.buffers, self.pools, self.roles, self.xdg_surfaces, self.popups, self.params):
       table.pop(object_id, None)
     self.pointers.pop(object_id, None)
     self.keyboards.pop(object_id, None)
@@ -795,10 +832,30 @@ class Client:
 # The broker ---------------------------------------------------------------------
 
 
+class Grant:
+  """A socket for one launch the user let use the GPU, open while that app runs."""
+
+  def __init__(self, broker, scope):
+    self.scope = scope
+    self.path = os.path.join(RUNTIME_DIR, f"gpu-{secrets.token_hex(8)}")
+    self.listener = broker.listen(self.path, 0o600)
+    self.clients = 0
+    self.used = False
+    self.idle = time.monotonic()  # since when no app has been connected
+
+
+class Job:
+  """A helper process whose output answers a control request."""
+
+  def __init__(self, conn, argv, finish):
+    self.conn, self.finish, self.output = conn, finish, bytearray()
+    self.process = subprocess.Popen(argv, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+
+
 class Broker:
   def __init__(self):
     self.selector = selectors.DefaultSelector()
-    self.upstream = os.path.join(os.environ["XDG_RUNTIME_DIR"], os.environ.get("WAYLAND_DISPLAY", "wayland-0"))
+    self.upstream = upstream_socket()
     self.keymap = Keymap()
     self.clients = []
     self.windows = {}
@@ -807,6 +864,10 @@ class Broker:
     self.user_serials = collections.deque(maxlen=256)  # recent serials from the user's seat
     self.stopping = False
     self.captures = {}  # window -> (left, top, scale) of its last screenshot
+    self.grants = []
+    self.gpu_session = False  # the user allowed the GPU for the rest of this session
+    self.gpu_requests = collections.deque()  # (conn, app) waiting for the user, the first one asked
+    self.jobs = []
 
   def listen(self, path, mode):
     if os.path.exists(path):
@@ -825,13 +886,17 @@ class Broker:
     log(f"serving {WAYLAND_SOCKET} for {self.upstream}")
 
     while True:
-      for key, events in self.selector.select():
+      for key, events in self.selector.select(timeout=5):
         kind, owner = key.data
         try:
           if kind == "wayland":
-            self.accept_client(key.fileobj)
+            self.accept_client(key.fileobj, owner)
           elif kind == "control":
             self.control(key.fileobj)
+          elif kind == "job":
+            self.job_output(owner)
+          elif kind == "requester":
+            self.requester_gone(owner)
           elif events & selectors.EVENT_WRITE:
             self.writable(owner, key.fileobj)
           else:
@@ -842,10 +907,14 @@ class Broker:
             self.drop(owner)
           else:
             log(f"error: {error}")
+      self.expire_grants()
 
-  def accept_client(self, listener):
+  def accept_client(self, listener, grant):
     sock, _ = listener.accept()
-    client = Client(self, sock, self.upstream)
+    client = Client(self, sock, self.upstream, grant)
+    if grant:
+      grant.clients += 1
+      grant.used = True
     self.clients.append(client)
     self.selector.register(client.down.sock, selectors.EVENT_READ, ("client", client))
     self.selector.register(client.up.sock, selectors.EVENT_READ, ("client", client))
@@ -868,6 +937,9 @@ class Broker:
       self.remove_window(window)
     client.close()
     self.clients.remove(client)
+    if client.grant:
+      client.grant.clients -= 1
+      client.grant.idle = time.monotonic()
 
   def add_window(self, client, toplevel):
     window = self.next_window
@@ -882,31 +954,148 @@ class Broker:
 
   def control(self, listener):
     conn, _ = listener.accept()
-    with conn:
-      uid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
-      if uid != os.getuid():
-        return
-      conn.settimeout(2)
-      data = b""
-      while not data.endswith(b"\n"):
-        chunk = conn.recv(65536)
-        if not chunk:
-          break
-        data += chunk
-      try:
-        request = json.loads(data)
-        reply = {"ok": True, **(getattr(self, f"do_{request['command']}")(**request.get("args", {})) or {})}
-      except Exception as error:
-        reply = {"ok": False, "error": str(error)}
-      conn.sendall(json.dumps(reply).encode() + b"\n")
+    uid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+    if uid != os.getuid():
+      conn.close()
+      return
+    conn.settimeout(2)
+    data = b""
+    while not data.endswith(b"\n"):
+      chunk = conn.recv(65536)
+      if not chunk:
+        break
+      data += chunk
+    try:
+      request = json.loads(data)
+      command, args = request["command"], request.get("args", {})
+      deferred = getattr(self, f"defer_{command}", None)
+      if deferred:
+        deferred(conn, **args)  # replies itself, now or once the user or a helper answers
+      else:
+        self.reply(conn, getattr(self, f"do_{command}")(**args))
+    except Exception as error:
+      self.reply(conn, error=error)
     for client in self.clients:
       client.flush()
     if self.stopping:
-      for client in list(self.clients):
-        self.drop(client)
-      for path in (WAYLAND_SOCKET, CONTROL_SOCKET):
-        os.unlink(path)
-      sys.exit(0)
+      self.stop()
+
+  def reply(self, conn, result=None, error=None):
+    reply = {"ok": False, "error": str(error)} if error else {"ok": True, **(result or {})}
+    try:
+      conn.sendall(json.dumps(reply).encode() + b"\n")
+    except OSError:
+      pass
+    conn.close()
+
+  def stop(self):
+    for job in list(self.jobs):
+      self.end_job(job)
+      job.process.kill()
+      self.reply(job.conn, error="The agent seat stopped")
+    for conn, _ in self.gpu_requests:
+      if conn.fileno() >= 0:
+        self.reply(conn, error="The agent seat stopped")
+    for client in list(self.clients):
+      self.drop(client)
+    for grant in list(self.grants):
+      self.close_grant(grant)
+    for path in (WAYLAND_SOCKET, CONTROL_SOCKET):
+      os.unlink(path)
+    sys.exit(0)
+
+  # Helper processes answer requests that take a while, so the seat keeps
+  # running meanwhile. A caller that hangs up cancels its helper.
+
+  def start_job(self, conn, argv, finish):
+    job = Job(conn, argv, finish)
+    self.jobs.append(job)
+    self.selector.register(job.process.stdout, selectors.EVENT_READ, ("job", job))
+    self.selector.register(conn, selectors.EVENT_READ, ("requester", job))
+
+  def end_job(self, job):
+    for fileobj in (job.process.stdout, job.conn):
+      try:
+        self.selector.unregister(fileobj)
+      except (KeyError, ValueError):
+        pass
+    self.jobs.remove(job)
+
+  def job_output(self, job):
+    chunk = os.read(job.process.stdout.fileno(), 65536)
+    if chunk:
+      job.output += chunk
+      return
+    self.end_job(job)
+    code = job.process.wait()
+    job.process.stdout.close()
+    try:
+      self.reply(job.conn, job.finish(job.output.decode(errors="replace"), code))
+    except Exception as error:
+      self.reply(job.conn, error=error)
+
+  def requester_gone(self, job):
+    self.end_job(job)
+    job.process.kill()
+    job.process.wait()
+    job.process.stdout.close()
+    job.conn.close()
+    try:
+      job.finish("", -1)
+    except Exception:
+      pass
+
+  # GPU grants. The agent asks; the user answers in their own menu, which the
+  # agent's pointer and keyboard cannot reach. Asking again while the user
+  # decides waits in line.
+
+  def defer_gpu(self, conn, app="an app"):
+    if self.gpu_session:
+      self.reply(conn, self.grant_gpu("session"))
+      return
+    self.gpu_requests.append((conn, app))
+    if len(self.gpu_requests) == 1:
+      self.ask_gpu()
+
+  def ask_gpu(self):
+    conn, app = self.gpu_requests[0]
+    self.start_job(conn, ["omarchy-menu-select", f"Let the agent's {app} use the GPU?", *GPU_CHOICES, "Deny"], self.answered_gpu)
+
+  def answered_gpu(self, output, _):
+    self.gpu_requests.popleft()
+    scope = GPU_CHOICES.get(output.strip())
+    if scope == "session":
+      self.gpu_session = True
+      while self.gpu_requests:
+        self.reply(self.gpu_requests.popleft()[0], self.grant_gpu("session"))
+    elif self.gpu_requests:
+      self.ask_gpu()
+    if not scope:
+      raise PermissionError("The user did not allow the GPU")
+    return self.grant_gpu(scope)
+
+  def grant_gpu(self, scope):
+    grant = Grant(self, scope)
+    self.grants.append(grant)
+    self.selector.register(grant.listener, selectors.EVENT_READ, ("wayland", grant))
+    return {"socket": grant.path, "scope": scope}
+
+  def close_grant(self, grant):
+    self.grants.remove(grant)
+    self.selector.unregister(grant.listener)
+    grant.listener.close()
+    if os.path.exists(grant.path):
+      os.unlink(grant.path)
+
+  def expire_grants(self):
+    # A grant ends a little after its app's last connection closes, since apps
+    # may probe the display and reconnect, or after a minute if nothing came.
+    now = time.monotonic()
+    for grant in list(self.grants):
+      if grant.clients:
+        continue
+      if grant.used and now - grant.idle > GPU_GRANT_IDLE_SECONDS or not grant.used and now - grant.idle > GPU_GRANT_UNUSED_SECONDS:
+        self.close_grant(grant)
 
   def next_serial(self):
     self.serial += 1
@@ -940,13 +1129,37 @@ class Broker:
     left, top, scale = self.captures.get(int(window), (0, 0, client.scale(toplevel)))
     return [value / scale + (top if index % 2 else left) for index, value in enumerate(coordinates)]
 
-  def do_screenshot(self, window, path):
-    if int(window) not in self.windows:
-      raise ValueError(f"no agent window {window}")
-    client, toplevel = self.windows[int(window)]
+  def defer_screenshot(self, conn, window, path):
+    client, _ = self.window(window)
+    if client.grant:
+      # A GPU window's buffers are opaque to the broker, so Hyprland draws it.
+      self.start_job(conn, [sys.executable, os.path.abspath(__file__), "capture", str(window), path], lambda output, code: self.captured(window, path, output, code))
+    else:
+      self.reply(conn, self.screenshot(window, path))
+
+  def screenshot(self, window, path):
+    client, toplevel = self.window(window)
     canvas, width, height, origin = client.capture(toplevel)
     write_png(path, canvas, width, height)
     self.captures[int(window)] = origin
+    return {"path": path, "width": width, "height": height}
+
+  def captured(self, window, path, output, code):
+    result = json.loads(output or "{}")
+    if code != 0:
+      raise ValueError(result.get("error", "Hyprland could not capture the window"))
+    width, height = result["width"], result["height"]
+
+    # Hyprland draws either the window geometry or the whole surface around
+    # it; whichever matches the image's shape sets where its pixels land.
+    client, toplevel = self.window(window)
+    surface = client.xdg_surfaces[client.toplevels[toplevel]["xdg"]]["surface"]
+    gx, gy, gw, gh = client.geometry(surface)
+    sw, sh = client.size(surface)
+    if sw and sh and gw and gh and abs(width / sw - height / sh) < abs(width / gw - height / gh):
+      self.captures[int(window)] = (-gx, -gy, width / sw)
+    else:
+      self.captures[int(window)] = (0, 0, width / (gw or width))
     return {"path": path, "width": width, "height": height}
 
   def do_windows(self):
@@ -965,7 +1178,8 @@ class Broker:
     return any(client.xdg_surfaces.get(popup["xdg"], {}).get("surface") == surface for popup in client.popups.values())
 
   def do_status(self):
-    return {"pid": os.getpid(), "apps": len(self.clients), "windows": len(self.windows)}
+    gpu_apps = sum(1 for client in self.clients if client.grant)
+    return {"pid": os.getpid(), "apps": len(self.clients), "windows": len(self.windows), "gpu": "session" if self.gpu_session else "ask", "gpu_apps": gpu_apps}
 
   def adopt_keymap(self, text):
     if text != self.keymap.text:
@@ -1074,6 +1288,134 @@ class Broker:
     self.tap(client, target[0], mask)
 
 
+def upstream_socket():
+  return os.path.join(os.environ["XDG_RUNTIME_DIR"], os.environ.get("WAYLAND_DISPLAY", "wayland-0"))
+
+
+# Capturing GPU windows ------------------------------------------------------------
+
+
+class Display:
+  """A small blocking Wayland client for the broker's own requests to Hyprland."""
+
+  def __init__(self, path):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    self.channel = Channel(sock)
+    sock.settimeout(5)
+    self.objects = {1: "wl_display"}
+    self.next_id = 2
+    self.registry = self.new("wl_registry")
+    self.send(1, "get_registry", self.registry)
+    self.globals = {args[1]: (args[0], args[2]) for object_id, _, name, args in self.roundtrip() if object_id == self.registry and name == "global"}
+
+  def new(self, interface):
+    object_id = self.next_id
+    self.next_id += 1
+    self.objects[object_id] = interface
+    return object_id
+
+  def send(self, object_id, name, *args):
+    opcode, (_, signature, _) = next((i, m) for i, m in enumerate(PROTOCOLS[self.objects[object_id]]["requests"]) if m[0] == name)
+    self.channel.queue(*encode(object_id, opcode, signature, args))
+    self.channel.flush()
+
+  def bind(self, interface, version=1):
+    if interface not in self.globals:
+      raise ValueError(f"Hyprland does not offer {interface}")
+    name, available = self.globals[interface]
+    object_id = self.new(interface)
+    self.send(self.registry, "bind", name, (interface, min(version, available), object_id))
+    return object_id
+
+  def events(self):
+    """Every event as (object, interface, name, args), forever."""
+    while True:
+      if not self.channel.receive():
+        raise ConnectionError("Hyprland hung up")
+      for object_id, opcode, message in self.channel.messages():
+        interface = self.objects.get(object_id)
+        if interface is None:
+          continue
+        name, signature, _ = PROTOCOLS[interface]["events"][opcode]
+        args = decode(signature, message[8:], self.channel.infds)
+        for (kind, new_interface), value in zip(signature, args):
+          if kind == "new_id" and new_interface:
+            self.objects[value] = new_interface
+        yield object_id, interface, name, args
+
+  def roundtrip(self):
+    """Events up to a sync, which Hyprland answers after everything before it."""
+    callback = self.new("wl_callback")
+    self.send(1, "sync", callback)
+    events = []
+    for event in self.events():
+      if event[0] == callback:
+        return events
+      events.append(event)
+
+
+def capture(window, path):
+  """Have Hyprland draw an agent window into shared memory and save it as a PNG."""
+  display = Display(upstream_socket())
+
+  display.bind("ext_foreign_toplevel_list_v1")
+  handle = None
+  for object_id, interface, name, args in display.roundtrip():
+    if interface == "ext_foreign_toplevel_handle_v1" and name == "app_id" and re.fullmatch(rf"agent-{window}(\..*)?", args[0] or ""):
+      handle = object_id
+  if not handle:
+    raise ValueError(f"Hyprland has no agent window {window}")
+
+  # New ids must reach Hyprland in order, so bind each manager before making its object.
+  sources = display.bind("ext_foreign_toplevel_image_capture_source_manager_v1")
+  source = display.new("ext_image_capture_source_v1")
+  display.send(sources, "create_source", source, handle)
+  sessions = display.bind("ext_image_copy_capture_manager_v1")
+  session = display.new("ext_image_copy_capture_session_v1")
+  display.send(sessions, "create_session", session, source, 0)
+
+  size, formats = None, []
+  for object_id, _, name, args in display.events():
+    if object_id != session:
+      continue
+    if name == "buffer_size":
+      size = args
+    elif name == "shm_format":
+      formats.append(args[0])
+    elif name == "stopped":
+      raise ValueError("Hyprland stopped the capture")
+    elif name == "done":
+      break
+  format = next((f for f in (0, 1) if f in formats), None)  # ARGB8888 or XRGB8888
+  if not size or format is None:
+    raise ValueError("Hyprland offered no usable shared memory format")
+
+  width, height = size
+  memory = os.memfd_create("agent-seat-capture")
+  os.ftruncate(memory, width * height * 4)
+  shm = display.bind("wl_shm")
+  pool = display.new("wl_shm_pool")
+  display.send(shm, "create_pool", pool, os.dup(memory), width * height * 4)
+  buffer = display.new("wl_buffer")
+  display.send(pool, "create_buffer", buffer, 0, width, height, width * 4, format)
+
+  frame = display.new("ext_image_copy_capture_frame_v1")
+  display.send(session, "create_frame", frame)
+  display.send(frame, "attach_buffer", buffer)
+  display.send(frame, "damage_buffer", 0, 0, width, height)
+  display.send(frame, "capture")
+  for object_id, _, name, args in display.events():
+    if object_id == frame and name == "ready":
+      break
+    if object_id == frame and name == "failed":
+      raise ValueError(f"Hyprland could not capture the window (reason {args[0]})")
+
+  with mmap.mmap(memory, width * height * 4, prot=mmap.PROT_READ) as pixels:
+    write_png(path, pixels[:], width, height)
+  print(json.dumps({"width": width, "height": height}))
+
+
 def call(request):
   sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
   try:
@@ -1098,6 +1440,12 @@ def call(request):
 if __name__ == "__main__":
   if len(sys.argv) >= 2 and sys.argv[1] == "call":
     call(sys.argv[2])
+  elif len(sys.argv) == 4 and sys.argv[1] == "capture":
+    try:
+      capture(sys.argv[2], sys.argv[3])
+    except Exception as error:
+      print(json.dumps({"error": str(error)}))
+      sys.exit(1)
   elif len(sys.argv) == 1 or sys.argv[1] == "serve":
     Broker().serve()
   else:

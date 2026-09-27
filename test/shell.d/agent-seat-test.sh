@@ -10,7 +10,8 @@ test_dir=$(mktemp -d)
 mkdir -p "$test_dir/bin" "$test_dir/runtime"
 
 cleanup() {
-  [[ -n ${broker_pid:-} ]] && kill "$broker_pid" 2>/dev/null
+  # The broker runs under a subshell of run_broker, so end it by parent too.
+  [[ -n ${broker_pid:-} ]] && pkill -P "$broker_pid" 2>/dev/null && kill "$broker_pid" 2>/dev/null
   [[ -n ${compositor_pid:-} ]] && kill "$compositor_pid" 2>/dev/null
   rm -rf "$test_dir"
 }
@@ -19,6 +20,11 @@ trap cleanup EXIT
 # The broker asks Hyprland where agent windows are; there is no Hyprland here.
 printf '#!/bin/bash\necho "[]"\n' >"$test_dir/bin/hyprctl"
 chmod +x "$test_dir/bin/hyprctl"
+
+# The user's menu: logs each question and gives the answer the test set.
+printf '#!/bin/bash\necho "$1" >>"%s/menu.log"\ncat "%s/menu-answer"\n' "$test_dir" "$test_dir" >"$test_dir/bin/omarchy-menu-select"
+chmod +x "$test_dir/bin/omarchy-menu-select"
+touch "$test_dir/menu.log"
 
 cat >"$test_dir/wire.py" <<'EOF'
 import array, socket, struct
@@ -60,7 +66,7 @@ class Connection:
 EOF
 
 # A fake Hyprland: advertises a seat, a compositor, xdg_wm_base, the data
-# device manager and a virtual pointer manager, answers wl_display.sync,
+# device manager, a virtual pointer manager and GPU buffers, answers wl_display.sync,
 # plays a user pointer entering every surface it can, and logs what reaches it.
 cat >"$test_dir/compositor.py" <<'EOF'
 import array, os, socket, struct, subprocess, sys
@@ -72,7 +78,7 @@ server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(path)
 server.listen(4)
 
-GLOBALS = {1: ("wl_seat", 7), 2: ("wl_compositor", 6), 3: ("xdg_wm_base", 6), 4: ("wl_data_device_manager", 3), 5: ("zwlr_virtual_pointer_manager_v1", 2)}
+GLOBALS = {1: ("wl_seat", 7), 2: ("wl_compositor", 6), 3: ("xdg_wm_base", 6), 4: ("wl_data_device_manager", 3), 5: ("zwlr_virtual_pointer_manager_v1", 2), 6: ("zwp_linux_dmabuf_v1", 5)}
 
 while True:
     conn = Connection(server.accept()[0])
@@ -246,6 +252,44 @@ pass "seat is the agent's"
 grep -q "keymap with fd" <<<"$seat" || fail "agent apps get the user's keymap" "$seat"
 pass "agent apps get the user's keymap"
 
+gpu_request() {
+  run_broker omarchy-agent-seat-broker call '{"command":"gpu","args":{"app":"vkcube"}}'
+}
+
+questions() {
+  wc -l <"$test_dir/menu.log"
+}
+
+echo "Deny" >"$test_dir/menu-answer"
+gpu_request 2>"$test_dir/gpu.err" && fail "a declined GPU request fails"
+grep -q "did not allow" "$test_dir/gpu.err" || fail "a declined GPU request says why" "$(cat "$test_dir/gpu.err")"
+grep -qx "Let the agent's vkcube use the GPU?" "$test_dir/menu.log" || fail "the user is asked before an app gets the GPU" "$(cat "$test_dir/menu.log")"
+pass "the user is asked before an app gets the GPU, and can decline"
+
+echo "Allow once" >"$test_dir/menu-answer"
+grant=$(gpu_request) || fail "the user can allow the GPU once" "$(cat "$test_dir/broker.log")"
+gpu_socket=$(jq -r '.socket' <<<"$grant")
+[[ $(jq -r '.scope' <<<"$grant") == "once" && -S $gpu_socket ]] || fail "an allowed launch gets a socket of its own" "$grant"
+[[ $(stat -c %a "$gpu_socket") == "600" ]] || fail "the GPU socket is private to the user"
+globals=$(python3 "$test_dir/app.py" "$gpu_socket" globals)
+[[ $globals == "wl_compositor wl_data_device_manager wl_seat xdg_wm_base zwp_linux_dmabuf_v1" ]] || fail "an allowed app gets GPU buffers" "$globals"
+globals=$(python3 "$test_dir/app.py" "$socket" globals)
+[[ $globals == "wl_compositor wl_data_device_manager wl_seat xdg_wm_base" ]] || fail "other apps still get no GPU buffers" "$globals"
+pass "an allowed app gets GPU buffers on a socket of its own, other apps do not"
+
+gpu_request >/dev/null 2>&1
+(( $(questions) == 3 )) || fail "allowing once asks again next launch" "$(cat "$test_dir/menu.log")"
+pass "allowing once asks again next launch"
+
+echo "Allow for this session" >"$test_dir/menu-answer"
+gpu_request >/dev/null || fail "the user can allow the GPU for the session"
+echo "Deny" >"$test_dir/menu-answer"
+grant=$(gpu_request) || fail "a session grant covers later launches"
+(( $(questions) == 4 )) || fail "a session grant asks only once" "$(cat "$test_dir/menu.log")"
+[[ $(jq -r '.scope' <<<"$grant") == "session" ]] || fail "later launches get the session grant" "$grant"
+[[ $(run_broker omarchy-agent-seat-status --json | jq -r '.gpu') == "session" ]] || fail "status shows the session grant"
+pass "allowing for the session asks only once"
+
 coproc APP { python3 "$test_dir/app.py" "$socket" window; }
 read -r -t 5 ready <&"${APP[0]}"
 [[ $ready == "ready" ]] || fail "agent app maps a window"
@@ -277,5 +321,6 @@ pass "bad keys are refused"
 run_broker omarchy-agent-seat-stop >/dev/null
 for _ in {1..50}; do kill -0 "$broker_pid" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$broker_pid" 2>/dev/null && fail "stop ends the broker"
+compgen -G "$test_dir/runtime/omarchy/agent-seat/gpu-*" >/dev/null && fail "stop closes the GPU sockets"
 [[ $(run_broker omarchy-agent-seat-status) == "Agent seat: stopped" ]] || fail "status reports a stopped seat"
 pass "stop ends the broker"

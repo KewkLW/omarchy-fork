@@ -24,8 +24,14 @@ omarchy agent seat windows                                       # JSON: window,
 
 Logins, captchas, two-factor prompts and anything else that needs the user's own hands: ask them to switch to workspace 10 (`Super + 0`) and do it in the agent window, then wait for them to say they're done. Don't act in the same window while they work in it: an app has one focus, so whoever acts last takes it. Other agent windows are fine.
 
+## The GPU
+
+Apps get no GPU by default. For one that needs it (a game engine, a 3D tool, a Vulkan app), launch it with `--gpu`: `omarchy agent seat run --gpu vkcube`. The user is asked in their own menu, which your pointer and keyboard cannot reach, and can allow it once or for the rest of the session, or decline. Launch waits for the answer and fails if they decline; don't retry, ask the user what they want instead.
+
+Screenshots of a GPU app come from Hyprland rather than the app's own buffers, so menus that open outside its window may be missing from them.
+
 ## Limits
 
-- No clipboard, file pickers, drag and drop between apps, audio or GPU acceleration inside the sandbox.
+- No clipboard, file pickers, drag and drop between apps or audio inside the sandbox, and no GPU without `--gpu` and the user's yes.
 - The sandbox cannot see the user's files. Anything the app downloads lands under `~/.local/share/omarchy/agent-seat/home`.
 - `omarchy agent seat stop` closes every app on the seat; `omarchy agent seat status` shows whether it is running.
