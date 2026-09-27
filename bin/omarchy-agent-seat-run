@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # omarchy:summary=Launch a sandboxed app on the agent seat and print its agent window number
-# omarchy:args=[--no-wait] [--gpu] <command> [args...]
-# omarchy:examples=omarchy agent seat run chromium https://omarchy.org | omarchy agent seat run foot | omarchy agent seat run --gpu vkcube
+# omarchy:args=[--no-wait] [--gpu] [--share <path>] [--share-ro <path>] <command> [args...]
+# omarchy:examples=omarchy agent seat run chromium https://omarchy.org | omarchy agent seat run foot | omarchy agent seat run --gpu vkcube | omarchy agent seat run --share ~/Projects/site chromium ~/Projects/site/index.html
 
 # The app runs in a bubblewrap sandbox whose only way to the desktop is the
 # agent seat broker. It gets no Hyprland IPC, no user Wayland or X11 socket, no
@@ -12,13 +12,31 @@
 # --gpu asks the user first, in their own menu, to let this launch use the GPU
 # (once, or for the rest of the session). Only then does the app get the GPU
 # devices, and a broker socket of its own that also offers GPU buffers.
+#
+# --share and --share-ro hand the app one of the user's files or directories,
+# read-write or read-only, at the same path. The seat asks nothing of its own
+# here: sharing is part of the command, so the agent's own permission rules
+# decide it, like any file the agent touches itself.
 
 wait_for_window=true
 gpu=false
+shares=()
 while [[ $1 == --* ]]; do
   case $1 in
     --no-wait) wait_for_window=false ;;
     --gpu) gpu=true ;;
+    --share | --share-ro)
+      if ! path=$(realpath -e -- "${2:-}" 2>/dev/null); then
+        echo "Nothing to share at ${2:-(no path given)}" >&2
+        exit 1
+      fi
+      if [[ $1 == "--share" ]]; then
+        shares+=(--bind "$path" "$path")
+      else
+        shares+=(--ro-bind "$path" "$path")
+      fi
+      shift
+      ;;
     *)
       echo "Unknown option $1" >&2
       exit 1
@@ -28,7 +46,7 @@ while [[ $1 == --* ]]; do
 done
 
 if (($# == 0)); then
-  echo "Usage: omarchy agent seat run [--no-wait] [--gpu] <command> [args...]" >&2
+  echo "Usage: omarchy agent seat run [--no-wait] [--gpu] [--share <path>] [--share-ro <path>] <command> [args...]" >&2
   exit 1
 fi
 
@@ -88,6 +106,9 @@ if [[ -n $executable && $executable != /usr/* ]]; then
   sandbox+=(--ro-bind "$(dirname "$executable")" "$(dirname "$executable")")
   set -- "$executable" "${@:2}"
 fi
+
+# Last, so a share's own mode wins over the mounts above.
+sandbox+=("${shares[@]}")
 
 setsid -f bwrap "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1
 

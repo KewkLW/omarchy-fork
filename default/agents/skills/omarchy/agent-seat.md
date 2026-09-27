@@ -30,8 +30,12 @@ Apps get no GPU by default. For one that needs it (a game engine, a 3D tool, a V
 
 Screenshots of a GPU app come from Hyprland rather than the app's own buffers, so menus that open outside its window may be missing from them.
 
+## Your files
+
+The sandbox sees none of the user's files unless you share them: `--share <path>` read-write, `--share-ro <path>` read-only, repeatable, each at the same path inside. `omarchy agent seat run --gpu --share ~/Projects/game ~/Projects/game/Editor`. The seat asks nothing about this itself; sharing is part of your command, so your own permission rules decide it, the same as for files you touch directly. Share only what the app needs.
+
 ## Limits
 
 - No clipboard, file pickers, drag and drop between apps or audio inside the sandbox, and no GPU without `--gpu` and the user's yes.
-- The sandbox cannot see the user's files. Anything the app downloads lands under `~/.local/share/omarchy/agent-seat/home`.
+- Without `--share`, the sandbox cannot see the user's files. Anything the app downloads lands under `~/.local/share/omarchy/agent-seat/home`.
 - `omarchy agent seat stop` closes every app on the seat; `omarchy agent seat status` shows whether it is running.

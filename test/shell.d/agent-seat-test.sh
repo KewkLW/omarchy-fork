@@ -322,5 +322,8 @@ run_broker omarchy-agent-seat-stop >/dev/null
 for _ in {1..50}; do kill -0 "$broker_pid" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$broker_pid" 2>/dev/null && fail "stop ends the broker"
 compgen -G "$test_dir/runtime/omarchy/agent-seat/gpu-*" >/dev/null && fail "stop closes the GPU sockets"
+
+run_broker omarchy-agent-seat-run --share "$test_dir/missing" foot 2>/dev/null && fail "sharing a missing path is refused"
+pass "sharing a missing path is refused"
 [[ $(run_broker omarchy-agent-seat-status) == "Agent seat: stopped" ]] || fail "status reports a stopped seat"
 pass "stop ends the broker"
