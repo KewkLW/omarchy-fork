@@ -26,7 +26,7 @@ No daemon, no new packages (Python and `jq` are already on every install), no ne
 - **D-Bus**: would work and is already present, but it's a service to register and a policy file to maintain, and it gives nothing a directory under `$XDG_RUNTIME_DIR` doesn't for a same-user system. It also puts the channel on the session bus, where every desktop app can reach it.
 - **A mailbox the agents check** (Revision 1): messages waited in an inbox until the agent ran `omarchy agent inbox`. Agents don't check unprompted, so conversations would stall, and the exchange would happen out of sight. Talking has to be as direct as typing.
 - **tmux `send-keys` / terminal remote control**: the right idea, typing into the agent, but tied to one multiplexer or terminal, with no sender stamping and no record. The relay does the same thing for any terminal, knows who is talking, and logs it.
-- **Parsing each agent's own session logs** (`~/.claude/projects`, `~/.codex/sessions`, …) to show conversations: thirteen formats that change with every agent release. The agents' own terminals on workspace 9 already show their conversations, and the message log shows what passes between them.
+- **Parsing each agent's own session logs** (`~/.claude/projects`, `~/.codex/sessions`, …) as the channel or the record: thirteen formats that change with every agent release. The agents' own terminals on workspace 9 already show their conversations, and the message log shows what passes between them. The one exception is subagents (below), which have no terminal to show, and there it's read-only and optional.
 
 ## Design
 
@@ -104,12 +104,26 @@ The log is `0600` in a `0700` directory, and log files older than 30 days are pr
 
 `omarchy agent room` runs `omarchy-agent-chat` in a terminal (`org.omarchy.agent-room`) on workspace 9. It follows the log live, colouring each sender and indenting long messages, so the entire conversation between agents and the user is in that one terminal. It also has a prompt: a plain line speaks to every agent, `@codex-3380 hold off on the migration` to one, and `/agents`, `/pause` and `/resume` manage the room. What the user types goes out as `user`, because the pane has no agent in its ancestry.
 
+### Subagents get terminals too
+
+Claude Code runs subagents inside the main `claude` process: the background agents it lists under `main`, each with its own task. They have no process or terminal, so the room can't see them by process tree and the relay can't type to them. Claude Code does keep a live record on disk: `~/.claude/sessions/<pid>.json` ties a running claude to its session, each subagent writes its transcript to `<session>/subagents/agent-<id>.jsonl`, and its task and model sit in `agent-<id>.meta.json`.
+
+The room reads that, read-only:
+
+- `omarchy agent list` shows subagents under their agent as `claude-5720/a3ed7631`, with their task. Claude sessions started by hand join the list as soon as anything looks.
+- While the room pane is open, `omarchy-agent-room-core open-watchers` gives every running subagent a terminal of its own on workspace 9 (`org.omarchy.agent-watch`, placed silently so a new subagent never pulls the user over), up to 8 at a time. It follows the transcript live: the task, each tool call and a clipped result, and each message. It closes a minute after the subagent finishes, which means its last turn ended and it's been quiet for two minutes, because background agents can end a turn and be woken again. A terminal the user closes stays closed.
+- `omarchy agent watch <agent>/<subagent>` opens one by hand.
+- `@claude-5720/a3ed7631 ...` is typed into the parent as a request to pass the message on, since only the parent can reach its subagent.
+
+This is the one place the room reads an agent's private files. None of it is a published interface, so it is written to fail quietly: a changed format means no subagent terminals, never a broken room. Codex keeps its subagents differently and isn't covered yet.
+
 ### Workspace 9
 
 One window rule file, `default/hypr/apps/agents.lua`:
 
 - `org.omarchy.agent` (terminals from the keybinding and `omarchy agent`) opens on workspace 9 and takes you there.
 - `org.omarchy.agent-room` opens on workspace 9 too.
+- `org.omarchy.agent-watch`, the subagent terminals, open there silently.
 - Nothing else goes there. Workspace 9 is for watching agents work, so it holds only their terminals and the room pane. The agent seat's GUI apps keep workspace 10, where they don't crowd the terminals.
 - The Quake console agent stays on the scratchpad. Its exec rule pins the workspace, and a drop-down console that jumps you elsewhere would defeat it. It still joins the room as a participant.
 
@@ -129,7 +143,7 @@ The trust boundary is the Unix user, and this plan doesn't pretend otherwise. Wh
 
 ### Tests
 
-`test/shell.d/agent-room-test.sh` runs against a temporary `$XDG_RUNTIME_DIR` and `$XDG_STATE_HOME`. Its fake agents run under the real relay: a bash that records what's typed into its prompt and runs commands fed to it as its tool calls. It covers identity and ids, messages typed into the other agent with the right heading and answer line, the relay stamping the real sender whatever the text claims, the user speaking in, `all`, messages to the user, addressing by id, name and kind, hand-started agents that can't be spoken to, pause and resume, the rate limit, log format and permissions, dead-agent cleanup with pid reuse, and sandboxes: an agent in a pid namespace (standing in for Codex's sandbox) still talks through its relay as itself, and a sandboxed caller with no relay is refused and clears nobody. Agents run this suite too, so it first detaches from whoever started it. Otherwise the room would take the whole test run for that agent. `default-agent-test.sh` expects every launch to go through the relay.
+`test/shell.d/agent-room-test.sh` runs against a temporary `$XDG_RUNTIME_DIR` and `$XDG_STATE_HOME`. Its fake agents run under the real relay: a bash that records what's typed into its prompt and runs commands fed to it as its tool calls. It covers identity and ids, messages typed into the other agent with the right heading and answer line, the relay stamping the real sender whatever the text claims, the user speaking in, `all`, messages to the user, addressing by id, name and kind, hand-started agents that can't be spoken to, pause and resume, the rate limit, log format and permissions, dead-agent cleanup with pid reuse, subagents (listed under their agent, one terminal each while running, a live watch that ends with the subagent, messages passed through the parent, all against a fake Claude session), and sandboxes: an agent in a pid namespace (standing in for Codex's sandbox) still talks through its relay as itself, and a sandboxed caller with no relay is refused and clears nobody. Agents run this suite too, so it first detaches from whoever started it. Otherwise the room would take the whole test run for that agent. `default-agent-test.sh` expects every launch to go through the relay.
 
 ## Rollout
 

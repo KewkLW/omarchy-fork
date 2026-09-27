@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 # omarchy:summary=Shared core behind the agent room commands
-# omarchy:args=whoami|list|send|pause|resume|name|log [args...]
+# omarchy:args=whoami|list|send|pause|resume|name|log|watch|open-watchers [args...]
 # omarchy:hidden=true
 
 # The agent room lets agents running as this user talk to each other directly,
@@ -15,10 +15,12 @@
 import argparse
 import datetime
 import fcntl
+import glob
 import json
 import os
 import random
 import re
+import select
 import shutil
 import socket
 import subprocess
@@ -316,11 +318,114 @@ def cmd_whoami(args):
     print(json.dumps(me) if args.json else me["id"])
 
 
+# Subagents
+#
+# Claude Code runs its subagents inside the main claude process, so they have no
+# process or terminal of their own to find. Claude Code does keep a live record
+# of them on disk: sessions/<pid>.json ties a running claude to its session, and
+# each subagent writes its transcript to <session>/subagents/agent-<id>.jsonl
+# with its task beside it in agent-<id>.meta.json. None of that is a published
+# interface, so everything here reads it defensively, and the room works the
+# same without it.
+
+CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+# A background subagent can end its turn and be woken again later, so it only
+# counts as finished once its last turn has ended and it has been quiet this long.
+SUBAGENT_QUIET = 120
+SUBAGENT_SHORT_ID = 8
+
+
+def claude_sessions():
+    found = []
+    for path in glob.glob(os.path.join(CLAUDE_HOME, "sessions", "*.json")):
+        session = load_json(path)
+        try:
+            pid, start = int(session["pid"]), int(session["procStart"])
+        except (TypeError, KeyError, ValueError):
+            continue
+        if session.get("sessionId") and alive(pid, start):
+            found.append({**session, "pid": pid, "start": start})
+    return found
+
+
+# Claude sessions started by hand join the room as soon as anything looks, so
+# their subagents have a parent to hang from.
+def discover_claude():
+    known = {a["pid"] for a in agents()}
+    for session in claude_sessions():
+        if session["pid"] not in known:
+            register("claude", session["pid"], session["start"])
+
+
+def last_record(path):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 65536))
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("type") in ("assistant", "user"):
+            return record
+    return None
+
+
+def subagent_finished(path):
+    record = last_record(path)
+    ended = record is not None and record["type"] == "assistant" and (record.get("message") or {}).get("stop_reason") == "end_turn"
+    try:
+        quiet = time.time() - os.path.getmtime(path) >= SUBAGENT_QUIET
+    except OSError:
+        return True
+    return ended and quiet
+
+
+def subagents(parent=None):
+    found = []
+    for session in claude_sessions():
+        parent_id = f"claude-{session['pid']}"
+        if parent and parent["id"] != parent_id:
+            continue
+        pattern = os.path.join(CLAUDE_HOME, "projects", "*", session["sessionId"], "subagents", "agent-*.jsonl")
+        for path in sorted(glob.glob(pattern), key=os.path.getmtime):
+            agent_id = os.path.basename(path)[len("agent-"):-len(".jsonl")]
+            meta = load_json(path[: -len(".jsonl")] + ".meta.json") or {}
+            found.append({
+                "id": f"{parent_id}/{agent_id[:SUBAGENT_SHORT_ID]}",
+                "parent": parent_id,
+                "agent_id": agent_id,
+                "type": meta.get("agentType") or "subagent",
+                "description": meta.get("description") or "",
+                "model": meta.get("model"),
+                "background": meta.get("requestShape") == "background",
+                "transcript": path,
+                "finished": subagent_finished(path),
+            })
+    return found
+
+
+def find_subagent(target):
+    parent_id, _, prefix = target.partition("/")
+    matches = [s for s in subagents() if s["parent"] == parent_id and s["agent_id"].startswith(prefix)]
+    if len(matches) != 1:
+        fail(f"No single subagent {target}. See: omarchy agent list")
+    return matches[0]
+
+
 def cmd_list(args):
     me = caller()
+    discover_claude()
     rows = []
+    helpers = subagents()
     for agent in agents():
-        rows.append({**agent, "you": agent["id"] == me["id"]})
+        mine = [s for s in helpers if s["parent"] == agent["id"] and (args.all or not s["finished"])]
+        rows.append({**agent, "you": agent["id"] == me["id"], "subagents": mine})
     if args.json:
         print(json.dumps(rows, indent=2))
         return
@@ -334,6 +439,9 @@ def cmd_list(args):
         # types messages in; the rest can talk but can't be talked to.
         deaf = "" if row["relay"] else "  (can send, can't receive)"
         print(f"{row['id']}{name}  {row['cwd'] or ''}{deaf}{you}")
+        for sub in row["subagents"]:
+            done = "  (finished)" if sub["finished"] else ""
+            print(f"  └ {sub['id']}  {sub['type']}  {sub['description']}{done}")
 
 
 def cmd_send(args):
@@ -342,6 +450,10 @@ def cmd_send(args):
     if not text:
         fail("Nothing to send")
     sender = caller()
+    if "/" in args.to:
+        sub = find_subagent(args.to)
+        args.to = sub["parent"]
+        text = f'For your subagent "{sub["description"] or sub["type"]}" ({sub["agent_id"]}), pass this on to it: {text}'
     if sender["id"] != USER:
         if os.path.exists(PAUSED):
             fail("The user has paused the agent room; nothing is delivered until they resume it")
@@ -498,6 +610,124 @@ def forward(outbox, argv):
     fail("Your relay didn't answer")
 
 
+# Watching a subagent
+
+def summarise(tool):
+    given = tool.get("input") or {}
+    for key in ("command", "file_path", "path", "pattern", "url", "description", "prompt"):
+        if isinstance(given.get(key), str):
+            return given[key]
+    return json.dumps(given)
+
+
+def result_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return ""
+
+
+def clip(text, lines, width):
+    rows = [row[:width] for row in text.strip().splitlines()[:lines]]
+    more = len(text.strip().splitlines()) - lines
+    return rows + ([f"... {more} more lines"] if more > 0 else [])
+
+
+DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
+
+
+def render(record, width):
+    kind = record.get("type")
+    message = record.get("message") or {}
+    content = message.get("content")
+    when = ""
+    if record.get("timestamp"):
+        when = datetime.datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00")).astimezone().strftime("%H:%M")
+    out = []
+    if kind == "user" and isinstance(content, str):
+        out.append(f"{when}  {BOLD}Task{RESET}")
+        out += [f"       {row}" for row in clip(content, 12, width)]
+    elif kind == "user" and isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "tool_result":
+                out += [f"       {DIM}{row}{RESET}" for row in clip(result_text(part.get("content")), 4, width)]
+    elif kind == "assistant" and isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and part.get("text", "").strip():
+                out += [f"{when}  {row}" if i == 0 else f"       {row}" for i, row in enumerate(clip(part["text"], 40, width))]
+            elif part.get("type") == "tool_use":
+                out.append(f"{when}  {BOLD}> {part.get('name')}{RESET}  {summarise(part).splitlines()[0][:width] if summarise(part) else ''}")
+    return out
+
+
+def cmd_watch(args):
+    sub = find_subagent(args.subagent)
+    title = f"{sub['parent']} > {sub['description'] or sub['type']}"
+    sys.stdout.write(f"\033]0;{title}\007")
+    width = max(40, shutil.get_terminal_size((100, 30)).columns - 8)
+    model = f" · {sub['model']}" if sub["model"] else ""
+    print(f"{BOLD}{sub['parent']} > {sub['type']}{RESET}  {sub['description']}{model}")
+    print(f"{DIM}{sub['id']}  (read-only: speak to it with @{sub['id']} in the room){RESET}\n", flush=True)
+
+    # Opened partway through a long run, start from the recent end.
+    def show_lines(lines):
+        for line in lines:
+            try:
+                rows = render(json.loads(line), width)
+            except ValueError:
+                continue
+            if rows:
+                print("\n".join(rows), flush=True)
+
+    with open(sub["transcript"]) as f:
+        lines = f.read().split("\n")
+        offset = f.tell()
+    partial = lines.pop()
+    show_lines(lines[-200:])
+
+    while True:
+        with open(sub["transcript"]) as f:
+            f.seek(offset)
+            partial += f.read()
+            offset = f.tell()
+        *complete, partial = partial.split("\n")
+        show_lines(complete)
+        parent_alive = any(f"claude-{s['pid']}" == sub["parent"] for s in claude_sessions())
+        if not parent_alive or subagent_finished(sub["transcript"]):
+            break
+        time.sleep(0.5)
+    print(f"\n{DIM}-- finished --{RESET}", flush=True)
+    if args.linger and sys.stdin.isatty():
+        print(f"{DIM}Closing in {args.linger}s, or press Enter.{RESET}", flush=True)
+        select.select([sys.stdin], [], [], args.linger)
+
+
+# Run by the room pane: every running subagent gets a terminal on the agent
+# workspace, once, for as long as the pane is open.
+MAX_WATCHERS = 8
+
+
+def cmd_open_watchers(args):
+    # Each subagent opens once: one the user closes stays closed.
+    opened = set()
+    while True:
+        running = [s for s in subagents() if not s["finished"]]
+        showing = sum(1 for s in running if s["agent_id"] in opened)
+        for sub in running:
+            if sub["agent_id"] in opened or showing >= MAX_WATCHERS:
+                continue
+            opened.add(sub["agent_id"])
+            showing += 1
+            subprocess.Popen(
+                ["omarchy-launch-tui", "--app-id=org.omarchy.agent-watch", "omarchy-agent-watch", "--linger", "60", sub["id"]],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+        time.sleep(args.every)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="omarchy-agent-room-core")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -508,6 +738,7 @@ def build_parser():
 
     p = sub.add_parser("list")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--all", action="store_true", help="include finished subagents")
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("send")
@@ -522,6 +753,15 @@ def build_parser():
     p = sub.add_parser("name")
     p.add_argument("name")
     p.set_defaults(func=cmd_name)
+
+    p = sub.add_parser("watch")
+    p.add_argument("--linger", type=int, default=0)
+    p.add_argument("subagent")
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("open-watchers")
+    p.add_argument("--every", type=float, default=3)
+    p.set_defaults(func=cmd_open_watchers)
 
     p = sub.add_parser("log")
     p.add_argument("--follow", action="store_true")

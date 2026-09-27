@@ -35,6 +35,7 @@ export XDG_RUNTIME_DIR="$test_dir/run"
 export XDG_STATE_HOME="$test_dir/state"
 export PATH="$test_dir/bin:$ROOT/bin:$PATH"
 export OMARCHY_TEST_NOTIFICATIONS="$test_dir/notifications"
+export CLAUDE_CONFIG_DIR="$test_dir/claude"
 
 room="$test_dir/run/omarchy/agents"
 
@@ -43,6 +44,9 @@ cat >"$test_dir/bin/omarchy-notification-send" <<'SH'
 #!/bin/bash
 printf '%s\n' "$*" >>"$OMARCHY_TEST_NOTIFICATIONS"
 SH
+
+# Terminals the room opens are logged, not opened.
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"%s/launched"\n' "$test_dir" >"$test_dir/bin/omarchy-launch-tui"
 
 # A fake agent is a script named like one, so its process is called claude or
 # codex, running a shell command the way an agent's tool call does.
@@ -230,6 +234,60 @@ log=$(ls "$test_dir/state/omarchy/agents/log"/*.jsonl)
 jq -se --arg f "$frontend" --arg r "$reviewer" 'any(.[]; .text == "Please review src/api" and .from == $f and .to == $r)' "$log" >/dev/null ||
   fail "the log records who said what to whom"
 pass "every message is kept in a private log the room shows"
+
+# Claude Code keeps its subagents inside the claude process, with a session
+# file tying the process to a session and a transcript per subagent. Here the
+# frontend agent plays a claude with one subagent at work and one finished.
+frontend_meta=$(cat "$room/$frontend/agent.json")
+subagents="$CLAUDE_CONFIG_DIR/projects/-work/session-1/subagents"
+mkdir -p "$CLAUDE_CONFIG_DIR/sessions" "$subagents"
+jq -n --argjson pid "$(jq .pid <<<"$frontend_meta")" --arg start "$(jq .start <<<"$frontend_meta")" \
+  '{pid: $pid, sessionId: "session-1", procStart: $start}' >"$CLAUDE_CONFIG_DIR/sessions/$(jq .pid <<<"$frontend_meta").json"
+cat >"$subagents/agent-abcd1234ef.jsonl" <<'JSONL'
+{"type":"user","timestamp":"2026-09-27T18:00:00Z","message":{"role":"user","content":"Build the director service"}}
+{"type":"assistant","timestamp":"2026-09-27T18:00:05Z","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","name":"Bash","input":{"command":"make test"}}]}}
+{"type":"user","timestamp":"2026-09-27T18:00:09Z","message":{"content":[{"type":"tool_result","content":"all green"}]}}
+JSONL
+echo '{"agentType":"general-purpose","description":"Build the director service","model":"opus","requestShape":"background"}' >"$subagents/agent-abcd1234ef.meta.json"
+echo '{"type":"assistant","timestamp":"2026-09-27T17:00:00Z","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Done with the audit."}]}}' >"$subagents/agent-99990000ff.jsonl"
+echo '{"agentType":"Explore","description":"Audit the schema"}' >"$subagents/agent-99990000ff.meta.json"
+touch -d '10 minutes ago' "$subagents/agent-99990000ff.jsonl"
+
+listed=$(omarchy-agent-list)
+[[ $listed == *"└ $frontend/abcd1234  general-purpose  Build the director service"* ]] || fail "subagents are listed under their agent" "$listed"
+[[ $listed != *"Audit the schema"* ]] || fail "finished subagents are left out of the list"
+[[ $(omarchy-agent-list --all) == *"Audit the schema  (finished)"* ]] || fail "--all lists finished subagents too"
+pass "Claude subagents are listed under their agent, finished ones only with --all"
+
+omarchy-agent-room-core open-watchers --every 0.2 &
+watcher_pid=$!
+sleep 1.5
+kill "$watcher_pid"
+wait "$watcher_pid" 2>/dev/null
+[[ $(grep -c "omarchy-agent-watch" "$test_dir/launched") == 1 ]] &&
+  grep -q -- "--app-id=org.omarchy.agent-watch omarchy-agent-watch --linger 60 $frontend/abcd1234" "$test_dir/launched" ||
+  fail "a running subagent gets one terminal, a finished one none" "$(cat "$test_dir/launched")"
+pass "the room opens one terminal per running subagent"
+
+watched=$(timeout 3 omarchy-agent-watch "$frontend/abcd1234" | sed 's/\x1b[^a-zA-Z]*[a-zA-Z]//g; s/\x1b\][^\x07]*\x07//g')
+[[ $watched == *"Build the director service"* && $watched == *"> Bash  make test"* && $watched == *"all green"* ]] ||
+  fail "watching a subagent shows its task, commands and results" "$watched"
+pass "watching a subagent shows its task, commands and results"
+
+omarchy-agent-watch "$frontend/abcd1234" >"$test_dir/watch.out" &
+watch_pid=$!
+sleep 0.5
+echo '{"type":"assistant","timestamp":"2026-09-27T18:01:00Z","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Director service is up."}]}}' >>"$subagents/agent-abcd1234ef.jsonl"
+touch -d '10 minutes ago' "$subagents/agent-abcd1234ef.jsonl"
+wait_for "a watch ends when its subagent finishes" bash -c "! kill -0 $watch_pid 2>/dev/null"
+grep -q "Director service is up." "$test_dir/watch.out" && grep -q -- "-- finished --" "$test_dir/watch.out" ||
+  fail "a watch follows the subagent to the end" "$(cat "$test_dir/watch.out")"
+pass "a watch follows its subagent live and ends when it finishes"
+
+omarchy-agent-send "$frontend/abcd1234" "hold off on the migration" >/dev/null
+wait_for "a message for a subagent reaches its agent" \
+  heard frontend 'For your subagent "Build the director service" (abcd1234ef), pass this on to it: hold off on the migration'
+pass "a message for a subagent goes to its agent to pass on"
 
 # A pid recycled by another program must not inherit a dead agent's place.
 mkdir -p "$room/claude-$$"

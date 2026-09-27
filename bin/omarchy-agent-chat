@@ -5,15 +5,18 @@
 
 echo "Agent room. Everything agents say to each other and to you shows up here."
 echo "Type to speak to every agent, or @<agent> <message> to speak to one."
+echo "@<agent>/<subagent> passes a message to a Claude subagent through its agent."
 echo "/agents lists who's here, /pause stops agents messaging anyone, /resume lets"
-echo "them carry on."
+echo "them carry on. Every running Claude subagent gets its own terminal here."
 echo
 omarchy-agent-list
 echo
 
 omarchy-agent-room-core log --follow &
 follower=$!
-trap 'kill $follower 2>/dev/null' EXIT
+omarchy-agent-room-core open-watchers &
+watchers=$!
+trap 'kill $follower $watchers 2>/dev/null' EXIT
 
 while IFS= read -e -r line; do
   history -s "$line"

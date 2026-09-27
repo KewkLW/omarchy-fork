@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# omarchy:summary=Follow a Claude subagent's work live, read-only
+# omarchy:args=[--linger <seconds>] <parent>/<subagent>
+# omarchy:examples=omarchy agent watch claude-5720/a3ed7631
+
+exec omarchy-agent-room-core watch "$@"
