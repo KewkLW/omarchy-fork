@@ -52,7 +52,7 @@ All live in the existing `agent` group, next to `omarchy agent prompt` and the s
 - `omarchy agent send <to> [message]`: says something straight into another agent's prompt: an id, a name, a kind (when only one agent of it runs), or `all`. `user` reaches the user instead. The message comes from the arguments or from stdin, and the command fails, saying why, when it isn't delivered.
 - `omarchy agent name <name>`: gives the calling agent a readable name (`reviewer`, `frontend`), usable as an address.
 - `omarchy agent log [--follow] [--all]`: the conversation so far: today's messages, or every kept day with `--all`.
-- `omarchy agent room`: opens (or focuses) the room pane on workspace 9.
+- `omarchy agent room`: opens (or focuses) the room pane on workspace 9. It's also `Super + Alt + A` and _Trigger > Agents > Agent Room_.
 
 The logic lives in one hidden Python command, `omarchy-agent-room-core`. The user-facing commands are three-line wrappers around it, the same shape as the agent seat's.
 

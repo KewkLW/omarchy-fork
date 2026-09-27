@@ -94,6 +94,7 @@ o.bind("SUPER + CTRL + ALT + B", "Show battery remaining", "omarchy-notification
 o.bind("SUPER + CTRL + ALT + W", "Toggle weather", "omarchy-notification-weather")
 
 o.bind("SUPER + SHIFT + CTRL + A", "Agent", "omarchy-agent --pick")
+o.bind("SUPER + ALT + A", "Agent room", "omarchy-agent-room")
 o.bind("SUPER + CTRL + ALT + A", "Agent seat", "omarchy-agent-seat-show")
 o.bind("SUPER + CTRL + A", "Audio", "omarchy-shell shell toggle omarchy.audio")
 o.bind("SUPER + CTRL + B", "Bluetooth", "omarchy-shell shell toggle omarchy.bluetooth")

@@ -67,6 +67,7 @@
   "trigger.hardware": {"icon":"","label":"Hardware","aliases":["hardware","hw"]},
   "trigger.tests": {"icon":"󰓅","label":"Speed Test"},
   "trigger.agents": {"icon":"󰚩","label":"Agents"},
+  "trigger.agents.room": {"icon":"󰭹","label":"Agent Room","action":"omarchy-agent-room"},
   "trigger.agents.seat": {"icon":"󱚤","label":"Agent Seat","when":"omarchy-agent-seat-status >/dev/null","action":"omarchy-agent-seat-show"},
   "trigger.agents.seat-stop": {"icon":"󱚤","label":"Stop Agent Seat","when":"omarchy-agent-seat-status >/dev/null","action":"omarchy-agent-seat-stop"},
   "trigger.hardware.laptop-display": {"icon":"󰛧","label":"Laptop Display","when":"omarchy-hw-laptop","action":"omarchy-hyprland-monitor-internal toggle"},
