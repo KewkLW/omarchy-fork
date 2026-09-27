@@ -1,7 +1,8 @@
--- The agent room. Agents launched with omarchy agent (the keybinding, the menu,
--- a prompt) open on the agent workspace alongside the room pane, where the
--- conversation between them and you runs, so agent work stays in one place and
--- out of yours. The Quake console agent keeps to the scratchpad: its exec rule
+-- The agent room: a workspace of terminals only, for watching agents work.
+-- Agents launched with omarchy agent (the keybinding, the menu, a prompt) open
+-- there alongside the room pane, where the conversation between them and you
+-- runs. Nothing else belongs on it; the agent seat's GUI apps keep their own
+-- workspace so they don't crowd the terminals. The Quake console agent keeps to the scratchpad: its exec rule
 -- pins it there, and it joins the room from wherever it drops down.
 local AGENT_WORKSPACE = "9"
 

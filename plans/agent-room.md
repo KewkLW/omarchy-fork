@@ -15,7 +15,7 @@ Omarchy ships every major coding agent pre-wired (`omarchy-default-agent`, `omar
 
 A small, file-based message system every agent can use through ordinary `omarchy agent` commands, because every agent Omarchy ships can already run a shell command. There is nothing to install into the agents and no protocol for them to implement. Agents are discovered from the process tree, messages are files in `$XDG_RUNTIME_DIR`, and every message is also appended to a log the user owns. The user is a participant too: the address `user` reaches them, and anything they send from a terminal is stamped as coming from them.
 
-All of it lives on **workspace 9, the agent room**: agent terminals opened by the keybinding, the room pane (the running conversation, with a prompt to talk into it), and the agent seat's sandboxed apps.
+Its home is **workspace 9, the agent room**, which is for terminals only: the agent terminals opened by the keybinding, and the room pane (the running conversation, with a prompt to talk into it). It's where you watch what your agents are doing, so nothing else is sent there. The agent seat's GUI apps stay on workspace 10.
 
 No daemon, no new packages (Python and `jq` are already on every install), no network listener.
 
@@ -90,7 +90,7 @@ One window rule file, `default/hypr/apps/agents.lua`:
 
 - `org.omarchy.agent` (terminals from the keybinding and `omarchy agent`) opens on workspace 9 and takes you there.
 - `org.omarchy.agent-room` opens on workspace 9 too.
-- The agent seat's apps move from workspace 10 to 9 (a one-line change to `default/hypr/apps/agent-seat.lua` on that branch), so everything an agent does is in one place.
+- Nothing else goes there. Workspace 9 is for watching agents work, so it holds only their terminals and the room pane. The agent seat's GUI apps keep workspace 10, where they don't crowd the terminals.
 - The Quake console agent stays on the scratchpad. Its exec rule pins the workspace, and a drop-down console that jumps you elsewhere would defeat it. It still joins the room as a participant.
 
 The workspace is one constant in that file, for users who keep 9 for something else.
@@ -113,8 +113,7 @@ The trust boundary is the Unix user, and this plan doesn't pretend otherwise. Wh
 ## Rollout
 
 1. **This PR.** The messaging commands, the room pane, the pty relay wired into `omarchy-agent`, the workspace 9 rules, the skill topic (`default/agents/skills/omarchy/agent-room.md`, linked from `SKILL.md`), and a manual section in `manual/17-ai.md`. No migration: the runtime state is new, and the rules ship under `default/`.
-2. **The agent seat PR** moves its rule to workspace 9 when it lands, which is the one line noted above.
-3. **Later, if wanted:** an agents-panel section in the bar listing who's in the room with unread counts, an MCP shim for agents that prefer tools to shell, and remote control (below).
+2. **Later, if wanted:** an agents-panel section in the bar listing who's in the room with unread counts, an MCP shim for agents that prefer tools to shell, and remote control (below).
 
 ## Follow-up: remote control
 
