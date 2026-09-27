@@ -127,6 +127,15 @@ The room's windows are placed by `default/hypr/agent-workspaces.lua`, shared wit
 - Nothing else goes there. The room's workspace is for watching agents work, so it holds only their terminals and the room pane. The agent seat's GUI apps keep their own workspace (10), where they don't crowd the terminals.
 - The Quake console agent stays on the scratchpad. Its exec rule pins the workspace, and a drop-down console that jumps you elsewhere would defeat it. It still joins the room as a participant.
 
+**Windows agents open** are routed there at the core, by Hyprland itself, whichever agent opened them and however: every window that opens is checked against the process that owns it. Omarchy's launchers detach from the process tree (`uwsm-app` hands the app to systemd), but they pass the environment on, and an agent's children inherit its environment. So a window whose process carries an agent's marker was opened by an AI: `OMARCHY_AGENT_ROOM_OUTBOX` from the relay, `AI_AGENT` and `CLAUDECODE` from Claude Code, `CODEX_THREAD_ID` and `CODEX_SESSION_ID` from Codex. Failing that, an agent among its ancestors gives it away. The user's own terminal is an agent's parent, not its child, so an agent started by hand stays where it was started.
+
+- Terminals (Omarchy's `terminal` tag) go to the room; everything else goes to the seat's workspace.
+- A window that the user's own rules send somewhere else keeps its place: a game to its workspace, the Quake console to the scratchpad. Only windows that would land where the user is, or on an agent workspace, are routed.
+- The user is never taken along. Hyprland focuses a new window as it maps whatever is set on it first (a `no_initial_focus` prop set from `window.open_early` doesn't hold, and neither does a tag rule), so the router notes where the user was and hands focus back on `window.open`. A rule that isn't silent switches the view before the window opens, so the router tracks view changes and takes the workspace from just before a switch that landed on the window's workspace within 50 ms. Measured in a nested Hyprland, the view is on the agent workspace for under 10 ms, less than a frame.
+- `set({ route_spawned = false })` turns it off.
+
+This is all Lua in `agent-workspaces.lua`, reading `/proc` from Hyprland's own config: no daemon, and nothing to install into the agents.
+
 The room is 9 by default. `require("default.hypr.agent-workspaces").set({ room = 7 })` in the user's `hyprland.lua` moves it; the template there shows how. For people who give each monitor its own bank of workspaces (1–10 on one, 11–20 on the next), `per_monitor = 10` gives every monitor its own room and seat (9 and 10, then 19 and 20), counted from the left or in the order `monitors` lists, and an agent opens in the room of the monitor the user is on. The placement is a named window rule that the module rewrites whenever the focused monitor changes, so the window opens in the right place rather than flashing on the wrong one first.
 
 ### Security
