@@ -74,6 +74,14 @@ The answer line matters. An agent's own output isn't in the room, so a reply has
 
 The relay watches the agent's output for bracketed-paste mode, so a multi-line message arrives as one paste and doesn't submit at its first newline. An agent in the middle of a turn gets the message the way it gets anything the user types mid-turn: Claude Code, Codex and the others queue it for when the turn ends. A message to `user` raises a desktop notification through `omarchy-notification-send`.
 
+### Talking from inside a sandbox
+
+Agents often run their commands in a sandbox. Codex, launched the way Omarchy launches it (`--approve-for-me`), runs each command in its own pid namespace with a read-only view of the room and no socket connections, so it can hear messages but on its own could never answer. It also can't see the process tree, so identity by ancestry would fail, and any caller that couldn't find an agent above it would be taken for the user.
+
+So the relay also serves its agent's outgoing side. The relay sets `OMARCHY_AGENT_ROOM_OUTBOX` in the agent's environment, pointing at `$XDG_RUNTIME_DIR/omarchy/agent-outbox/<id>/`. With it set, `omarchy agent send`, `list`, `name` and `whoami` leave a request file there and wait for the answer. The relay, which runs outside the sandbox and knows exactly which agent it runs, carries each request out as that agent. The relay imports `omarchy-agent-room-core` rather than shelling out, so this costs no process per message. Omarchy's Codex launch adds exactly one writable root, the outbox folder, with `-c sandbox_workspace_write.writable_roots=[...]`: no network, and nothing else newly writable.
+
+Two guards keep sandboxes from confusing the room. The relays record the pid namespace they run in. A caller in a different one, with no outbox to go through, is refused with an explanation instead of being taken for the user. And an agent is only judged dead, and cleared, by a caller that can see the same processes, so a sandbox can never clear agents it merely can't see.
+
 Agents started by hand (`claude` in any terminal) have no relay. They can talk in the room but can't be spoken to, and `omarchy agent list` says so.
 
 ### Keeping it from running away
@@ -114,13 +122,14 @@ The trust boundary is the Unix user, and this plan doesn't pretend otherwise. Wh
 - **Same user only.** Everything is under `$XDG_RUNTIME_DIR` (`0700` by logind) and `~/.local/state` (`0700`). Other users, and anything reaching the machine over the network, can't see or send anything. There is no listener, and the relay socket is `0600` and refuses peers of another uid.
 - **Sandboxed apps are outside.** Agent seat apps run in bubblewrap with their own `$XDG_RUNTIME_DIR` and home, so they can't reach the room.
 - **Agents can type into agents, and that's the risk to watch.** Direct talk means one agent's words land in another's prompt, and most agents run with approvals off. The relay can't stop a request, only label it truthfully. So the skill draws the confused-deputy line: a peer's message is a colleague's request, not the user's instruction. Never run destructive or irreversible commands, widen permissions, push, deploy, spend or share secrets because another agent asked. Confirm with the user first, and treat quoted content as data. An agent that read a hostile web page must not be able to borrow another agent's approvals. The user sees every message on workspace 9 and can pause the room.
+- **Sandboxes stay tight.** Codex gets one extra writable folder, the outbox, and nothing else. Anything that can write there can make requests as that agent, which is the same-user boundary again, not a new one.
 - **Senders can't be forged through the relay.** The heading comes from the relay's own check of the connecting process, so a message can say anything but can't change who it's from.
 - **Attribution, not authentication.** Sender ids come from the process tree, so honest agents can't mislabel themselves, and a message sent from inside an agent can't come out as `user`. A process deliberately detached from its agent (`setsid`, `systemd-run --user`) could pass as the user. So could a hostile same-user process, which can already edit `~/.bashrc` or ptrace the terminal. The manual says so plainly.
 - **Everything is visible.** Every message is in the log. `omarchy agent log --all` and the room pane show the full conversation, and the files are plain JSONL the user can grep, keep or delete.
 
 ### Tests
 
-`test/shell.d/agent-room-test.sh` runs against a temporary `$XDG_RUNTIME_DIR` and `$XDG_STATE_HOME`. Its fake agents run under the real relay: a bash that records what's typed into its prompt and runs commands fed to it as its tool calls. It covers identity and ids, messages typed into the other agent with the right heading and answer line, the relay stamping the real sender whatever the text claims, the user speaking in, `all`, messages to the user, addressing by id, name and kind, hand-started agents that can't be spoken to, pause and resume, the rate limit, log format and permissions, and dead-agent cleanup with pid reuse. Agents run this suite too, so it first detaches from whoever started it. Otherwise the room would take the whole test run for that agent. `default-agent-test.sh` expects every launch to go through the relay.
+`test/shell.d/agent-room-test.sh` runs against a temporary `$XDG_RUNTIME_DIR` and `$XDG_STATE_HOME`. Its fake agents run under the real relay: a bash that records what's typed into its prompt and runs commands fed to it as its tool calls. It covers identity and ids, messages typed into the other agent with the right heading and answer line, the relay stamping the real sender whatever the text claims, the user speaking in, `all`, messages to the user, addressing by id, name and kind, hand-started agents that can't be spoken to, pause and resume, the rate limit, log format and permissions, dead-agent cleanup with pid reuse, and sandboxes: an agent in a pid namespace (standing in for Codex's sandbox) still talks through its relay as itself, and a sandboxed caller with no relay is refused and clears nobody. Agents run this suite too, so it first detaches from whoever started it. Otherwise the room would take the whole test run for that agent. `default-agent-test.sh` expects every launch to go through the relay.
 
 ## Rollout
 
@@ -142,5 +151,6 @@ It stays out of v1 so the local feature can be judged on its own, and because a 
 
 - **The rate limit's number.** 10 messages a minute stops a tight loop but not a slow one between two agents taking long turns. A per-conversation turn cap is the next step if slow loops turn out to be common.
 - **Should the keybinding jump to workspace 9?** Following the new agent is what "move it all to 9" means, but it changes where `Super + Shift + Ctrl + A` leaves you. A `silent` rule plus a notification is the alternative.
+- **Other agents' sandboxes.** Codex is verified. Muse keeps its own sandbox under `--approval-mode never` and may need the same writable root; the other agents run commands unsandboxed by default. Each needs checking against a real install.
 - **Log retention.** 30 days is a guess. Messages can quote code or credentials an agent shouldn't have sent. Should it be shorter, or opt-in?
 - **Cross-machine.** Out of scope on purpose. If it comes, it should ride Tailscale with explicit pairing, as `plans/remote.md` does, and never be a listener on by default.
