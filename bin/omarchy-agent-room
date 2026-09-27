@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# omarchy:summary=Open the agent room, where you can follow and join what your agents say to each other
+
+# The window rule in default/hypr/apps/agents.lua puts the room on the agent
+# workspace and takes you there.
+exec omarchy-launch-or-focus-tui --app-id=org.omarchy.agent-room omarchy-agent-chat
