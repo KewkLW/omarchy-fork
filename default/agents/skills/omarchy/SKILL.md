@@ -47,6 +47,7 @@ matching guide before starting:
 - [`hooks.md`](hooks.md) - automation hooks that run on system events
 - [`capture.md`](capture.md) - screenshots, screen recordings, OCR text capture, and file sharing
 - [`agent-seat.md`](agent-seat.md) - driving GUI apps (click, type, screenshot) on the agent seat instead of the user's desktop
+- [`agent-room.md`](agent-room.md) - finding and messaging the other agents on this machine, and reaching the user
 - [`contributing.md`](contributing.md) - reporting Omarchy bugs and submitting fixes upstream
 
 ## Critical Safety Rules

@@ -1,0 +1,484 @@
+#!/usr/bin/python3
+
+# omarchy:summary=Shared core behind the agent room commands
+# omarchy:args=whoami|whois|list|send|inbox|name|log|register [args...]
+# omarchy:hidden=true
+
+# The agent room lets agents running as this user find each other and trade
+# messages, with the user able to read and join every conversation. There is no
+# daemon: identity comes from the process tree, inboxes are directories under
+# $XDG_RUNTIME_DIR, and every message is appended to a log the user owns. The
+# omarchy-agent-{list,send,inbox,name,log} wrappers all land here.
+
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+# The agents omarchy-default-agent knows. A process counts as an agent when its
+# name is one of these, or when it is an interpreter running a script with one
+# of these names (npm-installed agents run as `node .../bin/<agent>`).
+AGENT_KINDS = {
+    "agy", "claude", "codex", "copilot", "crush", "cursor-agent", "grok",
+    "hermes", "muse", "omp", "opencode", "openclaw", "ori", "pi",
+}
+INTERPRETERS = re.compile(r"^(node|nodejs|bun|deno|python[0-9.]*)$")
+
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "omarchy", "agents")
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "omarchy", "agents")
+LOG_DIR = os.path.join(STATE, "log")
+LOG_DAYS = 30
+USER = "user"
+
+os.umask(0o077)
+
+
+def fail(message, code=1):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+# Processes
+
+def read_stat(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+    except OSError:
+        return None
+    # comm is parenthesised and may itself contain spaces or parentheses.
+    close = data.rindex(")")
+    comm = data[data.index("(") + 1 : close]
+    fields = data[close + 2 :].split()
+    return {"comm": comm, "ppid": int(fields[1]), "start": int(fields[19])}
+
+
+def cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        return []
+
+
+def agent_kind(pid, stat):
+    if stat["comm"] in AGENT_KINDS:
+        return stat["comm"]
+    args = cmdline(pid)
+    if args and os.path.basename(args[0]) in AGENT_KINDS:
+        return os.path.basename(args[0])
+    if args and INTERPRETERS.match(os.path.basename(args[0])):
+        for arg in args[1:]:
+            if arg.startswith("-"):
+                continue
+            name = re.sub(r"\.(c?m?js|ts|py)$", "", os.path.basename(arg))
+            return name if name in AGENT_KINDS else None
+    return None
+
+
+def alive(pid, start):
+    stat = read_stat(pid)
+    return stat is not None and stat["start"] == start
+
+
+# Identity: the nearest agent above the caller, or the user when there is none.
+# A pty relay registers its agent up front, so a registered pid wins even when
+# the agent runs under a name this list doesn't know.
+
+def caller():
+    return identify(os.getppid())
+
+
+def identify(pid):
+    registered = {a["pid"]: a for a in agents()}
+    while pid > 1:
+        stat = read_stat(pid)
+        if stat is None:
+            break
+        if pid in registered:
+            return registered[pid]
+        kind = agent_kind(pid, stat)
+        if kind:
+            return register(kind, pid, stat["start"])
+        pid = stat["ppid"]
+    return {"id": USER, "name": USER, "kind": USER}
+
+
+def agent_dir(agent_id):
+    return os.path.join(RUNTIME, agent_id)
+
+
+def register(kind, pid, start, relay=False):
+    agent_id = f"{kind}-{pid}"
+    path = agent_dir(agent_id)
+    meta_path = os.path.join(path, "agent.json")
+    existing = load_json(meta_path)
+    if existing and existing.get("start") == start:
+        if relay and not existing.get("relay"):
+            existing["relay"] = True
+            write_json(meta_path, existing)
+        return existing
+    # A leftover directory under a recycled pid belongs to a dead agent.
+    shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(os.path.join(path, "inbox"), mode=0o700, exist_ok=True)
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = None
+    meta = {
+        "id": agent_id,
+        "kind": kind,
+        "pid": pid,
+        "start": start,
+        "name": None,
+        "cwd": cwd,
+        "relay": relay,
+        "since": now(),
+    }
+    write_json(meta_path, meta)
+    return meta
+
+
+def agents():
+    found = []
+    try:
+        entries = sorted(os.listdir(RUNTIME))
+    except FileNotFoundError:
+        return found
+    for entry in entries:
+        if entry == USER:
+            continue
+        meta = load_json(os.path.join(RUNTIME, entry, "agent.json"))
+        if meta is None:
+            continue
+        if alive(meta["pid"], meta["start"]):
+            found.append(meta)
+        else:
+            shutil.rmtree(os.path.join(RUNTIME, entry), ignore_errors=True)
+    return found
+
+
+def resolve(target, sender):
+    if target == USER:
+        return [{"id": USER, "name": USER, "kind": USER}]
+    live = agents()
+    if target == "all":
+        return [a for a in live if a["id"] != sender["id"]]
+    for key in ("id", "name"):
+        matches = [a for a in live if a.get(key) == target]
+        if matches:
+            return matches[:1]
+    matches = [a for a in live if a["kind"] == target or str(a["pid"]) == target]
+    if len(matches) == 1:
+        return matches
+    if len(matches) > 1:
+        fail(f"More than one {target} is running; address one by id: " + ", ".join(a["id"] for a in matches))
+    fail(f"No agent called {target}. See: omarchy agent list")
+
+
+# Files
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, data):
+    temp = f"{path}.{os.getpid()}.tmp"
+    with open(temp, "w") as f:
+        json.dump(data, f)
+    os.replace(temp, path)
+
+
+def inbox_dir(agent_id):
+    path = os.path.join(agent_dir(agent_id), "inbox")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def label(agent):
+    return agent.get("name") or agent["id"]
+
+
+def append_log(message):
+    os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+    day = message["time"][:10]
+    with open(os.path.join(LOG_DIR, f"{day}.jsonl"), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps(message) + "\n")
+    cutoff = (datetime.date.today() - datetime.timedelta(days=LOG_DAYS)).isoformat()
+    for name in os.listdir(LOG_DIR):
+        if name.endswith(".jsonl") and name[:10] < cutoff:
+            os.unlink(os.path.join(LOG_DIR, name))
+
+
+def deliver(recipient, message):
+    inbox = inbox_dir(recipient["id"])
+    temp = os.path.join(inbox, f".{message['id']}.tmp")
+    with open(temp, "w") as f:
+        json.dump(message, f)
+    os.replace(temp, os.path.join(inbox, f"{message['id']}.json"))
+
+
+# The user reaches an agent that sits idle at its prompt by having its pty relay
+# type the message in. Agents only ever leave mail: the relay refuses them.
+def type_into(recipient, message):
+    if message["from"] != USER or not recipient.get("relay"):
+        return
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(2)
+        sock.connect(os.path.join(agent_dir(recipient["id"]), "input.sock"))
+        sock.sendall(f"[Agent room] From user: {message['text']}".encode())
+    except OSError:
+        pass
+    finally:
+        sock.close()
+
+
+def notify_user(message):
+    subprocess.run(
+        ["omarchy-notification-send", "-g", "󰚩", f"{message['from_name']} says", message["text"][:300]],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+# Commands
+
+def cmd_whoami(args):
+    me = caller()
+    print(json.dumps(me) if args.json else me["id"])
+
+
+# The pty relay asks this about each peer, so only the user can type into agents.
+def cmd_whois(args):
+    print(identify(args.pid)["id"])
+
+
+def cmd_list(args):
+    me = caller()
+    rows = []
+    for agent in agents():
+        try:
+            unread = len([n for n in os.listdir(os.path.join(agent_dir(agent["id"]), "inbox")) if n.endswith(".json")])
+        except OSError:
+            unread = 0
+        rows.append({**agent, "unread": unread, "you": agent["id"] == me["id"]})
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No agents running")
+        return
+    for row in rows:
+        name = f" ({row['name']})" if row["name"] else ""
+        you = "  <- you" if row["you"] else ""
+        mail = f"  {row['unread']} unread" if row["unread"] else ""
+        print(f"{row['id']}{name}  {row['cwd'] or ''}{mail}{you}")
+
+
+def cmd_send(args):
+    text = " ".join(args.message) if args.message else sys.stdin.read()
+    text = text.strip()
+    if not text:
+        fail("Nothing to send")
+    sender = caller()
+    recipients = resolve(args.to, sender)
+    if not recipients:
+        fail("No other agents are running")
+    message = {
+        "id": f"m-{int(time.time() * 1000)}-{random.randrange(10000):04d}",
+        "time": now(),
+        "from": sender["id"],
+        "from_name": label(sender),
+        "to": args.to if args.to == "all" else recipients[0]["id"],
+        "reply_to": args.reply,
+        "text": text,
+    }
+    append_log(message)
+    for recipient in recipients:
+        deliver(recipient, message)
+        if recipient["id"] == USER:
+            notify_user(message)
+        else:
+            type_into(recipient, message)
+    print(message["id"])
+
+
+def unread(agent_id):
+    inbox = inbox_dir(agent_id)
+    names = sorted(n for n in os.listdir(inbox) if n.endswith(".json"))
+    return [(os.path.join(inbox, n), load_json(os.path.join(inbox, n))) for n in names]
+
+
+def cmd_inbox(args):
+    me = caller()
+    deadline = time.monotonic() + args.wait if args.wait is not None else None
+    messages = unread(me["id"])
+    # Polling a tmpfs directory four times a second costs nothing measurable and
+    # needs no watcher process to clean up if the caller is killed mid-wait.
+    while not messages and deadline is not None and time.monotonic() < deadline:
+        time.sleep(0.25)
+        messages = unread(me["id"])
+    for path, message in messages:
+        if message is None:
+            continue
+        if args.json:
+            print(json.dumps(message))
+        else:
+            reply = f" (re {message['reply_to']})" if message.get("reply_to") else ""
+            print(f"[{message['id']}] from {message['from_name']} ({message['from']}){reply}:\n{message['text']}\n")
+        if not args.peek:
+            os.unlink(path)
+    if not messages and deadline is not None:
+        sys.exit(2)
+
+
+def cmd_name(args):
+    me = caller()
+    if me["id"] == USER:
+        fail("Only agents take names; you are already `user`")
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", args.name) or args.name in (USER, "all") or args.name in AGENT_KINDS:
+        fail("Names are lowercase letters, digits and dashes, and can't be user, all, or an agent kind")
+    if any(a["name"] == args.name and a["id"] != me["id"] for a in agents()):
+        fail(f"Another agent is already called {args.name}")
+    meta_path = os.path.join(agent_dir(me["id"]), "agent.json")
+    meta = load_json(meta_path)
+    meta["name"] = args.name
+    write_json(meta_path, meta)
+    print(args.name)
+
+
+def log_files(all_days):
+    try:
+        names = sorted(n for n in os.listdir(LOG_DIR) if n.endswith(".jsonl"))
+    except FileNotFoundError:
+        return []
+    if not all_days:
+        today = datetime.date.today().isoformat()
+        names = [n for n in names if n[:10] >= today] or names[-1:]
+    return [os.path.join(LOG_DIR, n) for n in names]
+
+
+def show(line, as_json):
+    if as_json:
+        print(line, end="" if line.endswith("\n") else "\n", flush=True)
+        return
+    try:
+        message = json.loads(line)
+    except ValueError:
+        return
+    when = datetime.datetime.fromisoformat(message["time"].replace("Z", "+00:00")).astimezone().strftime("%H:%M")
+    sender, to = message["from_name"], message["to"]
+    if sys.stdout.isatty():
+        sender, to = paint(message["from"], sender), paint(to, to)
+    print(f"{when}  {sender} -> {to}: {message['text']}", flush=True)
+
+
+# Each participant keeps one terminal colour, so a busy room reads at a glance.
+def paint(key, text):
+    if key == USER:
+        return f"\033[1m{text}\033[0m"
+    colour = 31 + sum(key.encode()) % 6
+    return f"\033[{colour}m{text}\033[0m"
+
+
+def cmd_log(args):
+    files = log_files(args.all)
+    for path in files:
+        with open(path) as f:
+            for line in f:
+                show(line, args.json)
+    if not args.follow:
+        return
+    path = files[-1] if files else None
+    offset = os.path.getsize(path) if path else 0
+    while True:
+        latest = log_files(False)
+        if latest and latest[-1] != path:
+            path, offset = latest[-1], 0
+        if path and os.path.exists(path) and os.path.getsize(path) > offset:
+            with open(path) as f:
+                f.seek(offset)
+                for line in f:
+                    show(line, args.json)
+                offset = f.tell()
+        time.sleep(0.25)
+
+
+def cmd_register(args):
+    stat = read_stat(args.pid)
+    if stat is None:
+        fail(f"No process {args.pid}")
+    print(json.dumps(register(args.kind, args.pid, stat["start"], relay=True)))
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="omarchy-agent-room-core")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("whoami")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_whoami)
+
+    p = sub.add_parser("whois")
+    p.add_argument("pid", type=int)
+    p.set_defaults(func=cmd_whois)
+
+    p = sub.add_parser("list")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("send")
+    p.add_argument("--reply")
+    p.add_argument("to")
+    p.add_argument("message", nargs="*")
+    p.set_defaults(func=cmd_send)
+
+    p = sub.add_parser("inbox")
+    p.add_argument("--wait", type=float, nargs="?", const=600)
+    p.add_argument("--peek", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_inbox)
+
+    p = sub.add_parser("name")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_name)
+
+    p = sub.add_parser("log")
+    p.add_argument("--follow", action="store_true")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser("register")
+    p.add_argument("kind")
+    p.add_argument("pid", type=int)
+    p.set_defaults(func=cmd_register)
+
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
+
+
+main()

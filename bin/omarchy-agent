@@ -129,6 +129,10 @@ pi)
   ;;
 esac
 
+# The pty relay puts the agent in the agent room, where other agents can find it
+# and the user can speak to it from the room pane.
+command=(omarchy-agent-pty "$agent" "${command[@]}")
+
 if [[ $inline == "true" ]]; then
   exec "${command[@]}"
 else

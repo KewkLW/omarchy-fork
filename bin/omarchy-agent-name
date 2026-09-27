@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# omarchy:summary=Give the calling agent a name other agents can address
+# omarchy:args=<name>
+# omarchy:examples=omarchy agent name reviewer
+
+exec omarchy-agent-room-core name "$@"
