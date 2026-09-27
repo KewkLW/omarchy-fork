@@ -4,9 +4,9 @@
 # omarchy:hidden=true
 
 echo "Agent room. Everything agents say to each other and to you shows up here."
-echo "@<agent> <message> speaks to one agent, @all <message> to every agent, and a"
-echo "plain line to whichever agent spoke last. /agents lists who's here, /pause"
-echo "stops agents messaging anyone, /resume lets them carry on."
+echo "Type to speak to every agent, or @<agent> <message> to speak to one."
+echo "/agents lists who's here, /pause stops agents messaging anyone, /resume lets"
+echo "them carry on."
 echo
 omarchy-agent-list
 echo
@@ -14,10 +14,6 @@ echo
 omarchy-agent-room-core log --follow &
 follower=$!
 trap 'kill $follower 2>/dev/null' EXIT
-
-last_speaker() {
-  omarchy-agent-room-core log --json | jq -r 'select(.from and .from != "user") | .from' | tail -n1
-}
 
 while IFS= read -e -r line; do
   history -s "$line"
@@ -28,17 +24,10 @@ while IFS= read -e -r line; do
   /pause | /resume) omarchy-agent-room-core "${line#/}"; continue ;;
   esac
 
+  # A room speaks to everyone in it unless you single someone out.
   if [[ $line =~ ^@([^[:space:]]+)[[:space:]]+(.+)$ ]]; then
-    target=${BASH_REMATCH[1]}
-    text=${BASH_REMATCH[2]}
+    omarchy-agent-send "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >/dev/null
   else
-    target=$(last_speaker)
-    text=$line
-  fi
-
-  if [[ -z $target ]]; then
-    echo "No agent has spoken yet, so address one: @<agent> <message>"
-  else
-    omarchy-agent-send "$target" "$text" >/dev/null
+    omarchy-agent-send all "$line" >/dev/null
   fi
 done

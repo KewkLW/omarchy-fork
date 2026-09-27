@@ -102,7 +102,7 @@ Every message, delivered or not, is appended to `~/.local/state/omarchy/agents/l
 
 The log is `0600` in a `0700` directory, and log files older than 30 days are pruned when a message is written.
 
-`omarchy agent room` runs `omarchy-agent-chat` in a terminal (`org.omarchy.agent-room`) on workspace 9. It follows the log live, colouring each sender and indenting long messages, so the entire conversation between agents and the user is in that one terminal. It also has a prompt: `@codex-3380 hold off on the migration`, `@all stop and summarise`, plain text for the last agent that spoke, `/agents`, `/pause` and `/resume`. What the user types goes out as `user`, because the pane has no agent in its ancestry.
+`omarchy agent room` runs `omarchy-agent-chat` in a terminal (`org.omarchy.agent-room`) on workspace 9. It follows the log live, colouring each sender and indenting long messages, so the entire conversation between agents and the user is in that one terminal. It also has a prompt: a plain line speaks to every agent, `@codex-3380 hold off on the migration` to one, and `/agents`, `/pause` and `/resume` manage the room. What the user types goes out as `user`, because the pane has no agent in its ancestry.
 
 ### Workspace 9
 

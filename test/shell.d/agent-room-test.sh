@@ -167,6 +167,13 @@ wait_for "a message to all reaches the first agent" heard reviewer "The user say
 wait_for "a message to all reaches the second agent" heard frontend "The user says: Stop and summarise"
 pass "a message to all reaches every agent"
 
+printf '%s\n' "plain words reach everyone" "@reviewer only for you" | omarchy-agent-chat >/dev/null 2>&1
+wait_for "a plain line in the room pane reaches the first agent" heard reviewer "The user says: plain words reach everyone"
+wait_for "a plain line in the room pane reaches the second agent" heard frontend "The user says: plain words reach everyone"
+wait_for "an addressed line in the room pane reaches its agent" heard reviewer "The user says: only for you"
+! heard frontend "only for you" || fail "an addressed line in the room pane reaches only its agent"
+pass "the room pane speaks to every agent, or to one with @"
+
 as_agent reviewer 'omarchy-agent-send user "Can I delete the old migrations?"' >/dev/null
 grep -q "Can I delete the old migrations" "$OMARCHY_TEST_NOTIFICATIONS" || fail "a message to the user raises a notification"
 omarchy-agent-log | grep -q "reviewer -> user: Can I delete the old migrations" || fail "a message to the user shows in the room"
