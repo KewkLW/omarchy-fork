@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# omarchy:summary=Send a message to another agent or to the user
-# omarchy:args=[--reply <message-id>] <id|name|kind|user|all> [message]
-# omarchy:examples=omarchy agent send codex "Review src/api when you can" | echo "done" | omarchy agent send user | omarchy agent send all "Stop and summarise"
+# omarchy:summary=Say something straight into another agent's prompt, or to the user
+# omarchy:args=<id|name|kind|user|all> [message]
+# omarchy:examples=omarchy agent send codex "Can you review src/api?" | echo "done" | omarchy agent send user | omarchy agent send all "Stop and summarise"
 
 exec omarchy-agent-room-core send "$@"

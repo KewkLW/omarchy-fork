@@ -1,14 +1,15 @@
 #!/usr/bin/python3
 
 # omarchy:summary=Shared core behind the agent room commands
-# omarchy:args=whoami|whois|list|send|inbox|name|log|register [args...]
+# omarchy:args=whoami|whois|list|send|pause|resume|name|log|register [args...]
 # omarchy:hidden=true
 
-# The agent room lets agents running as this user find each other and trade
-# messages, with the user able to read and join every conversation. There is no
-# daemon: identity comes from the process tree, inboxes are directories under
-# $XDG_RUNTIME_DIR, and every message is appended to a log the user owns. The
-# omarchy-agent-{list,send,inbox,name,log} wrappers all land here.
+# The agent room lets agents running as this user talk to each other directly,
+# with the whole conversation on show in the room pane on workspace 9, where the
+# user can join in. There is no daemon: identity comes from the process tree,
+# each agent's pty relay types what it is sent into its prompt, and every
+# message is appended to a log the room pane follows. The
+# omarchy-agent-{list,send,name,log} wrappers all land here.
 
 import argparse
 import datetime
@@ -37,6 +38,11 @@ STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.
 LOG_DIR = os.path.join(STATE, "log")
 LOG_DAYS = 30
 USER = "user"
+PAUSED = os.path.join(RUNTIME, "paused")
+
+# Two agents answering each other can talk forever. Past this many messages a
+# minute an agent is told to slow down, and the user can pause the room outright.
+RATE_LIMIT = 10
 
 os.umask(0o077)
 
@@ -128,7 +134,7 @@ def register(kind, pid, start, relay=False):
         return existing
     # A leftover directory under a recycled pid belongs to a dead agent.
     shutil.rmtree(path, ignore_errors=True)
-    os.makedirs(os.path.join(path, "inbox"), mode=0o700, exist_ok=True)
+    os.makedirs(path, mode=0o700, exist_ok=True)
     try:
         cwd = os.readlink(f"/proc/{pid}/cwd")
     except OSError:
@@ -154,8 +160,6 @@ def agents():
     except FileNotFoundError:
         return found
     for entry in entries:
-        if entry == USER:
-            continue
         meta = load_json(os.path.join(RUNTIME, entry, "agent.json"))
         if meta is None:
             continue
@@ -171,7 +175,7 @@ def resolve(target, sender):
         return [{"id": USER, "name": USER, "kind": USER}]
     live = agents()
     if target == "all":
-        return [a for a in live if a["id"] != sender["id"]]
+        return [a for a in live if a["id"] != sender["id"] and a.get("relay")]
     for key in ("id", "name"):
         matches = [a for a in live if a.get(key) == target]
         if matches:
@@ -205,12 +209,6 @@ def write_json(path, data):
     os.replace(temp, path)
 
 
-def inbox_dir(agent_id):
-    path = os.path.join(agent_dir(agent_id), "inbox")
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    return path
-
-
 def label(agent):
     return agent.get("name") or agent["id"]
 
@@ -227,26 +225,38 @@ def append_log(message):
             os.unlink(os.path.join(LOG_DIR, name))
 
 
-def deliver(recipient, message):
-    inbox = inbox_dir(recipient["id"])
-    temp = os.path.join(inbox, f".{message['id']}.tmp")
-    with open(temp, "w") as f:
-        json.dump(message, f)
-    os.replace(temp, os.path.join(inbox, f"{message['id']}.json"))
+def recent_from(sender_id, seconds):
+    files = log_files(False)
+    if not files:
+        return 0
+    cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    count = 0
+    with open(files[-1]) as f:
+        for line in f:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if message.get("from") == sender_id and message.get("time", "") >= cutoff and "text" in message:
+                count += 1
+    return count
 
 
-# The user reaches an agent that sits idle at its prompt by having its pty relay
-# type the message in. Agents only ever leave mail: the relay refuses them.
-def type_into(recipient, message):
-    if message["from"] != USER or not recipient.get("relay"):
-        return
+# Messages go straight into the recipient's prompt through its pty relay. The
+# relay works out who is sending from the connection itself and writes the
+# sender into what it types, so a message can't claim to be from someone else.
+def type_into(recipient, text):
+    if not recipient.get("relay"):
+        return False
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock.settimeout(2)
+        sock.settimeout(5)
         sock.connect(os.path.join(agent_dir(recipient["id"]), "input.sock"))
-        sock.sendall(f"[Agent room] From user: {message['text']}".encode())
+        sock.sendall(text.encode())
+        sock.shutdown(socket.SHUT_WR)
+        return sock.recv(16).startswith(b"ok")
     except OSError:
-        pass
+        return False
     finally:
         sock.close()
 
@@ -266,20 +276,16 @@ def cmd_whoami(args):
     print(json.dumps(me) if args.json else me["id"])
 
 
-# The pty relay asks this about each peer, so only the user can type into agents.
+# The pty relay asks this about each peer, to stamp what it types with the sender.
 def cmd_whois(args):
-    print(identify(args.pid)["id"])
+    print(json.dumps(identify(args.pid)))
 
 
 def cmd_list(args):
     me = caller()
     rows = []
     for agent in agents():
-        try:
-            unread = len([n for n in os.listdir(os.path.join(agent_dir(agent["id"]), "inbox")) if n.endswith(".json")])
-        except OSError:
-            unread = 0
-        rows.append({**agent, "unread": unread, "you": agent["id"] == me["id"]})
+        rows.append({**agent, "you": agent["id"] == me["id"]})
     if args.json:
         print(json.dumps(rows, indent=2))
         return
@@ -289,8 +295,10 @@ def cmd_list(args):
     for row in rows:
         name = f" ({row['name']})" if row["name"] else ""
         you = "  <- you" if row["you"] else ""
-        mail = f"  {row['unread']} unread" if row["unread"] else ""
-        print(f"{row['id']}{name}  {row['cwd'] or ''}{mail}{you}")
+        # Only agents started through omarchy agent run under the relay that
+        # types messages in; the rest can talk but can't be talked to.
+        deaf = "" if row["relay"] else "  (can send, can't receive)"
+        print(f"{row['id']}{name}  {row['cwd'] or ''}{deaf}{you}")
 
 
 def cmd_send(args):
@@ -299,55 +307,58 @@ def cmd_send(args):
     if not text:
         fail("Nothing to send")
     sender = caller()
+    if sender["id"] != USER:
+        if os.path.exists(PAUSED):
+            fail("The user has paused the agent room; nothing is delivered until they resume it")
+        if recent_from(sender["id"], 60) >= RATE_LIMIT:
+            fail(f"More than {RATE_LIMIT} messages in a minute; slow down, or stop if you and another agent are going back and forth")
     recipients = resolve(args.to, sender)
-    if not recipients:
-        fail("No other agents are running")
+    if args.to != "all" and recipients[0]["id"] == sender["id"]:
+        fail("That's you")
+    if args.to == "all" and not recipients:
+        fail("No other agent in the room can be spoken to")
+    if recipients[0]["id"] != USER and args.to != "all" and not recipients[0].get("relay"):
+        fail(f"{recipients[0]['id']} wasn't started with omarchy agent, so it can't be spoken to")
+
     message = {
         "id": f"m-{int(time.time() * 1000)}-{random.randrange(10000):04d}",
         "time": now(),
         "from": sender["id"],
         "from_name": label(sender),
         "to": args.to if args.to == "all" else recipients[0]["id"],
-        "reply_to": args.reply,
         "text": text,
     }
-    append_log(message)
+    missed = []
     for recipient in recipients:
-        deliver(recipient, message)
         if recipient["id"] == USER:
             notify_user(message)
-        else:
-            type_into(recipient, message)
+        elif not type_into(recipient, text):
+            missed.append(recipient["id"])
+    if missed:
+        message["undelivered"] = missed
+    append_log(message)
+    if missed:
+        fail("Not delivered to " + ", ".join(missed))
     print(message["id"])
 
 
-def unread(agent_id):
-    inbox = inbox_dir(agent_id)
-    names = sorted(n for n in os.listdir(inbox) if n.endswith(".json"))
-    return [(os.path.join(inbox, n), load_json(os.path.join(inbox, n))) for n in names]
+def room_event(text):
+    append_log({"time": now(), "event": text})
 
 
-def cmd_inbox(args):
-    me = caller()
-    deadline = time.monotonic() + args.wait if args.wait is not None else None
-    messages = unread(me["id"])
-    # Polling a tmpfs directory four times a second costs nothing measurable and
-    # needs no watcher process to clean up if the caller is killed mid-wait.
-    while not messages and deadline is not None and time.monotonic() < deadline:
-        time.sleep(0.25)
-        messages = unread(me["id"])
-    for path, message in messages:
-        if message is None:
-            continue
-        if args.json:
-            print(json.dumps(message))
-        else:
-            reply = f" (re {message['reply_to']})" if message.get("reply_to") else ""
-            print(f"[{message['id']}] from {message['from_name']} ({message['from']}){reply}:\n{message['text']}\n")
-        if not args.peek:
-            os.unlink(path)
-    if not messages and deadline is not None:
-        sys.exit(2)
+def cmd_pause(args):
+    if caller()["id"] != USER:
+        fail("Only the user can pause or resume the room")
+    if args.command == "pause":
+        os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
+        open(PAUSED, "w").close()
+        room_event("The user paused the room. Agents can't message anyone until it resumes.")
+    else:
+        try:
+            os.unlink(PAUSED)
+        except FileNotFoundError:
+            pass
+        room_event("The user resumed the room.")
 
 
 def cmd_name(args):
@@ -385,10 +396,17 @@ def show(line, as_json):
     except ValueError:
         return
     when = datetime.datetime.fromisoformat(message["time"].replace("Z", "+00:00")).astimezone().strftime("%H:%M")
+    if "event" in message:
+        print(f"{when}  -- {message['event']}", flush=True)
+        return
     sender, to = message["from_name"], message["to"]
     if sys.stdout.isatty():
         sender, to = paint(message["from"], sender), paint(to, to)
-    print(f"{when}  {sender} -> {to}: {message['text']}", flush=True)
+    # Continuation lines are indented under the text, so a long message still
+    # reads as one message in a busy room.
+    text = message["text"].replace("\n", "\n       ")
+    missed = f"  [not delivered to {', '.join(message['undelivered'])}]" if message.get("undelivered") else ""
+    print(f"{when}  {sender} -> {to}: {text}{missed}", flush=True)
 
 
 # Each participant keeps one terminal colour, so a busy room reads at a glance.
@@ -446,16 +464,13 @@ def main():
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("send")
-    p.add_argument("--reply")
     p.add_argument("to")
     p.add_argument("message", nargs="*")
     p.set_defaults(func=cmd_send)
 
-    p = sub.add_parser("inbox")
-    p.add_argument("--wait", type=float, nargs="?", const=600)
-    p.add_argument("--peek", action="store_true")
-    p.add_argument("--json", action="store_true")
-    p.set_defaults(func=cmd_inbox)
+    for command in ("pause", "resume"):
+        p = sub.add_parser(command)
+        p.set_defaults(func=cmd_pause)
 
     p = sub.add_parser("name")
     p.add_argument("name")

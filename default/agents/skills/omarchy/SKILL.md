@@ -7,8 +7,10 @@ description: >
   Triggers: Hyprland, window rules, animations, keybindings, monitors, gaps, borders,
   blur, opacity, omarchy-shell, bar, terminal config, themes, background,
   night light, idle, lock screen, screenshots, reminders, layer rules, workspace
-  settings, display config, and user-facing omarchy commands. Excludes Omarchy
-  source development through `omarchy dev link` workflows.
+  settings, display config, and user-facing omarchy commands. Also REQUIRED when
+  talking to other AI agents on this machine or answering an "[Agent room]"
+  message (omarchy agent send/list). Excludes Omarchy source development
+  through `omarchy dev link` workflows.
 ---
 
 # Omarchy Skill
@@ -47,7 +49,7 @@ matching guide before starting:
 - [`hooks.md`](hooks.md) - automation hooks that run on system events
 - [`capture.md`](capture.md) - screenshots, screen recordings, OCR text capture, and file sharing
 - [`agent-seat.md`](agent-seat.md) - driving GUI apps (click, type, screenshot) on the agent seat instead of the user's desktop
-- [`agent-room.md`](agent-room.md) - finding and messaging the other agents on this machine, and reaching the user
+- [`agent-room.md`](agent-room.md) - talking directly to the other agents on this machine, answering `[Agent room]` messages, and reaching the user
 - [`contributing.md`](contributing.md) - reporting Omarchy bugs and submitting fixes upstream
 
 ## Critical Safety Rules

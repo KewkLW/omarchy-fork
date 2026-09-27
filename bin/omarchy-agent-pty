@@ -1,16 +1,15 @@
 #!/usr/bin/python3
 
-# omarchy:summary=Run an agent under a pty relay so the user can speak to it from the agent room
+# omarchy:summary=Run an agent under a pty relay so other agents and the user can speak to it
 # omarchy:args=<kind> <command> [args...]
 # omarchy:hidden=true
 
 # omarchy-agent starts agents through this relay. It passes the terminal through
-# untouched and opens input.sock in the agent's room directory. When the user
-# sends the agent a message from the agent room, the message is typed into the
-# agent's prompt as if the user had typed it there. Only the user gets through:
-# every peer is identified by its process tree, and anything with an agent above
-# it is refused, so agents can leave each other mail but never type for each
-# other.
+# untouched and opens input.sock in the agent's room directory. A message sent to
+# the agent, by another agent or by the user from the room pane, is typed into
+# its prompt, headed with who sent it and how to answer. The relay works out the
+# sender itself, from the connecting process's tree, so nothing a message says
+# can change who it appears to be from.
 
 import errno
 import fcntl
@@ -39,8 +38,14 @@ kind, command = sys.argv[1], sys.argv[2:]
 PASTE_ON, PASTE_OFF = b"\x1b[?2004h", b"\x1b[?2004l"
 MAX_MESSAGE = 64 * 1024
 
+# The agent waits for the relay to register it before it starts, so nothing it
+# says in its first moments can be taken for whoever launched it.
+go_read, go_write = os.pipe()
 pid, master = pty.fork()
 if pid == 0:
+    os.close(go_write)
+    os.read(go_read, 1)
+    os.close(go_read)
     try:
         os.execvp(command[0], command)
     except OSError as error:
@@ -85,24 +90,45 @@ try:
 except (OSError, subprocess.CalledProcessError, ValueError):
     # The agent still runs without the room; it just can't be spoken to.
     listener = None
+    meta = {"id": None}
+
+os.close(go_read)
+os.write(go_write, b"x")
+os.close(go_write)
 
 
-def from_user(conn):
+def sender(conn):
     peer_pid, peer_uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
     if peer_uid != os.getuid():
-        return False
+        return None
     result = subprocess.run(["omarchy-agent-room-core", "whois", str(peer_pid)], capture_output=True, text=True)
-    return result.stdout.strip() == "user"
+    try:
+        who = json.loads(result.stdout)
+    except ValueError:
+        return None
+    # An agent talking to itself through its own relay is a loop, not a message.
+    return None if who["id"] == meta["id"] else who
 
 
-def type_message(text, paste):
+def heading(who):
+    if who["id"] == "user":
+        name = "The user"
+    elif who.get("name"):
+        name = f"{who['name']} ({who['id']})"
+    else:
+        name = who["id"]
+    return f"[Agent room] {name} says:", f'(Answer in the room: omarchy agent send {who["id"]} "...")'
+
+
+def type_message(who, text, paste):
     text = text.strip()
     if not text:
         return
+    head, answer = heading(who)
     if paste:
-        os.write(master, b"\x1b[200~" + text.encode() + b"\x1b[201~")
+        os.write(master, b"\x1b[200~" + f"{head}\n{text}\n{answer}".encode() + b"\x1b[201~")
     else:
-        os.write(master, " ".join(text.split("\n")).encode())
+        os.write(master, " ".join(f"{head} {text} {answer}".split("\n")).encode())
     # Prompts that read the paste and the Enter in one go take the Enter as part
     # of the paste, so give the paste a moment to land first.
     time.sleep(0.1)
@@ -113,7 +139,8 @@ def accept(paste):
     conn, _ = listener.accept()
     with conn:
         conn.settimeout(2)
-        if not from_user(conn):
+        who = sender(conn)
+        if who is None:
             return
         data = b""
         try:
@@ -122,9 +149,10 @@ def accept(paste):
                 if not chunk:
                     break
                 data += chunk
+            type_message(who, data[:MAX_MESSAGE].decode(errors="replace"), paste)
+            conn.sendall(b"ok")
         except OSError:
             return
-        type_message(data[:MAX_MESSAGE].decode(errors="replace"), paste)
 
 
 paste = False

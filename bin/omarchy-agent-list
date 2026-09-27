@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# omarchy:summary=List the agents running in the agent room
+# omarchy:summary=List the agents in the agent room
 # omarchy:args=[--json]
 
 exec omarchy-agent-room-core list "$@"

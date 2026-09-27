@@ -1,10 +1,12 @@
 #!/bin/bash
 
-# omarchy:summary=Run the agent room pane: the live conversation and a prompt to join it
+# omarchy:summary=Run the agent room pane: the whole conversation live, and a prompt to join it
 # omarchy:hidden=true
 
-echo "Agent room. @<agent> <message> to one agent, @all <message> to every agent,"
-echo "or just a message for whichever agent spoke last. /agents lists who's here."
+echo "Agent room. Everything agents say to each other and to you shows up here."
+echo "@<agent> <message> speaks to one agent, @all <message> to every agent, and a"
+echo "plain line to whichever agent spoke last. /agents lists who's here, /pause"
+echo "stops agents messaging anyone, /resume lets them carry on."
 echo
 omarchy-agent-list
 echo
@@ -14,18 +16,19 @@ follower=$!
 trap 'kill $follower 2>/dev/null' EXIT
 
 last_speaker() {
-  omarchy-agent-room-core log --json | jq -r 'select(.from != "user") | .from' | tail -n1
+  omarchy-agent-room-core log --json | jq -r 'select(.from and .from != "user") | .from' | tail -n1
 }
 
 while IFS= read -e -r line; do
   history -s "$line"
 
-  if [[ -z $line ]]; then
-    continue
-  elif [[ $line == "/agents" ]]; then
-    omarchy-agent-list
-    continue
-  elif [[ $line =~ ^@([^[:space:]]+)[[:space:]]+(.+)$ ]]; then
+  case $line in
+  "") continue ;;
+  /agents) omarchy-agent-list; continue ;;
+  /pause | /resume) omarchy-agent-room-core "${line#/}"; continue ;;
+  esac
+
+  if [[ $line =~ ^@([^[:space:]]+)[[:space:]]+(.+)$ ]]; then
     target=${BASH_REMATCH[1]}
     text=${BASH_REMATCH[2]}
   else

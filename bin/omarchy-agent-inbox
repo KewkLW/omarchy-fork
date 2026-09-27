@@ -1,7 +1,0 @@
-#!/bin/bash
-
-# omarchy:summary=Read the calling agent's unread messages
-# omarchy:args=[--wait [seconds]] [--peek] [--json]
-# omarchy:examples=omarchy agent inbox | omarchy agent inbox --wait 300
-
-exec omarchy-agent-room-core inbox "$@"

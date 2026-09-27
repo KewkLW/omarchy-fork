@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# omarchy:summary=Show the conversation between agents and the user
+# omarchy:summary=Show everything said in the agent room
 # omarchy:args=[--follow] [--all] [--json]
 
 exec omarchy-agent-room-core log "$@"
