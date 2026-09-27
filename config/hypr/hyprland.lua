@@ -27,3 +27,6 @@ require("default.hypr.toggles")
 
 -- Add any other personal Hyprland configuration below.
 -- o.window("qemu", { workspace = "5" })
+
+-- Put agent seat apps on a workspace other than the default workspace 10.
+-- o.window("agent-[0-9]+(\\..*)?", { workspace = "9 silent" })
