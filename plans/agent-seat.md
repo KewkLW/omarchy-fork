@@ -70,12 +70,13 @@ The broker compiles Hyprland's own keymap (sent to the user's seat) with libxkbc
 
 - **Files** reach the sandbox only when the agent shares them: `--share <path>` read-write, `--share-ro <path>` read-only, each at the same path. The seat adds no prompt of its own; sharing is part of the agent's command, so the agent's own permission rules decide it.
 - **The GPU** is the exception that asks. `--gpu` pops a menu in the user's session, which agent input can't reach, offering Allow once, Allow for this session, or Deny. It fails closed if the menu can't show. An allowed app connects through a socket of its own that also offers GPU buffers, with the GPU devices bound in. Its screenshots then come from Hyprland's toplevel capture, which may miss outside-the-window menus.
-- **Stopping** (`omarchy agent seat stop`, or _Trigger > Stop Agent Seat_ in the menu while the seat runs) ends the broker and every process in every sandbox. Each sandbox keeps a lifecycle record with process start times, so a recycled pid is never killed.
+- **Stopping** (`omarchy agent seat stop`, or _Trigger > Agents > Stop Agent Seat_ in the menu while the seat runs) ends the broker and every process in every sandbox. Each sandbox keeps a lifecycle record with process start times, so a recycled pid is never killed.
 
 ### Where it lives
 
 - `default/hypr/apps/agent-seat.lua`: class `agent-[0-9]+(\..*)?` goes to `10 silent`, with `render_unfocused`, `no_initial_focus`, `no_dim` and a 3px orange border. `config/hypr/hyprland.lua` shows how to move it to another workspace.
-- Commands under `omarchy agent seat`: `run`, `windows`, `pointer`, `type`, `screenshot`, `status` and `stop`, with the broker and the sandbox supervisor hidden. `GROUP_DESCRIPTIONS[agent]` mentions the seat.
+- `Super + Ctrl + Alt + A` (or _Trigger > Agents > Agent Seat_ while it runs) jumps to the seat's newest window, wherever its workspace is.
+- Commands under `omarchy agent seat`: `run`, `windows`, `pointer`, `type`, `screenshot`, `show`, `status` and `stop`, with the broker and the sandbox supervisor hidden. `GROUP_DESCRIPTIONS[agent]` mentions the seat.
 - `default/agents/skills/omarchy/agent-seat.md` teaches agents to use the seat and never the user's desktop, and when to hand over to the user (logins, captchas, two-factor).
 - `manual/17-ai.md` has a section for users.
 
