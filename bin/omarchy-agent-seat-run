@@ -52,14 +52,21 @@ fi
 
 runtime="$XDG_RUNTIME_DIR/omarchy/agent-seat"
 agent_home="$HOME/.local/share/omarchy/agent-seat/home"
+sandbox_supervisor=$(realpath -e "$(dirname "$0")/omarchy-agent-seat-sandbox")
 
 windows() {
   omarchy-agent-seat-broker call '{"command":"windows"}' 2>/dev/null | jq -r '.windows[].window'
 }
 
+mkdir -p "$runtime/sandboxes"
+
+# Serialize seat startup and shutdown so stop cannot miss a sandbox whose
+# supervisor is still being registered.
+exec 9>"$runtime/sandboxes.lock"
+flock 9
+
 if ! omarchy-agent-seat-broker call '{"command":"windows"}' >/dev/null 2>&1; then
-  mkdir -p "$runtime"
-  setsid -f omarchy-agent-seat-broker serve >>"$runtime/broker.log" 2>&1
+  setsid -f omarchy-agent-seat-broker serve >>"$runtime/broker.log" 2>&1 9>&-
   for _ in {1..50}; do
     [[ -S $runtime/control ]] && break
     sleep 0.1
@@ -110,7 +117,18 @@ fi
 # Last, so a share's own mode wins over the mounts above.
 sandbox+=("${shares[@]}")
 
-setsid -f bwrap "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1
+record=$(mktemp "$runtime/sandboxes/sandbox.XXXXXX")
+marker=${record##*.}
+setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 9>&- &
+supervisor_pid=$!
+for _ in {1..50}; do
+  read -r _ _ _ tracked_bwrap _ <"$record" || true
+  [[ ${tracked_bwrap:-0} != 0 ]] && break
+  kill -0 "$supervisor_pid" 2>/dev/null || break
+  sleep 0.01
+done
+flock -u 9
+exec 9>&-
 
 if [[ $wait_for_window == "true" ]]; then
   for _ in {1..150}; do

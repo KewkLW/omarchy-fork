@@ -10,6 +10,7 @@ test_dir=$(mktemp -d)
 mkdir -p "$test_dir/bin" "$test_dir/runtime"
 
 cleanup() {
+  XDG_RUNTIME_DIR="$test_dir/runtime" PATH="$test_dir/bin:$ROOT/bin:$PATH" "$ROOT/bin/omarchy-agent-seat-stop" >/dev/null 2>&1 || true
   # The broker runs under a subshell of run_broker, so end it by parent too.
   [[ -n ${broker_pid:-} ]] && pkill -P "$broker_pid" 2>/dev/null && kill "$broker_pid" 2>/dev/null
   [[ -n ${compositor_pid:-} ]] && kill "$compositor_pid" 2>/dev/null
@@ -318,10 +319,49 @@ run_broker omarchy-agent-seat-type 1 "é" 2>/dev/null && fail "untypeable text i
 run_broker omarchy-agent-seat-type 1 --key hyper+x 2>/dev/null && fail "unknown modifiers are refused"
 pass "bad keys are refused"
 
+sandbox_marker="agent-seat-test-$$"
+run_broker omarchy-agent-seat-run --no-wait /usr/bin/bash -c '/usr/bin/sleep 300 & /usr/bin/sleep 300' "$sandbox_marker" || fail "a headless sandbox starts"
+records=("$test_dir/runtime/omarchy/agent-seat/sandboxes"/sandbox.*)
+(( ${#records[@]} == 1 )) || fail "a sandbox has one lifecycle record" "${records[*]}"
+for _ in {1..50}; do
+  read -r supervisor_pid _ _ bwrap_pid _ <"${records[0]}" || true
+  [[ ${bwrap_pid:-0} != 0 ]] && break
+  sleep 0.01
+done
+[[ ${supervisor_pid:-} =~ ^[0-9]+$ && ${bwrap_pid:-0} != 0 ]] || fail "a sandbox records its supervisor and bwrap processes" "$(cat "${records[0]}")"
+sandbox_pids=("$supervisor_pid" "$bwrap_pid")
+for _ in {1..50}; do
+  known=${#sandbox_pids[@]}
+  for pid in "${sandbox_pids[@]}"; do
+    while read -r child; do
+      [[ " ${sandbox_pids[*]} " == *" $child "* ]] || sandbox_pids+=("$child")
+    done < <(pgrep -P "$pid" || true)
+  done
+  (( ${#sandbox_pids[@]} >= 5 )) && break
+  (( known == ${#sandbox_pids[@]} )) && sleep 0.01
+done
+(( ${#sandbox_pids[@]} >= 5 )) || fail "a headless sandbox starts helper processes" "${sandbox_pids[*]}"
+pass "a headless sandbox and its helpers are tracked"
+
+/usr/bin/sleep 300 &
+unrelated_pid=$!
+unrelated_stat=$(<"/proc/$unrelated_pid/stat")
+unrelated_stat=${unrelated_stat##*) }
+read -ra unrelated_fields <<<"$unrelated_stat"
+printf '%s %s stale-marker 0 0\n' "$unrelated_pid" "${unrelated_fields[19]}" >"$test_dir/runtime/omarchy/agent-seat/sandboxes/sandbox.stale"
+
 run_broker omarchy-agent-seat-stop >/dev/null
 for _ in {1..50}; do kill -0 "$broker_pid" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$broker_pid" 2>/dev/null && fail "stop ends the broker"
 compgen -G "$test_dir/runtime/omarchy/agent-seat/gpu-*" >/dev/null && fail "stop closes the GPU sockets"
+for pid in "${sandbox_pids[@]}"; do
+  [[ ! -e /proc/$pid ]] || fail "stop ends every process in a sandbox" "${sandbox_pids[*]}"
+done
+pass "stop ends every process in a sandbox"
+kill -0 "$unrelated_pid" 2>/dev/null || fail "a stale lifecycle record does not kill an unrelated process"
+kill "$unrelated_pid"
+wait "$unrelated_pid" 2>/dev/null || true
+pass "stale lifecycle records do not kill unrelated processes"
 
 run_broker omarchy-agent-seat-run --share "$test_dir/missing" foot 2>/dev/null && fail "sharing a missing path is refused"
 pass "sharing a missing path is refused"

@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# omarchy:summary=Supervise one agent seat sandbox
+# omarchy:hidden=true
+
+record="$1"
+marker="$2"
+shift 2
+
+process_start_time() {
+  local stat fields
+
+  [[ -r /proc/$1/stat ]] || return 1
+  stat=$(<"/proc/$1/stat")
+  stat=${stat##*) }
+  read -ra fields <<<"$stat"
+  printf '%s\n' "${fields[19]}"
+}
+
+write_record() {
+  local temporary="$record.$$"
+
+  printf '%s %s %s %s %s\n' "$$" "$supervisor_start" "$marker" "${bwrap_pid:-0}" "${bwrap_start:-0}" >"$temporary"
+  mv -f -- "$temporary" "$record"
+}
+
+cleanup() {
+  [[ -e $record ]] && unlink "$record"
+}
+trap cleanup EXIT
+
+supervisor_start=$(process_start_time "$$") || exit 1
+write_record
+
+# The supervisor stays above bwrap so stop has one verifiable process to kill.
+# --die-with-parent then SIGKILLs bwrap's PID-namespace init and everything in
+# that namespace when the supervisor dies, even when an app ignores SIGTERM.
+bwrap --die-with-parent --setenv OMARCHY_AGENT_SEAT_SANDBOX "$marker" "$@" &
+bwrap_pid=$!
+bwrap_start=$(process_start_time "$bwrap_pid") || bwrap_start=0
+write_record
+
+wait "$bwrap_pid"
