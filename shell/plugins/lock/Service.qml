@@ -22,6 +22,10 @@ Item {
   property bool fingerprintAuthenticating: false
   property bool passwordPamConfigured: false
   property bool fingerprintConfigured: false
+  // Set up by omarchy-setup-security-agent-login: an empty password asks the
+  // user's phone to approve the unlock instead.
+  property bool agentLoginConfigured: false
+  property bool agentAuthenticating: false
   property bool previewVisible: false
   property string enteredPassword: ""
   property string pendingPassword: ""
@@ -35,7 +39,7 @@ Item {
   property bool strandedLockResolved: false
 
   readonly property bool locked: lockRequested || sessionLock.locked || sessionLock.secure
-  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating
+  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating || agentAuthenticating
 
   function realScreenCount() {
     var screens = Quickshell.screens || []
@@ -123,6 +127,8 @@ Item {
     fingerprintRetryTimer.stop()
     if (passwordPam.active) passwordPam.abort()
     if (fingerprintPam.active) fingerprintPam.abort()
+    agentAuthenticating = false
+    if (agentPam.active) agentPam.abort()
   }
 
   function beginLock() {
@@ -175,7 +181,11 @@ Item {
 
   function submitPassword(value) {
     var password = String(value || "")
-    if (!lockRequested || authenticatingPassword || password.length === 0) return
+    if (password.length === 0) {
+      startAgentLogin()
+      return
+    }
+    if (!lockRequested || authenticatingPassword) return
 
     runWake()
     pendingPassword = password
@@ -204,6 +214,26 @@ Item {
     failedAttempts += 1
     failureMessage = "Authentication failed (" + failedAttempts + ")"
     runWake()
+  }
+
+  function startAgentLogin() {
+    if (!lockRequested || !agentLoginConfigured || agentAuthenticating || authenticatingPassword) return
+
+    runWake()
+    agentAuthenticating = true
+    failureMessage = "Approve on your phone"
+    if (!agentPam.start()) handleAgentFinished(PamResult.Failed)
+  }
+
+  function handleAgentFinished(result) {
+    agentAuthenticating = false
+    if (!lockRequested) return
+    if (result === PamResult.Success) {
+      finishUnlock()
+    } else {
+      failureMessage = "Not approved on your phone"
+      runWake()
+    }
   }
 
   function startFingerprint() {
@@ -335,6 +365,20 @@ Item {
 
     onError: function(error) {
       root.handlePasswordFailure()
+    }
+  }
+
+  PamContext {
+    id: agentPam
+    config: "omarchy-lock-agent"
+    user: root.userName
+
+    onCompleted: function(result) {
+      root.handleAgentFinished(result)
+    }
+
+    onError: function(error) {
+      root.handleAgentFinished(PamResult.Failed)
     }
   }
 
@@ -490,6 +534,15 @@ Item {
     onFileChanged: reload()
   }
 
+  FileView {
+    path: "/etc/pam.d/omarchy-lock-agent"
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.agentLoginConfigured = true
+    onLoadFailed: root.agentLoginConfigured = false
+    onFileChanged: reload()
+  }
+
   // No lock before PAM is known good. An answer from before then may be stale --
   // the failsafe can be cleared from a TTY -- so re-ask rather than act on it.
   onPasswordPamConfiguredChanged: {
@@ -516,6 +569,16 @@ Item {
       return "ok"
     }
 
+    // Asks the phone to approve an unlock without anyone at the keyboard, so
+    // an agent or a remote session can let the user back in. It unlocks only
+    // on a passkey approval from an enrolled phone.
+    function askPhone(): string {
+      if (!root.agentLoginConfigured) return "not-configured"
+      if (!root.locked) return "not-locked"
+      root.startAgentLogin()
+      return root.agentAuthenticating ? "asking" : "failed"
+    }
+
     function isLocked(): string {
       return root.locked ? "true" : "false"
     }
@@ -530,6 +593,7 @@ Item {
         realScreens: root.realScreenCount(),
         passwordPam: root.passwordPamConfigured,
         fingerprint: root.fingerprintConfigured,
+        agentLogin: root.agentLoginConfigured,
         authenticating: root.authenticating,
         lastEvent: root.lastEvent,
         lastEventAt: root.lastEventAt
