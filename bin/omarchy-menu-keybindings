@@ -75,7 +75,7 @@ build_lua_bind_cache() {
     LUA_BIND_DISPATCHER_MAP["$cache_key"]="$dispatcher"
     LUA_BIND_ARG_MAP["$cache_key"]="$arg"
   done < <(
-    lua <<'LUA'
+    (ulimit -v 1048576; timeout 10 lua) <<'LUA'
 local modifiers = { SHIFT = 1, CTRL = 4, CONTROL = 4, ALT = 8, SUPER = 64 }
 
 local function split_keys(keys)
@@ -180,7 +180,12 @@ end
 
 local noop
 noop = setmetatable({}, {
-  __index = function()
+  -- Numeric keys are nil so `ipairs(hl.get_*())` in the config ends at once;
+  -- returning noop for them made those loops endless and ate all RAM.
+  __index = function(_, key)
+    if type(key) == "number" then
+      return nil
+    end
     return noop
   end,
   __call = function()
