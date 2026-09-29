@@ -14,6 +14,7 @@ From the terminal, the same switches are `omarchy toggle <thing>`. Run `omarchy 
 | Silence notifications | `Super + Ctrl + ,` | `omarchy toggle notification silencing` |
 | Stay awake (no idle lock) | `Super + Ctrl + I` | `omarchy toggle idle` |
 | Crash capture | — | `omarchy toggle crash-capture` |
+| Memory watchdog | — | `omarchy toggle memory-watch` |
 | Screensaver | — | `omarchy toggle screensaver` |
 | Menu bar | `Super + Shift + Space` | `omarchy toggle bar` |
 | Touchpad | `XF86TouchpadToggle` | `omarchy toggle touchpad` |

@@ -1,0 +1,16 @@
+#!/bin/bash
+
+# omarchy:summary=Answer the memory agent's question
+# omarchy:args=<approve|standdown|resolved>
+# omarchy:examples=omarchy memory reply approve | omarchy memory reply standdown
+
+case ${1:-} in
+approve | standdown | resolved) ;;
+*)
+  echo "Usage: omarchy-memory-reply <approve|standdown|resolved>" >&2
+  exit 1
+  ;;
+esac
+
+mkdir -p "$HOME/.local/state/omarchy/memory-watch"
+echo "$1" >"$HOME/.local/state/omarchy/memory-watch/reply"

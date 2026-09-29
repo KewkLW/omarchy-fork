@@ -1,0 +1,20 @@
+[Unit]
+Description=Head off out-of-memory session kills: pause runaway processes and hand the emergency to an AI agent
+# Needs the session bus to notify, and the default agent's environment.
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+# Opt-in, set by omarchy-toggle-memory-watch.
+ConditionPathExists=%h/.local/state/omarchy/toggles/memory-watch-on
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/omarchy-memory-watch
+Restart=always
+RestartSec=3
+# Ask systemd-oomd to kill something else first: this is what stops the kill.
+ManagedOOMPreference=avoid
+CPUWeight=1000
+
+[Install]
+WantedBy=graphical-session.target

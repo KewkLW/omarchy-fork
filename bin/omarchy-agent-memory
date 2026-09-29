@@ -1,0 +1,63 @@
+#!/bin/bash
+
+# omarchy:summary=Run the default agent headless to handle a memory emergency
+# omarchy:args=[reason] [metrics]
+# omarchy:examples=omarchy agent memory
+
+# Started by omarchy-memory-watch, or by hand to have the agent look at what is
+# eating memory right now. The method lives in the memory-emergency skill; this
+# only gathers the trigger and starts the agent without a terminal, because
+# nobody may be at the desk to open one.
+
+set -uo pipefail
+
+reason=${1:-run by hand}
+metrics=${2:-}
+state=$HOME/.local/state/omarchy/memory-watch
+stamp=$(date '+%Y%m%d-%H%M%S')
+skill="$OMARCHY_PATH/default/agents/skills/memory-emergency/SKILL.md"
+readonly MEMORY_GLYPH=$'\U000f035b'
+
+mkdir -p "$state/reports"
+
+prompt=$(
+  cat <<PROMPT
+You are the memory emergency responder on this Omarchy machine, started headless
+by omarchy-memory-watch. Nobody may be watching, so act on your own judgement
+within the skill's rules.
+
+  trigger:  $reason
+  metrics:  ${metrics:-(run \`free -m\`)}
+  run id:   $stamp
+  report:   $state/reports/$stamp.md
+${OMARCHY_MEMORY_DRILL:+
+DRILL: $OMARCHY_MEMORY_DRILL
+}
+Use the memory-emergency skill. If your harness has no skill mechanism, read the
+skill file directly and follow it:
+
+  $skill
+PROMPT
+)
+
+agent=$(omarchy-default-agent)
+
+# Only agents with an unattended one-shot mode that may signal other processes.
+case "$agent" in
+claude)
+  command=(claude -p --permission-mode bypassPermissions "$prompt")
+  ;;
+codex)
+  command=(codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$prompt")
+  ;;
+*)
+  omarchy-notification-send --urgency critical --glyph "$MEMORY_GLYPH" \
+    "Memory is nearly full" \
+    "$reason. ${metrics} See what is using it: omarchy memory top" >/dev/null 2>&1
+  echo "No headless memory responder for default agent '${agent:-none}'" >&2
+  exit 1
+  ;;
+esac
+
+cd "$state"
+"${command[@]}" >"$state/reports/$stamp.agent.log" 2>&1

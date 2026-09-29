@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# omarchy:summary=Toggle the memory watchdog that heads off out-of-memory session kills
+
+# Off by default: when memory runs out it runs the default agent unattended, with
+# permission prompts skipped, so that is the user's call to make.
+
+# nf-md-memory, escaped so this file reads without a Nerd Font.
+readonly MEMORY_GLYPH=$'\U000f035b'
+
+omarchy-toggle memory-watch-on
+
+# The unit checks the same flag with ConditionPathExists, so an enabled unit stays
+# inert after the flag is removed, even across logins.
+if omarchy-toggle-enabled memory-watch-on; then
+  systemctl --user enable --now omarchy-memory-watch.service
+  omarchy-notification-send -g "$MEMORY_GLYPH" "Memory watchdog enabled"
+else
+  systemctl --user disable --now omarchy-memory-watch.service
+  omarchy-notification-send -g "$MEMORY_GLYPH" "Memory watchdog disabled"
+fi

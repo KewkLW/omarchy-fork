@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# omarchy:summary=Ask the user to approve a memory emergency plan, and wait for a click
+# omarchy:args=[--background] <plan> [reason]
+# omarchy:hidden=true
+
+# For the memory responder. Puts up two critical toasts (approve / stand down)
+# and prints approve, standdown, resolved, or timeout. The wait is
+# OMARCHY_MEMORY_ASK_TIMEOUT seconds (default 120).
+#
+# --background returns at once and leaves the answer in ask.out in the state
+# directory. It detaches into its own session because agent shells kill what a
+# command leaves behind when it returns, and Codex's refuses `&` outright.
+
+set -uo pipefail
+
+state=$HOME/.local/state/omarchy/memory-watch
+
+if [[ ${1:-} == "--background" ]]; then
+  shift
+  mkdir -p "$state"
+  : >"$state/ask.out"
+  setsid -f "$0" "$@" >"$state/ask.out" 2>/dev/null </dev/null
+  echo "Asking; the answer will be in $state/ask.out"
+  exit 0
+fi
+
+plan=${1:?usage: omarchy-memory-ask [--background] <plan> [reason]}
+reason=${2:-}
+reply=$state/reply
+timeout=${OMARCHY_MEMORY_ASK_TIMEOUT:-120}
+readonly MEMORY_GLYPH=$'\U000f035b'
+
+mkdir -p "$(dirname "$reply")"
+rm -f "$reply"
+
+# --exec rather than a libnotify action: the shell runs clicks from its own hint.
+approve_id=$(omarchy-notification-send --print-id --urgency critical --glyph "$MEMORY_GLYPH" \
+  "Memory agent: $plan" "$reason Click to approve, or it goes ahead in ${timeout}s." \
+  --exec omarchy-memory-reply approve 2>/dev/null)
+standdown_id=$(omarchy-notification-send --print-id --urgency critical --glyph "$MEMORY_GLYPH" \
+  "Memory agent: stand down?" "Click if you'll handle it yourself." \
+  --exec omarchy-memory-reply standdown 2>/dev/null)
+
+answer=timeout
+for ((i = 0; i < timeout; i++)); do
+  if [[ -s $reply ]]; then
+    answer=$(<"$reply")
+    break
+  fi
+  sleep 1
+done
+
+# Replace both toasts so a late click can't answer a stale question.
+for id in $approve_id $standdown_id; do
+  [[ $id =~ ^[0-9]+$ ]] && omarchy-notification-send --replace-id "$id" --expire-time 4000 \
+    "Memory agent" "Answer: $answer" >/dev/null 2>&1
+done
+
+echo "$answer"

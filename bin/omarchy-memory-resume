@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# omarchy:summary=Resume process groups the memory brake paused
+# omarchy:args=[name-regex]
+# omarchy:examples=omarchy memory resume | omarchy memory resume clang
+
+set -uo pipefail
+
+frozen=$HOME/.local/state/omarchy/memory-watch/frozen.tsv
+
+if [[ ! -s $frozen ]]; then
+  echo "Nothing is paused"
+  exit 0
+fi
+
+kept=$(mktemp)
+while IFS=$'\t' read -r paused_at key mb name pids; do
+  if [[ -z ${1:-} || $name =~ $1 ]]; then
+    kill -CONT ${pids//,/ } 2>/dev/null
+    echo "Resumed $name (${mb}M, paused $paused_at)"
+  else
+    printf '%s\t%s\t%s\t%s\t%s\n' "$paused_at" "$key" "$mb" "$name" "$pids" >>"$kept"
+  fi
+done <"$frozen"
+mv "$kept" "$frozen"

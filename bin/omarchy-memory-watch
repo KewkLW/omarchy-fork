@@ -1,0 +1,141 @@
+#!/bin/bash
+
+# omarchy:summary=Watch memory pressure; brake runaway processes and hand the emergency to an AI agent
+# omarchy:hidden=true
+
+# When RAM and swap fill, systemd-oomd kills whole cgroups, and the one it picks
+# can be the compositor's, taking every open window with it. This steps in first:
+#
+#   agent  RAM nearly full and swap filling or thrashing: run the default agent
+#          headless (omarchy-agent-memory) to find the cause, ask the AI agents
+#          that started it and the user, and fix it as gently as it can.
+#   brake  swap near oomd's kill line: SIGSTOP the largest unprotected process
+#          group right away. Paused, not killed; omarchy-memory-resume undoes it.
+#          An agent can take minutes to start under heavy swapping, so it can't
+#          be the only defence.
+#
+# Thresholds are environment variables; change them with a drop-in from
+# `systemctl --user edit omarchy-memory-watch`.
+
+set -uo pipefail
+
+readonly STATE=$HOME/.local/state/omarchy/memory-watch
+readonly LOG=$STATE/watch.log
+readonly FROZEN=$STATE/frozen.tsv # time key total_mb name pids
+readonly UNIT=omarchy-memory-agent
+# nf-md-memory, escaped so this file reads without a Nerd Font.
+readonly MEMORY_GLYPH=$'\U000f035b'
+
+interval=${OMARCHY_MEMORY_INTERVAL:-2}
+agent_mem_pct=${OMARCHY_MEMORY_AGENT_MEM_PCT:-90}
+agent_swap_pct=${OMARCHY_MEMORY_AGENT_SWAP_PCT:-15}
+agent_psi=${OMARCHY_MEMORY_AGENT_PSI:-30} # /proc/pressure/memory full avg10
+brake_swap_pct=${OMARCHY_MEMORY_BRAKE_SWAP_PCT:-60}
+brake_mem_pct=${OMARCHY_MEMORY_BRAKE_MEM_PCT:-97} # with brake_psi: thrashing before swap fills
+brake_psi=${OMARCHY_MEMORY_BRAKE_PSI:-50}
+brake_min_mb=${OMARCHY_MEMORY_BRAKE_MIN_MB:-1024}
+brake_gap=${OMARCHY_MEMORY_BRAKE_GAP:-10}
+cooldown=${OMARCHY_MEMORY_COOLDOWN:-900}
+
+mkdir -p "$STATE/reports"
+
+log() {
+  printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2
+}
+
+read_metrics() {
+  local key value _
+  while read -r key value _; do
+    case $key in
+    MemTotal:) mem_total=$value ;;
+    MemAvailable:) mem_avail=$value ;;
+    SwapTotal:) swap_total=$value ;;
+    SwapFree:) swap_free=$value ;;
+    esac
+  done </proc/meminfo
+  mem_pct=$((100 - mem_avail * 100 / mem_total))
+  swap_pct=0
+  ((swap_total > 0)) && swap_pct=$(((swap_total - swap_free) * 100 / swap_total))
+  psi=$(awk '/^full/ { split($2, a, "="); printf "%d", a[2] }' /proc/pressure/memory)
+}
+
+metrics() {
+  echo "ram ${mem_pct}% ($((mem_avail / 1024))M free), swap ${swap_pct}%, pressure ${psi}"
+}
+
+brake() {
+  local picked key mb name pids
+  if ! picked=$(omarchy-memory-top --pick "$brake_min_mb"); then
+    log "brake: nothing unprotected over ${brake_min_mb}M to pause ($(metrics))"
+    return
+  fi
+  IFS=$'\t' read -r key mb name pids <<<"$picked"
+  # Individual pids, never `kill -- -pgid`: a pgid can span cgroups, and
+  # Hyprland's spans every app it launched.
+  kill -STOP ${pids//,/ } 2>/dev/null
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$key" "$mb" "$name" "$pids" >>"$FROZEN"
+  log "brake: paused $name (${mb}M, pids $pids) $(metrics)"
+  omarchy-notification-send --urgency critical --glyph "$MEMORY_GLYPH" \
+    "Memory brake: paused $name" \
+    "${mb}M. Paused, not killed. Resume with: omarchy memory resume" >/dev/null 2>&1 &
+}
+
+frozen_count() {
+  if [[ -f $FROZEN ]]; then
+    wc -l <"$FROZEN"
+  else
+    echo 0
+  fi
+}
+
+spawn_agent() {
+  local setenv=(--setenv=PATH="$PATH" --setenv=OMARCHY_PATH="$OMARCHY_PATH") name
+  log "agent: $1 $(metrics)"
+  # A transient unit starts from the user manager's environment, so pass on this
+  # watcher's settings (a drop-in's ask timeout, say).
+  for name in "${!OMARCHY_MEMORY_@}"; do
+    setenv+=(--setenv="$name=${!name}")
+  done
+  # A transient unit rather than a child, so it survives this watcher restarting.
+  # ManagedOOMPreference asks oomd to spare it; oomd may ignore that for user units.
+  systemd-run --user --unit="$UNIT" --collect --quiet \
+    -p ManagedOOMPreference=avoid -p RuntimeMaxSec=1200 -p CPUWeight=1000 \
+    -p WorkingDirectory="$STATE" "${setenv[@]}" \
+    omarchy-agent-memory "$1" "$(metrics)" || log "agent: could not start $UNIT"
+  last_spawn=$EPOCHSECONDS
+}
+
+last_spawn=0
+last_brake=0
+hot=0
+frozen_seen=$(frozen_count)
+log "watching: agent at ram>=${agent_mem_pct}% and (swap>=${agent_swap_pct}% or pressure>=${agent_psi}), brake at swap>=${brake_swap_pct}% or (ram>=${brake_mem_pct}% and pressure>=${brake_psi})"
+
+while true; do
+  read_metrics
+
+  if ((swap_pct >= brake_swap_pct || (mem_pct >= brake_mem_pct && psi >= brake_psi))) &&
+    ((EPOCHSECONDS - last_brake >= brake_gap)); then
+    brake
+    last_brake=$EPOCHSECONDS
+  fi
+
+  # Two samples in a row, so one spike doesn't wake an agent.
+  if ((mem_pct >= agent_mem_pct && (swap_pct >= agent_swap_pct || psi >= agent_psi))); then
+    ((hot++))
+  else
+    hot=0
+  fi
+
+  frozen_now=$(frozen_count)
+  if ! systemctl --user is-active --quiet "$UNIT"; then
+    if ((frozen_now > frozen_seen)); then
+      spawn_agent "the memory brake paused a process group"
+    elif ((hot >= 2 && EPOCHSECONDS - last_spawn >= cooldown)); then
+      spawn_agent "memory is nearly full"
+    fi
+    frozen_seen=$frozen_now
+  fi
+
+  sleep "$interval"
+done

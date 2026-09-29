@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# omarchy:summary=Tell the memory responder what your processes are for (for AI agents)
+# omarchy:args=<message>
+# omarchy:hidden=true
+
+# The sender is worked out from the process tree, not the message, so a note
+# can't claim to come from another agent.
+
+set -uo pipefail
+
+message=${1:?usage: omarchy-memory-note <message>}
+state=$HOME/.local/state/omarchy/memory-watch
+claude_home=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+sender=unknown
+pid=$PPID
+
+while ((pid > 1)); do
+  if [[ -f $claude_home/sessions/$pid.json ]]; then
+    sender=$(jq -r '.name // "claude-\(.pid)"' "$claude_home/sessions/$pid.json")
+    break
+  fi
+  comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+  if [[ $comm =~ ^(claude|codex|cursor-agent|opencode|crush|agy|gemini|grok|pi|omp|ori|hermes|muse|copilot|aider|goose)$ ]]; then
+    sender=$comm-$pid
+    break
+  fi
+  pid=$(awk '{ print $4 }' "/proc/$pid/stat" 2>/dev/null) || break
+  [[ -n $pid ]] || break
+done
+
+mkdir -p "$state"
+printf '%s\t%s\t%s\n' "$(date '+%F %T')" "$sender" "${message//$'\n'/ }" >>"$state/agent-notes.log"
+echo "Noted as $sender"
