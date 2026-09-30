@@ -20,6 +20,12 @@ The weekly price is the monthly price x 12 / 52. The monthly price comes from
 from the plan the record reports. The weekly allowance is account-wide while
 token counts are this machine's only, so usage elsewhere (claude.ai, another
 computer) makes tokens look more expensive than they are.
+
+With several subscription accounts (`omarchy agent account`), the token
+counts cover every account while the record's own limits describe only the
+active one, so each snapshot also keeps every account's weekly meter and
+plan, and an interval's cost is the sum of each account's share of its own
+weekly price.
 """
 
 from __future__ import annotations
@@ -108,15 +114,19 @@ def weekly_label(limits: dict[str, float]) -> str | None:
   return None
 
 
-def snapshot_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
+def plan_limits(entries: Any) -> dict[str, float]:
   # A model-scoped window carries its own title; only the account-wide
   # windows price the plan.
-  limits = {
+  return {
     str(entry.get("label")): float(entry["percent"])
-    for entry in record.get("limits") or []
+    for entry in entries or []
     if isinstance(entry, dict) and not entry.get("title") and isinstance(entry.get("percent"), (int, float))
     and entry["percent"] >= 0
   }
+
+
+def snapshot_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
+  limits = plan_limits(record.get("limits"))
   models = {}
   for model, bucket in (record.get("modelUsage") or {}).items():
     if not isinstance(bucket, dict):
@@ -132,6 +142,12 @@ def snapshot_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
   snapshot = {"t": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "limits": limits, "models": models}
   if record.get("tierLabel"):
     snapshot["plan"] = str(record["tierLabel"])
+  accounts = {}
+  for account in record.get("accounts") or []:
+    if isinstance(account, dict) and account.get("id"):
+      accounts[str(account["id"])] = {"limits": plan_limits(account.get("limits")), "plan": str(account.get("plan") or "")}
+  if len(accounts) > 1:
+    snapshot["accounts"] = accounts
   return snapshot
 
 
@@ -165,7 +181,8 @@ def append_snapshot(agent: str, snapshot: dict[str, Any]) -> bool:
   existing = read_snapshots(path)
   if existing:
     last = existing[-1]
-    if last["limits"] == snapshot["limits"] and last["models"] == {k: list(v) for k, v in snapshot["models"].items()}:
+    if (last["limits"] == snapshot["limits"] and last.get("accounts") == snapshot.get("accounts")
+        and last["models"] == {k: list(v) for k, v in snapshot["models"].items()}):
       return False
   with path.open("a") as handle:
     handle.write(json.dumps(snapshot, separators=(",", ":")) + "\n")
@@ -179,18 +196,57 @@ def api_price(model: str) -> tuple[float, float, float, float] | None:
   return None
 
 
-def monthly_price(agent: str, plan: str) -> tuple[float | None, str]:
+def monthly_price(agent: str, plan: str, account: str = "") -> tuple[float | None, str]:
+  # A config's accountPrices ({"work": 100}) prices one account; its
+  # monthlyPrice prices a single account, or any account whose plan isn't
+  # listed.
   config = read_json(config_path(agent))
-  if isinstance(config, dict) and isinstance(config.get("monthlyPrice"), (int, float)) and config["monthlyPrice"] > 0:
-    return float(config["monthlyPrice"]), "config"
+  config = config if isinstance(config, dict) else {}
+  price = (config.get("accountPrices") or {}).get(account) if account else None
+  if isinstance(price, (int, float)) and price > 0:
+    return float(price), "config"
+  fallback = config.get("monthlyPrice") if isinstance(config.get("monthlyPrice"), (int, float)) and config["monthlyPrice"] > 0 else None
+  if fallback and not account:
+    return float(fallback), "config"
   price = PLAN_PRICES.get(agent, {}).get(plan.strip().lower())
-  return (float(price), "plan") if price else (None, "")
+  if price:
+    return float(price), "plan"
+  return (float(fallback), "config") if fallback else (None, "")
 
 
-def interval(a: dict[str, Any], b: dict[str, Any], label: str) -> dict[str, float] | None:
-  """Usage between two snapshots, or None across a weekly reset."""
+def weekly_cost(a: dict[str, Any], b: dict[str, Any], label: str, price_for: Any) -> tuple[float, float] | None:
+  """Weekly share used and what it cost between two snapshots, or None
+  across a weekly reset, an account change, or an unpriced plan."""
+  if "accounts" in a or "accounts" in b:
+    before_all, after_all = a.get("accounts") or {}, b.get("accounts") or {}
+    if set(before_all) != set(after_all):
+      return None
+    weekly = dollars = 0.0
+    for account, after_entry in after_all.items():
+      account_label = weekly_label(after_entry["limits"])
+      before = before_all[account]["limits"].get(account_label) if account_label else None
+      after = after_entry["limits"].get(account_label) if account_label else None
+      if before is None or after is None or after < before:
+        return None
+      if after == before:
+        continue
+      price = price_for(after_entry.get("plan") or "", account)
+      if not price:
+        return None
+      weekly += after - before
+      dollars += (after - before) * price
+    return weekly, dollars
   before, after = a["limits"].get(label), b["limits"].get(label)
   if before is None or after is None or after < before:
+    return None
+  price = price_for(str(b.get("plan") or ""), "")
+  return (after - before, (after - before) * price) if price else None
+
+
+def interval(a: dict[str, Any], b: dict[str, Any], label: str, price_for: Any) -> dict[str, float] | None:
+  """Usage between two snapshots, or None when it can't be priced."""
+  cost = weekly_cost(a, b, label, price_for)
+  if cost is None:
     return None
   tokens = api = 0.0
   priced = True
@@ -207,13 +263,13 @@ def interval(a: dict[str, Any], b: dict[str, Any], label: str) -> dict[str, floa
       priced = False
     else:
       api += sum(d * p for d, p in zip(delta, price)) / 1e6
-  return {"weekly": after - before, "tokens": tokens, "api": api, "priced": priced}
+  return {"weekly": cost[0], "dollars": cost[1], "tokens": tokens, "api": api, "priced": priced}
 
 
-def rates(total: dict[str, float], weekly_price: float, priced: bool) -> dict[str, Any] | None:
-  if total["weekly"] < MIN_WEEKLY_DELTA - 1e-9:
+def rates(total: dict[str, float], priced: bool) -> dict[str, Any] | None:
+  if total["weekly"] < MIN_WEEKLY_DELTA - 1e-9 or total["dollars"] <= 0:
     return None
-  dollars = total["weekly"] * weekly_price
+  dollars = total["dollars"]
   return {
     "tokensPerDollar": round(total["tokens"] / dollars),
     "apiValuePerDollar": round(total["api"] / dollars, 2) if priced else None,
@@ -224,7 +280,7 @@ def rates(total: dict[str, float], weekly_price: float, priced: bool) -> dict[st
 
 
 def add(total: dict[str, float], part: dict[str, float]) -> None:
-  for key in ("weekly", "tokens", "api"):
+  for key in ("weekly", "dollars", "tokens", "api"):
     total[key] += part[key]
 
 
@@ -240,33 +296,38 @@ def build(agent: str) -> dict[str, Any] | None:
   weekly_price = monthly * 12 / 52
   is_claude = agent == "claude"
 
+  # A snapshot without a plan of its own is priced at the latest one.
+  def price_for(snapshot_plan: str, account: str) -> float | None:
+    price, _ = monthly_price(agent, snapshot_plan or plan, account)
+    return price * 12 / 52 if price else None
+
   pairs = []
   for a, b in zip(snapshots, snapshots[1:]):
-    part = interval(a, b, label)
+    part = interval(a, b, label, price_for)
     if part:
       pairs.append((b["_t"], part))
 
   days: dict[str, dict[str, float]] = {}
   priced_days: dict[str, bool] = {}
-  everything = {"weekly": 0.0, "tokens": 0.0, "api": 0.0}
+  everything = {"weekly": 0.0, "dollars": 0.0, "tokens": 0.0, "api": 0.0}
   all_priced = True
   for when, part in pairs:
     date = when.astimezone().strftime("%Y-%m-%d")
-    add(days.setdefault(date, {"weekly": 0.0, "tokens": 0.0, "api": 0.0}), part)
+    add(days.setdefault(date, {"weekly": 0.0, "dollars": 0.0, "tokens": 0.0, "api": 0.0}), part)
     priced_days[date] = priced_days.get(date, True) and part["priced"]
     add(everything, part)
     all_priced = all_priced and part["priced"]
 
   points = []
   for date in sorted(days):
-    point = rates(days[date], weekly_price, is_claude and priced_days[date])
+    point = rates(days[date], is_claude and priced_days[date])
     if point:
       points.append({"date": date, **point})
 
   # The last 24 hours, widened until the meter has moved enough to price.
   now = snapshots[-1]["_t"]
   current = None
-  window = {"weekly": 0.0, "tokens": 0.0, "api": 0.0}
+  window = {"weekly": 0.0, "dollars": 0.0, "tokens": 0.0, "api": 0.0}
   window_priced = True
   hours = CURRENT_WINDOW_HOURS
   for when, part in reversed(pairs):
@@ -278,11 +339,11 @@ def build(agent: str) -> dict[str, Any] | None:
     add(window, part)
     window_priced = window_priced and part["priced"]
     hours = max(CURRENT_WINDOW_HOURS, age)
-  current = rates(window, weekly_price, is_claude and window_priced)
+  current = rates(window, is_claude and window_priced)
   if current:
     current["hours"] = round(hours)
 
-  overall = rates(everything, weekly_price, is_claude and all_priced)
+  overall = rates(everything, is_claude and all_priced)
   if overall:
     overall["since"] = snapshots[0]["_t"].strftime("%Y-%m-%d")
 
@@ -295,6 +356,7 @@ def build(agent: str) -> dict[str, Any] | None:
     "weeklyPrice": round(weekly_price, 2),
     "updatedAt": now.isoformat(timespec="seconds"),
     "snapshots": len(snapshots),
+    "accounts": len(snapshots[-1].get("accounts") or {}) or 1,
     "current": current,
     "allTime": overall,
     "points": points[-MAX_POINTS:],

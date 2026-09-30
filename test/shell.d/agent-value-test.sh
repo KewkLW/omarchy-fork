@@ -71,3 +71,30 @@ echo '{"id":"fireworks","limits":[],"modelUsage":{}}' >"$usage_dir/fireworks.jso
 "$ROOT/bin/omarchy-agent-value" record
 [[ ! -e $value_dir/fireworks.jsonl ]] || fail "record skips agents without a weekly allowance"
 pass "record skips agents without a weekly allowance"
+
+# Two accounts: Main (Max 20x, $46.15/week) moves 10% and Work (Pro, $4.62/week)
+# moves 20% then 10% more, so the day cost $4.615 + $0.923 + $0.462. Token
+# counts are shared.
+rm -f "$XDG_CONFIG_HOME/omarchy/agents/claude.json" "$value_dir"/claude.*
+cat >"$value_dir/claude.jsonl" <<'LOG'
+{"t":"2026-09-03T10:00:00-07:00","plan":"Max 20x","limits":{"Weekly (7-day)":0.10},"accounts":{"main":{"plan":"Max 20x","limits":{"Weekly (7-day)":0.10}},"work":{"plan":"Pro","limits":{"Weekly (7-day)":0.30}}},"models":{"claude-opus-5-5":[0,0,0,0]}}
+{"t":"2026-09-03T12:00:00-07:00","plan":"Pro","limits":{"Weekly (7-day)":0.50},"accounts":{"main":{"plan":"Max 20x","limits":{"Weekly (7-day)":0.20}},"work":{"plan":"Pro","limits":{"Weekly (7-day)":0.50}}},"models":{"claude-opus-5-5":[0,0,0,553800000]}}
+{"t":"2026-09-03T13:00:00-07:00","plan":"Pro","limits":{"Weekly (7-day)":0.60},"accounts":{"main":{"plan":"Max 20x","limits":{"Weekly (7-day)":0.20}},"work":{"plan":"Pro","limits":{"Weekly (7-day)":0.60}}},"models":{"claude-opus-5-5":[0,0,0,553800000]}}
+{"t":"2026-09-03T14:00:00-07:00","plan":"Pro","limits":{"Weekly (7-day)":0.70},"accounts":{"work":{"plan":"Pro","limits":{"Weekly (7-day)":0.70}}},"models":{"claude-opus-5-5":[0,0,0,999000000]}}
+LOG
+"$ROOT/bin/omarchy-agent-value" build
+dollars=$(jq -r '.points[0].dollars' "$summary")
+[[ $dollars == "6.0" ]] || fail "value sums each account's share of its own plan" "$(cat "$summary")"
+pass "value sums each account's share of its own plan"
+
+[[ $(jq -r '.points[0].tokens' "$summary") == "553800000" ]] ||
+  fail "value skips an interval whose accounts changed" "$(cat "$summary")"
+pass "value skips an interval whose accounts changed"
+
+cat >"$usage_dir/claude.json" <<'JSON'
+{"id":"claude","tierLabel":"Pro","limits":[{"label":"Weekly (7-day)","percent":0.7}],"accounts":[{"id":"main","plan":"Max 20x","limits":[{"label":"Weekly (7-day)","percent":0.2},{"label":"Fable Weekly","title":"Fable Weekly","percent":0.9}]},{"id":"work","plan":"Pro","active":true,"limits":[{"label":"Weekly (7-day)","percent":0.7}]}],"modelUsage":{"claude-opus-5-5":{"inputTokens":1,"outputTokens":2,"cacheCreationInputTokens":3,"cacheReadInputTokens":4}}}
+JSON
+"$ROOT/bin/omarchy-agent-value" record claude
+tail -1 "$value_dir/claude.jsonl" | jq -e '.accounts == {"main":{"limits":{"Weekly (7-day)":0.2},"plan":"Max 20x"},"work":{"limits":{"Weekly (7-day)":0.7},"plan":"Pro"}}' >/dev/null ||
+  fail "record keeps every account's weekly meter and plan" "$(tail -1 "$value_dir/claude.jsonl")"
+pass "record keeps every account's weekly meter and plan"
