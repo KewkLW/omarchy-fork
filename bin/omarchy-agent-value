@@ -1,0 +1,369 @@
+#!/usr/bin/python3
+# omarchy:summary=Log what a subscription's tokens cost and how that changes over time
+# omarchy:args=[record | build | import <file>] [agent...]
+# omarchy:hidden=true
+"""Price the tokens a subscription agent burns against what the plan costs.
+
+A subscription never says what a token costs, but its records carry the two
+numbers that do: how far the weekly allowance has filled, and how many tokens
+went through the agent on this machine. Each `record` run appends one
+snapshot of both to ~/.local/state/omarchy/agents/value/<agent>.jsonl, and
+`build` turns the snapshot log into <agent>.json, which the agents panel
+reads:
+
+  tokens per $1   tokens used / (weekly share used x weekly price)
+  API value per $1  the same usage priced at Anthropic API list rates, per
+                    dollar of subscription (Claude only; 1-hour cache writes)
+
+The weekly price is the monthly price x 12 / 52. The monthly price comes from
+~/.config/omarchy/agents/<agent>.json ({"monthlyPrice": 200}) and otherwise
+from the plan the record reports. The weekly allowance is account-wide while
+token counts are this machine's only, so usage elsewhere (claude.ai, another
+computer) makes tokens look more expensive than they are.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+# Monthly USD by plan label, per agent. Anything else needs monthlyPrice in
+# the agent's config file.
+PLAN_PRICES = {
+  "claude": {"pro": 20, "max 5x": 100, "max 20x": 200, "max": 100},
+  "codex": {"plus": 20, "pro": 200},
+}
+
+# Anthropic API list prices, USD per million tokens: input, output, cache
+# write (1-hour TTL, 2x input, which Claude Code uses), cache read. Matched
+# on the longest id prefix.
+API_PRICES = {
+  "claude-fable-5-1": (10, 50, 20, 0.25),
+  "claude-mythos-5-1": (10, 50, 20, 0.25),
+  "claude-fable-5": (10, 50, 20, 1.0),
+  "claude-mythos-5": (10, 50, 20, 1.0),
+  "claude-opus-5-5": (4, 20, 8, 0.2),
+  "claude-opus-5": (5, 25, 10, 0.5),
+  "claude-opus-4-5": (5, 25, 10, 0.5),
+  "claude-opus-4-6": (5, 25, 10, 0.5),
+  "claude-opus-4-7": (5, 25, 10, 0.5),
+  "claude-opus-4-8": (5, 25, 10, 0.5),
+  "claude-opus-4": (15, 75, 30, 1.5),
+  "claude-sonnet-5": (2, 10, 4, 0.2),
+  "claude-sonnet-4": (3, 15, 6, 0.3),
+  "claude-haiku-4-5": (1, 5, 2, 0.1),
+}
+
+# A day whose weekly meter moved less than this is too coarse to price: the
+# meter reports whole percents, so one tick either way is a 50% error at 2%.
+MIN_WEEKLY_DELTA = 0.02
+CURRENT_WINDOW_HOURS = 24
+MAX_POINTS = 120
+
+
+def state_dir() -> Path:
+  return Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")) / "omarchy" / "agents"
+
+
+def value_dir() -> Path:
+  path = state_dir() / "value"
+  path.mkdir(parents=True, exist_ok=True)
+  return path
+
+
+def config_path(agent: str) -> Path:
+  return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "omarchy" / "agents" / f"{agent}.json"
+
+
+def read_json(path: Path) -> Any:
+  try:
+    return json.loads(path.read_text())
+  except (OSError, ValueError):
+    return None
+
+
+def write_json(path: Path, data: Any) -> None:
+  fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}.")
+  with os.fdopen(fd, "w") as handle:
+    json.dump(data, handle, separators=(",", ":"))
+    handle.write("\n")
+  os.replace(tmp, path)
+
+
+def weekly_label(limits: dict[str, float]) -> str | None:
+  for label in limits:
+    text = label.lower()
+    if text.startswith("weekly") or ("7-day" in text and "week" in text):
+      return label
+  for label in limits:
+    if "week" in label.lower() or "7-day" in label.lower():
+      return label
+  return None
+
+
+def snapshot_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
+  # A model-scoped window carries its own title; only the account-wide
+  # windows price the plan.
+  limits = {
+    str(entry.get("label")): float(entry["percent"])
+    for entry in record.get("limits") or []
+    if isinstance(entry, dict) and not entry.get("title") and isinstance(entry.get("percent"), (int, float))
+    and entry["percent"] >= 0
+  }
+  models = {}
+  for model, bucket in (record.get("modelUsage") or {}).items():
+    if not isinstance(bucket, dict):
+      continue
+    models[model] = [
+      int(bucket.get("inputTokens") or 0),
+      int(bucket.get("outputTokens") or 0),
+      int(bucket.get("cacheCreationInputTokens") or 0),
+      int(bucket.get("cacheReadInputTokens") or 0),
+    ]
+  if weekly_label(limits) is None or not models:
+    return None
+  snapshot = {"t": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "limits": limits, "models": models}
+  if record.get("tierLabel"):
+    snapshot["plan"] = str(record["tierLabel"])
+  return snapshot
+
+
+def read_snapshots(path: Path) -> list[dict[str, Any]]:
+  snapshots = []
+  try:
+    lines = path.read_text().splitlines()
+  except OSError:
+    return snapshots
+  for line in lines:
+    try:
+      entry = json.loads(line)
+      entry["_t"] = parse_time(entry["t"])
+    except (ValueError, KeyError, TypeError):
+      continue
+    if isinstance(entry.get("limits"), dict) and isinstance(entry.get("models"), dict):
+      snapshots.append(entry)
+  snapshots.sort(key=lambda s: s["_t"])
+  return snapshots
+
+
+def parse_time(value: str) -> dt.datetime:
+  # Older logs wrote +hhmm offsets, which fromisoformat reads on 3.11+ only.
+  value = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", str(value))
+  parsed = dt.datetime.fromisoformat(value)
+  return parsed if parsed.tzinfo else parsed.astimezone()
+
+
+def append_snapshot(agent: str, snapshot: dict[str, Any]) -> bool:
+  path = value_dir() / f"{agent}.jsonl"
+  existing = read_snapshots(path)
+  if existing:
+    last = existing[-1]
+    if last["limits"] == snapshot["limits"] and last["models"] == {k: list(v) for k, v in snapshot["models"].items()}:
+      return False
+  with path.open("a") as handle:
+    handle.write(json.dumps(snapshot, separators=(",", ":")) + "\n")
+  return True
+
+
+def api_price(model: str) -> tuple[float, float, float, float] | None:
+  for prefix in sorted(API_PRICES, key=len, reverse=True):
+    if model.startswith(prefix):
+      return API_PRICES[prefix]
+  return None
+
+
+def monthly_price(agent: str, plan: str) -> tuple[float | None, str]:
+  config = read_json(config_path(agent))
+  if isinstance(config, dict) and isinstance(config.get("monthlyPrice"), (int, float)) and config["monthlyPrice"] > 0:
+    return float(config["monthlyPrice"]), "config"
+  price = PLAN_PRICES.get(agent, {}).get(plan.strip().lower())
+  return (float(price), "plan") if price else (None, "")
+
+
+def interval(a: dict[str, Any], b: dict[str, Any], label: str) -> dict[str, float] | None:
+  """Usage between two snapshots, or None across a weekly reset."""
+  before, after = a["limits"].get(label), b["limits"].get(label)
+  if before is None or after is None or after < before:
+    return None
+  tokens = api = 0.0
+  priced = True
+  for model, counts in b["models"].items():
+    previous = a["models"].get(model, [0, 0, 0, 0])
+    # Transcripts deleted from disk shrink the running totals; a shrinking
+    # count is lost history, not negative usage.
+    delta = [max(0, int(n) - int(p)) for n, p in zip(counts, previous)]
+    if not any(delta):
+      continue
+    tokens += sum(delta)
+    price = api_price(model)
+    if price is None:
+      priced = False
+    else:
+      api += sum(d * p for d, p in zip(delta, price)) / 1e6
+  return {"weekly": after - before, "tokens": tokens, "api": api, "priced": priced}
+
+
+def rates(total: dict[str, float], weekly_price: float, priced: bool) -> dict[str, Any] | None:
+  if total["weekly"] < MIN_WEEKLY_DELTA - 1e-9:
+    return None
+  dollars = total["weekly"] * weekly_price
+  return {
+    "tokensPerDollar": round(total["tokens"] / dollars),
+    "apiValuePerDollar": round(total["api"] / dollars, 2) if priced else None,
+    "dollars": round(dollars, 2),
+    "tokens": int(total["tokens"]),
+    "weeklyUsed": round(total["weekly"], 4),
+  }
+
+
+def add(total: dict[str, float], part: dict[str, float]) -> None:
+  for key in ("weekly", "tokens", "api"):
+    total[key] += part[key]
+
+
+def build(agent: str) -> dict[str, Any] | None:
+  snapshots = read_snapshots(value_dir() / f"{agent}.jsonl")
+  if len(snapshots) < 2:
+    return None
+  plan = str(snapshots[-1].get("plan") or "")
+  monthly, source = monthly_price(agent, plan)
+  label = weekly_label(snapshots[-1]["limits"])
+  if not monthly or not label:
+    return None
+  weekly_price = monthly * 12 / 52
+  is_claude = agent == "claude"
+
+  pairs = []
+  for a, b in zip(snapshots, snapshots[1:]):
+    part = interval(a, b, label)
+    if part:
+      pairs.append((b["_t"], part))
+
+  days: dict[str, dict[str, float]] = {}
+  priced_days: dict[str, bool] = {}
+  everything = {"weekly": 0.0, "tokens": 0.0, "api": 0.0}
+  all_priced = True
+  for when, part in pairs:
+    date = when.astimezone().strftime("%Y-%m-%d")
+    add(days.setdefault(date, {"weekly": 0.0, "tokens": 0.0, "api": 0.0}), part)
+    priced_days[date] = priced_days.get(date, True) and part["priced"]
+    add(everything, part)
+    all_priced = all_priced and part["priced"]
+
+  points = []
+  for date in sorted(days):
+    point = rates(days[date], weekly_price, is_claude and priced_days[date])
+    if point:
+      points.append({"date": date, **point})
+
+  # The last 24 hours, widened until the meter has moved enough to price.
+  now = snapshots[-1]["_t"]
+  current = None
+  window = {"weekly": 0.0, "tokens": 0.0, "api": 0.0}
+  window_priced = True
+  hours = CURRENT_WINDOW_HOURS
+  for when, part in reversed(pairs):
+    age = (now - when).total_seconds() / 3600
+    if age > CURRENT_WINDOW_HOURS and window["weekly"] >= MIN_WEEKLY_DELTA:
+      break
+    if age > 24 * 7:
+      break
+    add(window, part)
+    window_priced = window_priced and part["priced"]
+    hours = max(CURRENT_WINDOW_HOURS, age)
+  current = rates(window, weekly_price, is_claude and window_priced)
+  if current:
+    current["hours"] = round(hours)
+
+  overall = rates(everything, weekly_price, is_claude and all_priced)
+  if overall:
+    overall["since"] = snapshots[0]["_t"].strftime("%Y-%m-%d")
+
+  return {
+    "schemaVersion": 1,
+    "id": agent,
+    "plan": plan,
+    "monthlyPrice": int(monthly) if monthly.is_integer() else monthly,
+    "priceSource": source,
+    "weeklyPrice": round(weekly_price, 2),
+    "updatedAt": now.isoformat(timespec="seconds"),
+    "snapshots": len(snapshots),
+    "current": current,
+    "allTime": overall,
+    "points": points[-MAX_POINTS:],
+  }
+
+
+def usage_records(only: list[str]) -> dict[str, dict[str, Any]]:
+  records = {}
+  for path in sorted((state_dir() / "usage").glob("*.json")):
+    agent = path.stem
+    if only and agent not in only:
+      continue
+    record = read_json(path)
+    if isinstance(record, dict):
+      records[agent] = record
+  return records
+
+
+def build_all(agents: list[str]) -> None:
+  for agent in agents:
+    summary = build(agent)
+    path = value_dir() / f"{agent}.json"
+    if summary:
+      write_json(path, summary)
+
+
+def logged_agents(only: list[str]) -> list[str]:
+  agents = sorted(path.stem for path in value_dir().glob("*.jsonl"))
+  return [agent for agent in agents if not only or agent in only]
+
+
+def import_log(source: Path, agent: str) -> int:
+  incoming = read_snapshots(source)
+  path = value_dir() / f"{agent}.jsonl"
+  existing = read_snapshots(path)
+  seen = {s["_t"] for s in existing}
+  merged = existing + [s for s in incoming if s["_t"] not in seen]
+  merged.sort(key=lambda s: s["_t"])
+  with path.open("w") as handle:
+    for snapshot in merged:
+      snapshot = {k: v for k, v in snapshot.items() if k != "_t"}
+      handle.write(json.dumps(snapshot, separators=(",", ":")) + "\n")
+  return len(merged) - len(existing)
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description="Log and price subscription token usage")
+  parser.add_argument("action", nargs="?", default="record", choices=["record", "build", "import"])
+  parser.add_argument("args", nargs="*")
+  parser.add_argument("--agent", default="claude", help="agent an imported log belongs to")
+  options = parser.parse_args()
+
+  if options.action == "import":
+    if len(options.args) != 1:
+      parser.error("import takes one snapshot log")
+    added = import_log(Path(options.args[0]).expanduser(), options.agent)
+    build_all([options.agent])
+    print(f"imported {added} snapshots into {options.agent}")
+    return 0
+
+  if options.action == "record":
+    for agent, record in usage_records(options.args).items():
+      snapshot = snapshot_from_record(record)
+      if snapshot:
+        append_snapshot(agent, snapshot)
+
+  build_all(logged_agents(options.args))
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())

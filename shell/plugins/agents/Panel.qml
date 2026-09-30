@@ -46,6 +46,12 @@ Panel {
     && balance.remaining / balance.funded <= 0.1
   readonly property bool alarming: (!!headline && headline.percent >= 0.9) || balanceAlarming
 
+  // What the plan's tokens cost, from omarchy-agent-value's log. Only agents
+  // with a known plan price and enough history have one.
+  property var value: null
+  readonly property var valueNow: value ? (value.current || value.allTime || null) : null
+  readonly property var valuePoints: value ? (value.points || []).slice(-30) : []
+
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
@@ -172,6 +178,40 @@ Panel {
     var text = formatMoney(b.spent, b.currency) + " spent of " + formatMoney(b.funded, b.currency) + " funded"
     if (b.estimated) text += " · estimated"
     return text
+  }
+
+  // ------------------------------------------------------------------ value
+
+  function valueWindowText(v) {
+    if (!v) return ""
+    var now = v.current
+    var span = now ? (now.hours <= 24 ? "Last 24h" : "Last " + Math.round(now.hours / 24) + "d") : "All time"
+    var plan = String(v.plan || "") !== "" ? v.plan + " · " : ""
+    return span + " · " + plan + "$" + Number(v.monthlyPrice) + "/mo"
+  }
+
+  function valueAllTimeText(v) {
+    if (!v || !v.allTime || !v.current) return ""
+    var text = "All time " + usage.formatTokenCount(v.allTime.tokensPerDollar)
+    if (v.allTime.apiValuePerDollar !== null && v.allTime.apiValuePerDollar !== undefined)
+      text += " · " + root.formatMoney(v.allTime.apiValuePerDollar) + " API"
+    return text + " · since " + v.allTime.since
+  }
+
+  function valuePeak(points) {
+    var peak = 0
+    for (var i = 0; i < points.length; i++) peak = Math.max(peak, Number(points[i].tokensPerDollar || 0))
+    return peak
+  }
+
+  function valueTooltip(point) {
+    if (!point) return ""
+    var parsed = new Date(String(point.date) + "T00:00:00")
+    var label = isNaN(parsed.getTime()) ? String(point.date) : dayName(point.date) + " " + (parsed.getMonth() + 1) + "/" + parsed.getDate()
+    var text = label + " · " + usage.formatTokenCount(point.tokensPerDollar) + " tokens per $1"
+    if (point.apiValuePerDollar !== null && point.apiValuePerDollar !== undefined)
+      text += " · " + root.formatMoney(point.apiValuePerDollar) + " API value"
+    return text + " · " + Math.round(point.weeklyUsed * 100) + "% of the week"
   }
 
   // ---------------------------------------------------------------- content
@@ -313,6 +353,18 @@ Panel {
   Main {
     id: usage
     settings: root.settings
+  }
+
+  FileView {
+    path: root.provider ? usage.usageDir.replace(/\/usage$/, "/value/") + root.provider.providerId + ".json" : ""
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      try { root.value = JSON.parse(text()) } catch (e) { root.value = null }
+    }
+    onLoadFailed: root.value = null
+    onPathChanged: root.value = null
   }
 
   // Cheap enough to keep running: it only re-evaluates text bindings, and a
@@ -608,6 +660,133 @@ Panel {
                 width: limitsSection.width
                 window: modelData
               }
+            }
+          }
+
+          // ---------- Value per dollar ----------
+          PanelSeparator {
+            visible: valueSection.visible
+            foreground: root.foreground
+          }
+
+          Column {
+            id: valueSection
+            visible: !!root.valueNow
+            width: parent.width
+            spacing: Style.space(10)
+
+            readonly property real peak: Math.max(1, root.valuePeak(root.valuePoints))
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "VALUE PER $1"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(valueTokens.implicitHeight, valueApi.implicitHeight)
+
+              Text {
+                id: valueTokens
+                textFormat: Text.PlainText
+                text: root.valueNow ? usage.formatTokenCount(root.valueNow.tokensPerDollar) + " tokens" : ""
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                id: valueApi
+                textFormat: Text.PlainText
+                visible: !!root.valueNow && root.valueNow.apiValuePerDollar !== null && root.valueNow.apiValuePerDollar !== undefined
+                text: visible ? root.formatMoney(root.valueNow.apiValuePerDollar) + " at API prices" : ""
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            // One column per day, scaled to the best day: taller is more
+            // tokens for the same dollar.
+            Row {
+              id: valueChart
+              visible: root.valuePoints.length > 0
+              width: parent.width
+              height: Style.space(56)
+              spacing: Style.space(2)
+
+              readonly property real barWidth: root.valuePoints.length > 0
+                ? Math.min(Style.space(18), (width - spacing * (root.valuePoints.length - 1)) / root.valuePoints.length)
+                : 0
+
+              Repeater {
+                model: root.valuePoints
+
+                Item {
+                  required property var modelData
+                  required property int index
+
+                  width: valueChart.barWidth
+                  height: valueChart.height
+
+                  readonly property bool latest: index === root.valuePoints.length - 1
+
+                  Rectangle {
+                    anchors.fill: parent
+                    radius: Style.cornerRadius
+                    color: root.track
+                  }
+
+                  Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    height: Math.max(Style.space(2), parent.height * root.clamp(Number(modelData.tokensPerDollar || 0) / valueSection.peak, 0, 1))
+                    radius: Style.cornerRadius
+                    color: parent.latest ? root.foreground : root.alpha(root.foreground, 0.55)
+                  }
+
+                  MouseArea {
+                    id: valueHover
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    acceptedButtons: Qt.NoButton
+                  }
+
+                  PanelToolTip {
+                    visible: valueHover.containsMouse
+                    text: root.valueTooltip(modelData)
+                    fontFamily: root.fontFamily
+                  }
+                }
+              }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: root.valueWindowText(root.value)
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              visible: text !== ""
+              width: parent.width
+              text: root.valueAllTimeText(root.value)
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
             }
           }
 
