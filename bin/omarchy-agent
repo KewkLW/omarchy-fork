@@ -1,11 +1,12 @@
 #!/bin/bash
 
 # omarchy:summary=Launch the default coding agent in a terminal
-# omarchy:args=[--inline] [--pick]
-# omarchy:examples=omarchy agent | omarchy agent --inline
+# omarchy:args=[--inline] [--pick] [--agent <name>]
+# omarchy:examples=omarchy agent | omarchy agent --inline | omarchy agent --agent claude
 
 inline=false
 pick=false
+agent=""
 
 # Flags only. A bare prompt would shadow the subcommands under this group, so
 # prompts go through omarchy-agent-prompt, which passes one here as --prompt.
@@ -18,6 +19,10 @@ while (($#)); do
     --pick)
       pick=true
       shift
+      ;;
+    --agent)
+      agent=${2:?--agent needs a name}
+      shift 2
       ;;
     --prompt)
       prompt=${2:?--prompt needs a value}
@@ -35,7 +40,20 @@ done
 # menu start in the work directory instead of re-asking on every session.
 [[ $PWD == "$HOME" && -d $HOME/Work ]] && cd "$HOME/Work"
 
-agent=$(omarchy-default-agent)
+# --agent names one outright (the agents panel's tabs launch this way);
+# claude-<id> is an extra Claude account from claude-accounts.json, which runs
+# claude against that account's config directory.
+if [[ ${agent:-} == claude-* ]]; then
+  accounts="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/agents/claude-accounts.json"
+  dir=$(jq -r --arg id "${agent#claude-}" '.[]? | select(.id == $id) | .dir // empty' "$accounts" 2>/dev/null)
+  if [[ -z $dir ]]; then
+    echo "Unknown Claude account: ${agent#claude-}. List it in $accounts" >&2
+    exit 1
+  fi
+  export CLAUDE_CONFIG_DIR="${dir/#\~/$HOME}"
+  agent=claude
+fi
+[[ -n ${agent:-} ]] || agent=$(omarchy-default-agent)
 
 # Omarchy ships without a default, so there is nothing to launch until one is
 # picked. --pick offers the choice instead of the error, which is what the

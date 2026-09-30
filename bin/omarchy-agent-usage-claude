@@ -1008,6 +1008,8 @@ def main() -> int:
     "schemaVersion": 1,
     "id": agent_id,
     "name": agent_name,
+    # What `omarchy agent --agent` launches for this tab.
+    "cli": agent_id,
     "tabLabel": account.get("tab") or account["id"].capitalize() if account else "Claude",
     "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
     "ready": number(stats.get("totalPrompts")) > 0 or len(limits["limits"]) > 0,

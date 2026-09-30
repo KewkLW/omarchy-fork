@@ -598,6 +598,7 @@ def main():
     "schemaVersion": 1,
     "id": AGENT_ID,
     "name": AGENT_NAME,
+    "cli": AGENT_ID,
     "updatedAt": datetime.now(timezone.utc).isoformat(),
     "ready": True,
     "hasLocalStats": True,

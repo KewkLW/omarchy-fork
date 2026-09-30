@@ -249,6 +249,8 @@ Item {
       providerName: String(record.name || record.id),
       // A short label for the switch, where several tabs share one row.
       tabLabel: String(record.tabLabel || record.name || record.id),
+      // The CLI a right-click on the tab starts; empty for API-only providers.
+      cli: String(record.cli || ""),
       ready: record.ready === true || synced,
       usageStatusText: String(record.usageStatusText || ""),
       authHelpText: String(record.authHelpText || ""),

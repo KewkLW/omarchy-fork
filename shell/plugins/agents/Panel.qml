@@ -64,6 +64,14 @@ Panel {
     root.close()
   }
 
+  // A tab's right-click starts that provider's own CLI rather than the default.
+  function launchProviderCli(p) {
+    var cli = p ? String(p.cli || "") : ""
+    if (!/^[a-z0-9-]+$/.test(cli)) return
+    if (root.bar) root.bar.run("omarchy-agent --agent " + cli)
+    root.close()
+  }
+
   // ---------------------------------------------------------------- limits
   //
   // Both providers report the same two shapes: a short rolling session window
@@ -485,10 +493,12 @@ Panel {
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
                 verticalPadding: Style.spacing.controlPaddingY
+                tooltipText: modelData.cli ? "Right-click to launch " + modelData.providerName : ""
                 onClicked: {
                   root.cursorActive = true
                   root.selectProvider(index)
                 }
+                onRightClicked: root.launchProviderCli(modelData)
                 onHovered: function(isHovered) { if (isHovered) root.cursorActive = true }
               }
             }
