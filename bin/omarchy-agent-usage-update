@@ -16,7 +16,7 @@ flags=()
 only=()
 declare -A excluded
 
-while [[ $# -gt 0 ]]; do
+while (( $# > 0 )); do
   case "$1" in
   --force | --limits-only) flags+=("$1") ;;
   --except)
@@ -72,13 +72,6 @@ status=0
 for pid in "${pids[@]}"; do
   wait "$pid" || status=1
 done
-
-# A limits-only run pairs fresh meters with cached token totals, so only full
-# scans feed the value log. It runs before any account switch, which narrows
-# flags to a limits-only recollect.
-if [[ ! " ${flags[*]} " =~ " --limits-only " && -x $OMARCHY_PATH/bin/omarchy-agent-value ]]; then
-  "$OMARCHY_PATH/bin/omarchy-agent-value" record || echo "omarchy-agent-usage-update: value log failed" >&2
-fi
 
 # Fresh limits are when switching accounts near a limit gets decided. A switch
 # changes which account the record's own limits describe, so that record is

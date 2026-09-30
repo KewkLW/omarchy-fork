@@ -30,10 +30,6 @@ Every subscription on one page, limits first.
 - **Balance** — prepaid agents show a credit ledger instead of limits: a
   fuel-gauge meter that drains toward empty, the remaining credit, and
   funded-versus-spent detail.
-- **Value per $1** — under each agent with a priced plan: tokens per dollar
-  of plan over the last day, the same usage at API list prices, and one bar
-  per day for the last 30 days (taller is more tokens for the dollar). Hover
-  a bar for that day's numbers. See [Value](#value).
 - **Make something cool** — starter prompts (a new theme, plugin, or app) that
   start the default agent on the task through `omarchy agent prompt`.
 - **Adding a subscription** — the + in the hero's corner (or `a`) swaps
@@ -122,46 +118,6 @@ period. `accountId` only matters when one API key can access several
 accounts. Without a configured `fundedAmount` the tab still shows token
 usage, just no balance. With a live ledger, `fundedAmount` is optional and
 only adds the meter and the spent-of-funded line under the real figure.
-
-## Value
-
-A subscription does not say what a token costs, but the records carry what
-it takes to work it out: how far the weekly allowance filled, and how many
-tokens went through the agent. After every full refresh,
-`omarchy-agent-usage-update` runs `omarchy-agent-value record`, which appends
-one snapshot of both to `~/.local/state/omarchy/agents/value/<agent>.jsonl`
-and rebuilds `<agent>.json` from the whole log for the panel:
-
-- **Tokens per $1** = tokens used ÷ (share of the week used × weekly price),
-  where the weekly price is the monthly price × 12 ÷ 52.
-- **API value per $1** prices the same tokens at Anthropic's API list rates
-  (input, output, 1-hour cache writes, cache reads per model). Claude only.
-
-Intervals that cross a weekly reset are dropped, and token totals that shrink
-(transcripts cleaned off disk) count as zero rather than negative. The week
-meter reports whole percents, so a day only gets a point once it moved 2% or
-more; the headline figure covers the last 24 hours, widened until it has.
-
-The monthly price comes from the plan label (Pro, Max 5x, Max 20x, ChatGPT
-Plus/Pro); set it explicitly, or for any other plan, in
-`~/.config/omarchy/agents/<agent>.json`:
-
-```json
-{ "monthlyPrice": 200 }
-```
-
-With several subscription accounts, each snapshot also keeps every
-account's weekly meter and plan, and an interval costs each account's share
-of its own weekly price, so a switch or two accounts running at once still
-price every token. An interval where an account was added or removed is
-dropped. Price one account by its id with
-`{ "accountPrices": { "work": 100 } }`; `monthlyPrice` then covers any
-account whose plan isn't known.
-
-The allowance is account-wide but token counts are this machine's, so usage
-on claude.ai or another computer makes local tokens look more expensive. An
-older snapshot log in the same line format can be merged in with
-`omarchy-agent-value import <file> --agent claude`.
 
 ## Interactions
 
