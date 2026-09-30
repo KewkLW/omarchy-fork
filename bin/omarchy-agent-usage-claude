@@ -32,6 +32,9 @@ from typing import Any
 
 AGENT_ID = "claude"
 AGENT_NAME = "Claude Code"
+MAIN_ACCOUNT = ""
+PROFILE_ENDPOINT = "https://api.anthropic.com/api/oauth/profile"
+PROFILE_MAX_AGE_SECONDS = 6 * 3600
 AUTH_HELP = "Run `claude auth login` to restore authoritative usage."
 USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 PROBE_MIN_INTERVAL_SECONDS = 15
@@ -39,6 +42,55 @@ PROBE_MIN_INTERVAL_SECONDS = 15
 
 def config_dir() -> Path:
   return expand_path(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+
+
+# Extra subscription accounts, each its own CLAUDE_CONFIG_DIR, listed in
+# ~/.config/omarchy/agents/claude-accounts.json as
+# [{"id": "kewky", "name": "Claude Kewky", "dir": "~/.claude-kewky"}].
+# Each one gets its own record (claude-<id>.json) and so its own panel tab.
+def extra_accounts() -> list[dict[str, str]]:
+  path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy" / "agents" / "claude-accounts.json"
+  try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return []
+  accounts = []
+  for entry in data if isinstance(data, list) else []:
+    if not isinstance(entry, dict):
+      continue
+    account_id = re.sub(r"[^a-z0-9-]+", "-", str(entry.get("id") or "").lower()).strip("-")
+    directory = str(entry.get("dir") or "")
+    if account_id and directory:
+      accounts.append({
+        "id": account_id,
+        "name": str(entry.get("name") or f"Claude {account_id}"),
+        "tab": str(entry.get("tab") or ""),
+        "dir": directory,
+      })
+  return accounts
+
+
+# Accounts that share one projects folder (a symlinked ~/.claude/projects)
+# write indistinguishable transcripts, so the session ids each account's CLI
+# lists as running are remembered here. A transcript whose session was seen
+# under an extra account counts toward that account; every other one belongs
+# to the main login. Sessions that ended before this ledger saw them stay main.
+def session_ledger(accounts: list[dict[str, str]]) -> dict[str, str]:
+  path = cache_root() / "claude-session-accounts.json"
+  ledger = read_fresh_json(path, float("inf")) or {}
+  changed = False
+  for account in accounts:
+    for record in (expand_path(account["dir"]) / "sessions").glob("*.json"):
+      try:
+        session_id = str(json.loads(record.read_text(encoding="utf-8")).get("sessionId") or "")
+      except Exception:
+        continue
+      if session_id and ledger.get(session_id) != account["id"]:
+        ledger[session_id] = account["id"]
+        changed = True
+  if changed:
+    write_json(path, ledger)
+  return ledger
 
 
 def expand_path(value: str) -> Path:
@@ -118,20 +170,46 @@ def empty_bucket() -> dict[str, int]:
 # ---------------------------------------------------------------- local scan
 
 
-def scan_projects(projects_path: Path) -> dict[str, Any]:
-  today = local_date_string()
-  recent_dates = recent_date_strings()
-  recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+def new_summary() -> dict[str, Any]:
+  return {
+    "recent": {day: {"date": day, "messageCount": 0} for day in recent_date_strings()},
+    "sessions": set(),
+    "activeDays": set(),
+    "todaySessions": set(),
+    "todayTokens": {},
+    "usageByModel": {},
+    "prompts": 0,
+    "todayPrompts": 0,
+    "todayTotal": 0,
+  }
 
+
+def finish_summary(acc: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "todayPrompts": acc["todayPrompts"],
+    "todaySessions": len(acc["todaySessions"]),
+    "todayTotalTokens": acc["todayTotal"],
+    "todayTokensByModel": acc["todayTokens"],
+    "recentDays": [acc["recent"][day] for day in recent_date_strings()],
+    "modelUsage": acc["usageByModel"],
+    "totalPrompts": acc["prompts"],
+    "totalSessions": len(acc["sessions"]),
+    # Days with any recorded usage, for the all-time "N days" summary. The
+    # dates travel too: merging snapshots from several machines needs their
+    # union, which a count alone cannot give.
+    "activeDays": len(acc["activeDays"]),
+    "activeDates": sorted(acc["activeDays"]),
+  }
+
+
+# One pass over the transcripts, split by account through the session ledger.
+# Returns account id -> summary, with the main login under MAIN_ACCOUNT.
+def scan_projects(projects_path: Path, ledger: dict[str, str]) -> dict[str, dict[str, Any]]:
+  today = local_date_string()
   seen: set[str] = set()
-  sessions: set[str] = set()
-  active_days: set[str] = set()
-  today_sessions: set[str] = set()
-  today_tokens: dict[str, int] = {}
-  usage_by_model: dict[str, dict[str, int]] = {}
-  prompts = 0
-  today_prompt_count = 0
-  today_token_total = 0
+  accounts: dict[str, dict[str, Any]] = {MAIN_ACCOUNT: new_summary()}
+  for account_id in set(ledger.values()):
+    accounts[account_id] = new_summary()
 
   files = projects_path.rglob("*.jsonl") if projects_path.is_dir() else []
   for path in files:
@@ -173,44 +251,31 @@ def scan_projects(projects_path: Path) -> dict[str, Any]:
           model = str(message.get("model") or entry.get("model") or "claude")
           day = local_date_from_timestamp(entry.get("timestamp") or message.get("timestamp"))
           session_key = str(entry.get("sessionId") or path)
-          sessions.add(session_key)
-          active_days.add(day)
-          prompts += 1
+          acc = accounts[ledger.get(session_key, MAIN_ACCOUNT)]
+          acc["sessions"].add(session_key)
+          acc["activeDays"].add(day)
+          acc["prompts"] += 1
 
-          bucket = usage_by_model.setdefault(model, empty_bucket())
+          bucket = acc["usageByModel"].setdefault(model, empty_bucket())
           bucket["inputTokens"] += input_tokens
           bucket["outputTokens"] += output_tokens
           bucket["cacheReadInputTokens"] += cache_read
           bucket["cacheCreationInputTokens"] += cache_write
 
-          if day in recent:
+          if day in acc["recent"]:
             # recentDays.messageCount is actually a token total, despite the
             # legacy name shared with synced snapshots.
-            recent[day]["messageCount"] += total
+            acc["recent"][day]["messageCount"] += total
 
           if day == today:
-            today_prompt_count += 1
-            today_sessions.add(session_key)
-            today_token_total += total
-            today_tokens[model] = today_tokens.get(model, 0) + total
+            acc["todayPrompts"] += 1
+            acc["todaySessions"].add(session_key)
+            acc["todayTotal"] += total
+            acc["todayTokens"][model] = acc["todayTokens"].get(model, 0) + total
     except Exception as exc:
       print(f"Ignoring unreadable Claude project file {path}: {exc}", file=sys.stderr)
 
-  return {
-    "todayPrompts": today_prompt_count,
-    "todaySessions": len(today_sessions),
-    "todayTotalTokens": today_token_total,
-    "todayTokensByModel": today_tokens,
-    "recentDays": [recent[day] for day in recent_dates],
-    "modelUsage": usage_by_model,
-    "totalPrompts": prompts,
-    "totalSessions": len(sessions),
-    # Days with any recorded usage, for the all-time "N days" summary. The
-    # dates travel too: merging snapshots from several machines needs their
-    # union, which a count alone cannot give.
-    "activeDays": len(active_days),
-    "activeDates": sorted(active_days),
-  }
+  return {account_id: finish_summary(acc) for account_id, acc in accounts.items()}
 
 
 def scan_cache_paths(projects_path: Path) -> tuple[Path, Path]:
@@ -248,21 +313,29 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     raise
 
 
-def cached_scan(projects_path: Path, max_age_seconds: float) -> dict[str, Any]:
+def cached_scan(projects_path: Path, max_age_seconds: float, ledger: dict[str, str], account: str) -> dict[str, Any]:
   cache_file, lock_file = scan_cache_paths(projects_path)
+  empty = finish_summary(new_summary())
 
-  cached = read_fresh_json(cache_file, max_age_seconds)
-  if cached is not None:
-    return cached
+  # The cache holds every account's split; a ledger that has grown since
+  # means the split is stale.
+  def usable(cached: dict[str, Any] | None) -> dict[str, Any] | None:
+    if cached is None or cached.get("ledgerSize") != len(ledger) or not isinstance(cached.get("accounts"), dict):
+      return None
+    return cached["accounts"].get(account, empty)
+
+  hit = usable(read_fresh_json(cache_file, max_age_seconds))
+  if hit is not None:
+    return hit
 
   with lock_file.open("w") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
-    cached = read_fresh_json(cache_file, max_age_seconds)
-    if cached is not None:
-      return cached
-    summary = scan_projects(projects_path)
-    write_json(cache_file, summary)
-    return summary
+    hit = usable(read_fresh_json(cache_file, max_age_seconds))
+    if hit is not None:
+      return hit
+    split = scan_projects(projects_path, ledger)
+    write_json(cache_file, {"ledgerSize": len(ledger), "accounts": split})
+    return split.get(account, empty)
 
 
 # ------------------------------------------------------------- local fallback
@@ -593,6 +666,38 @@ def oauth_login(claude_dir: Path) -> tuple[str, int, str]:
   return str(login.get("accessToken") or ""), number(login.get("expiresAt")), plan
 
 
+# The credential file keeps the tier from the moment of login, so an upgrade
+# afterwards (Max 5x to 20x) never reaches it. The profile endpoint answers
+# with the organization's current tier; its label is cached for a few hours
+# and the credential's tier is only the fallback.
+def current_plan(access_token: str, cache_name: str, fallback: str) -> str:
+  cache_file = cache_root() / cache_name
+  cached = read_fresh_json(cache_file, PROFILE_MAX_AGE_SECONDS)
+  if cached is not None and cached.get("plan"):
+    return str(cached["plan"])
+  if access_token == "":
+    return fallback
+  request = urllib.request.Request(
+    PROFILE_ENDPOINT,
+    headers={
+      "Authorization": "Bearer " + access_token,
+      "anthropic-beta": "oauth-2025-04-20",
+      "Accept": "application/json",
+    },
+  )
+  try:
+    with urllib.request.urlopen(request, timeout=10) as response:
+      payload = json.loads(response.read().decode("utf-8", errors="replace"))
+  except Exception:
+    return fallback
+  org = payload.get("organization") if isinstance(payload.get("organization"), dict) else {}
+  plan = plan_label(str(org.get("rate_limit_tier") or ""), "")
+  if not plan:
+    return fallback
+  write_json(cache_file, {"plan": plan})
+  return plan
+
+
 def plan_label(tier: str, subscription: str) -> str:
   if tier:
     match = re.search(r"max_(\d+x)", tier, re.IGNORECASE)
@@ -791,13 +896,13 @@ def usable_cached_limits(cached: dict[str, Any]) -> list[dict[str, Any]]:
   return [entry for entry in entries if isinstance(entry, dict) and limit_window_open(entry, now)]
 
 
-def collect_limits(access_token: str, expires_at_ms: int, force: bool) -> dict[str, Any]:
+def collect_limits(access_token: str, expires_at_ms: int, force: bool, cache_name: str = "claude-limits.json") -> dict[str, Any]:
   result = {"limits": [], "usageStatusText": "", "authHelpText": AUTH_HELP}
 
   # A panel that is opened and shut repeatedly must not turn into a request
   # per flick, so recent probe results are reused for a short window — and
   # kept as the answer of record when a later probe fails.
-  probe_cache = cache_root() / "claude-limits.json"
+  probe_cache = cache_root() / cache_name
   cached = read_fresh_json(probe_cache, float("inf")) or {}
   fallback = usable_cached_limits(cached)
 
@@ -854,13 +959,28 @@ def main() -> int:
   parser.add_argument("--force", action="store_true", help="rescan transcripts and re-probe limits, ignoring caches")
   parser.add_argument("--limits-only", action="store_true", help="reuse any recent transcript scan; only the limits probe must be fresh")
   parser.add_argument("--cache-seconds", type=float, default=20)
+  parser.add_argument("--account", default=MAIN_ACCOUNT, help="an id from claude-accounts.json; the main login when omitted")
   args = parser.parse_args()
 
-  claude_dir = config_dir()
-  scan_age = 0 if args.force else (900 if args.limits_only else args.cache_seconds)
-  stats = cached_scan(claude_dir / "projects", scan_age)
+  accounts = extra_accounts()
+  account = next((a for a in accounts if a["id"] == args.account), None)
+  if args.account and account is None:
+    print(f"Unknown Claude account {args.account!r}; list it in ~/.config/omarchy/agents/claude-accounts.json", file=sys.stderr)
+    return 1
 
-  if number(stats.get("totalPrompts")) <= 0:
+  agent_id = f"{AGENT_ID}-{account['id']}" if account else AGENT_ID
+  agent_name = account["name"] if account else AGENT_NAME
+  claude_dir = expand_path(account["dir"]) if account else config_dir()
+  main_dir = config_dir()
+  scan_age = 0 if args.force else (900 if args.limits_only else args.cache_seconds)
+  ledger = session_ledger(accounts)
+  # Every account scans the main projects folder: an extra account's own
+  # folder is usually a symlink to it, and the ledger does the splitting.
+  stats = cached_scan(main_dir / "projects", scan_age, ledger, account["id"] if account else MAIN_ACCOUNT)
+
+  # The fallbacks and other harnesses read files the accounts share, so only
+  # the main login counts them.
+  if account is None and number(stats.get("totalPrompts")) <= 0:
     fallback = stats_cache_fallback(claude_dir)
     if fallback is not None:
       stats = fallback
@@ -871,21 +991,24 @@ def main() -> int:
       if today_prompts or today_sessions:
         stats = dict(stats, todayPrompts=today_prompts, todaySessions=today_sessions)
 
-  pi_usage = scan_pi_usage(scan_age)
-  if pi_usage is not None:
-    stats = merge_stats(stats, pi_usage)
+  if account is None:
+    pi_usage = scan_pi_usage(scan_age)
+    if pi_usage is not None:
+      stats = merge_stats(stats, pi_usage)
 
-  opencode = scan_opencode_usage(scan_age)
-  if opencode is not None:
-    stats = merge_stats(stats, opencode)
+    opencode = scan_opencode_usage(scan_age)
+    if opencode is not None:
+      stats = merge_stats(stats, opencode)
 
   access_token, expires_at_ms, plan = oauth_login(claude_dir)
-  limits = collect_limits(access_token, expires_at_ms, args.force)
+  plan = current_plan(access_token, f"{agent_id}-plan.json", plan)
+  limits = collect_limits(access_token, expires_at_ms, args.force, f"{agent_id}-limits.json")
 
   record = {
     "schemaVersion": 1,
-    "id": AGENT_ID,
-    "name": AGENT_NAME,
+    "id": agent_id,
+    "name": agent_name,
+    "tabLabel": account.get("tab") or account["id"].capitalize() if account else "Claude",
     "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
     "ready": number(stats.get("totalPrompts")) > 0 or len(limits["limits"]) > 0,
     "hasLocalStats": True,

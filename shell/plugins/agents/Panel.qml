@@ -477,7 +477,7 @@ Panel {
                 required property int index
 
                 width: providerSwitch.cellWidth
-                text: modelData.providerName
+                text: modelData.tabLabel || modelData.providerName
                 selected: index === root.providerIndex
                 hasCursor: root.cursorActive && index === root.providerIndex
                 bordered: true

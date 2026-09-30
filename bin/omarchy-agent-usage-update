@@ -41,8 +41,9 @@ wanted() {
 
 collect() {
   local collector="$1" agent="$2"
+  shift 2
   local record tmp
-  if ! record=$("$collector" "${flags[@]}") || [[ -z $record ]] || ! jq -e . >/dev/null 2>&1 <<<"$record"; then
+  if ! record=$("$collector" "${flags[@]}" "$@") || [[ -z $record ]] || ! jq -e . >/dev/null 2>&1 <<<"$record"; then
     echo "omarchy-agent-usage-update: $agent collector failed" >&2
     return 1
   fi
@@ -60,6 +61,18 @@ for collector in "$OMARCHY_PATH"/bin/omarchy-agent-usage-*; do
   collect "$collector" "$agent" &
   pids+=($!)
 done
+
+# Extra Claude subscription accounts each get their own record, and so their
+# own tab: claude-<id>.json from the entries in claude-accounts.json.
+CLAUDE_ACCOUNTS="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/agents/claude-accounts.json"
+if [[ -f $CLAUDE_ACCOUNTS && -x $OMARCHY_PATH/bin/omarchy-agent-usage-claude ]]; then
+  while IFS= read -r account; do
+    [[ -n $account ]] || continue
+    wanted "claude-$account" || continue
+    collect "$OMARCHY_PATH/bin/omarchy-agent-usage-claude" "claude-$account" --account "$account" &
+    pids+=($!)
+  done < <(jq -r '.[]?.id // empty' "$CLAUDE_ACCOUNTS" 2>/dev/null)
+fi
 
 status=0
 for pid in "${pids[@]}"; do
