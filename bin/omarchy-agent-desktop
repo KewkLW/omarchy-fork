@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -116,12 +117,18 @@ def authorize(window):
   return tag, choice == "Allow once"
 
 
+def broker_path():
+  path = shutil.which("omarchy-agent-seat-broker")
+  if not path:
+    raise RuntimeError("omarchy-agent-seat-broker is not on PATH")
+  return path
+
+
 def keymap():
   """The user's keymap and layout, so characters land as they would from their keyboard."""
   keyboards = json.loads(run("hyprctl", "devices", "-j").stdout).get("keyboards", [])
   keyboard = next((keyboard for keyboard in keyboards if keyboard.get("main")), keyboards[0] if keyboards else {})
-  broker = os.path.join(os.environ["OMARCHY_PATH"], "bin", "omarchy-agent-seat-broker")
-  loader = importlib.machinery.SourceFileLoader("omarchy_agent_seat_broker", broker)
+  loader = importlib.machinery.SourceFileLoader("omarchy_agent_seat_broker", broker_path())
   module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
   loader.exec_module(module)
   names = (keyboard.get("rules") or "evdev", keyboard.get("model") or "pc105", keyboard.get("layout") or "us", keyboard.get("variant") or "", keyboard.get("options") or "")
@@ -178,7 +185,7 @@ def key_combo(address, combo):
 def capture_window(window, output):
   output = os.path.abspath(output or os.path.join(RUNTIME_DIR, f"agent-desktop-{window['stableId']}.png"))
   os.makedirs(os.path.dirname(output), exist_ok=True)
-  helper = os.path.join(os.environ["OMARCHY_PATH"], "bin", "omarchy-agent-seat-broker")
+  helper = broker_path()
   result = run(helper, "capture-identifier", window["stableId"], output, check=False)
   data = json.loads(result.stdout or "{}")
   if result.returncode:
