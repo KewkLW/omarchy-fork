@@ -15,3 +15,9 @@ o.window("agent-[0-9]+(\\..*)?", {
   border_size = 3,
   border_color = "rgba(ff8a00ff) rgba(ffc266ff) 45deg",
 })
+
+-- Desktop windows handed to an agent use the same visible ownership cue.
+o.window({ tag = "agent-drive" }, {
+  border_size = 3,
+  border_color = "rgba(ff8a00ff) rgba(ffc266ff) 45deg",
+})

@@ -1362,17 +1362,22 @@ class Display:
       events.append(event)
 
 
-def capture(window, path):
+def capture(window, path, identifier=False):
   """Have Hyprland draw an agent window into shared memory and save it as a PNG."""
   display = Display(upstream_socket())
 
   display.bind("ext_foreign_toplevel_list_v1")
   handle = None
   for object_id, interface, name, args in display.roundtrip():
-    if interface == "ext_foreign_toplevel_handle_v1" and name == "app_id" and re.fullmatch(rf"agent-{window}(\..*)?", args[0] or ""):
+    if interface != "ext_foreign_toplevel_handle_v1":
+      continue
+    if identifier and name == "identifier" and args[0] == window:
+      handle = object_id
+    elif not identifier and name == "app_id" and re.fullmatch(rf"agent-{window}(\..*)?", args[0] or ""):
       handle = object_id
   if not handle:
-    raise ValueError(f"Hyprland has no agent window {window}")
+    kind = "desktop window" if identifier else "agent window"
+    raise ValueError(f"Hyprland has no {kind} {window}")
 
   # New ids must reach Hyprland in order, so bind each manager before making its object.
   sources = display.bind("ext_foreign_toplevel_image_capture_source_manager_v1")
@@ -1450,6 +1455,12 @@ if __name__ == "__main__":
   elif len(sys.argv) == 4 and sys.argv[1] == "capture":
     try:
       capture(sys.argv[2], sys.argv[3])
+    except Exception as error:
+      print(json.dumps({"error": str(error)}))
+      sys.exit(1)
+  elif len(sys.argv) == 4 and sys.argv[1] == "capture-identifier":
+    try:
+      capture(sys.argv[2], sys.argv[3], identifier=True)
     except Exception as error:
       print(json.dumps({"error": str(error)}))
       sys.exit(1)

@@ -1,0 +1,235 @@
+#!/usr/bin/python3
+
+# omarchy:summary=Drive desktop windows through the agent workspace policy
+# omarchy:args=list | screenshot <address> [output] | type <address> <text> | key <address> <combo> | close <address>
+# omarchy:examples=omarchy agent desktop list | omarchy agent desktop screenshot 0x1234 | omarchy agent desktop type 0x1234 "hello" | omarchy agent desktop key 0x1234 ctrl+l
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+
+RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy")
+POLICY_PATH = os.path.join(RUNTIME_DIR, "agent-drive.json")
+DEFAULT_POLICY = {
+  "agent_workspaces": [9, 10],
+  "extra_workspaces": [],
+  "always_allow_classes": [],
+  "never_allow_classes": [r"^1[Pp]assword$", r"^Bitwarden$"],
+  "tag": "agent-drive",
+}
+
+SHIFTED = {
+  "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+  "_": "MINUS", "+": "EQUAL", "{": "LEFTBRACE", "}": "RIGHTBRACE", "|": "BACKSLASH", ":": "SEMICOLON",
+  '"': "APOSTROPHE", "<": "COMMA", ">": "DOT", "?": "SLASH", "~": "GRAVE",
+}
+PLAIN = {
+  " ": "SPACE", "\n": "RETURN", "\t": "TAB", "-": "MINUS", "=": "EQUAL", "[": "LEFTBRACE", "]": "RIGHTBRACE",
+  "\\": "BACKSLASH", ";": "SEMICOLON", "'": "APOSTROPHE", ",": "COMMA", ".": "DOT", "/": "SLASH", "`": "GRAVE",
+}
+MODIFIERS = {"ctrl": "CTRL", "control": "CTRL", "shift": "SHIFT", "alt": "ALT", "super": "SUPER", "meta": "SUPER"}
+KEYS = {
+  "enter": "RETURN", "return": "RETURN", "space": "SPACE", "tab": "TAB", "esc": "ESCAPE", "escape": "ESCAPE",
+  "backspace": "BACKSPACE", "delete": "DELETE", "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
+  "home": "HOME", "end": "END", "pageup": "PAGEUP", "pagedown": "PAGEDOWN",
+}
+
+
+def run(*args, check=True, capture=True):
+  return subprocess.run(args, check=check, text=True, capture_output=capture)
+
+
+def policy():
+  try:
+    with open(POLICY_PATH, encoding="utf-8") as file:
+      return {**DEFAULT_POLICY, **json.load(file)}
+  except (OSError, ValueError):
+    return DEFAULT_POLICY.copy()
+
+
+def clients():
+  result = run("hyprctl", "clients", "-j")
+  return json.loads(result.stdout)
+
+
+def normalize_address(address):
+  if not re.fullmatch(r"0x[0-9a-fA-F]+", address):
+    raise ValueError("address must look like 0x1234")
+  return address.lower()
+
+
+def window_at(address):
+  address = normalize_address(address)
+  for window in clients():
+    if window.get("address", "").lower() == address:
+      return window
+  raise ValueError(f"no desktop window {address}")
+
+
+def matches(patterns, value):
+  for pattern in patterns:
+    try:
+      if re.search(pattern, value):
+        return True
+    except re.error as error:
+      raise ValueError(f"invalid drive class pattern {pattern!r}: {error}") from error
+  return False
+
+
+def has_tag(window, tag):
+  return any(value.rstrip("*") == tag for value in window.get("tags", []))
+
+
+def dispatch(expression):
+  result = run("hyprctl", "dispatch", expression, check=False)
+  if result.returncode or result.stdout.strip() != "ok":
+    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Hyprland rejected the action")
+
+
+def quote(value):
+  return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def set_tag(address, tag, enabled):
+  operation = "+" if enabled else "-"
+  dispatch(f"hl.dsp.window.tag({{ window = {quote('address:' + address)}, tag = {quote(operation + tag)} }})")
+
+
+def ask(window):
+  title = window.get("title") or "untitled"
+  app_class = window.get("class") or "unknown"
+  prompt = f"Let the agent drive {app_class}: {title}?"
+  result = run("omarchy-menu-select", prompt, "Allow once", "Allow until the window closes", "Deny", check=False)
+  return result.stdout.strip() if result.returncode == 0 else "Deny"
+
+
+def authorize(window):
+  settings = policy()
+  app_class = window.get("class", "")
+  workspace = window.get("workspace", {}).get("id")
+  tag = settings["tag"]
+  if matches(settings["never_allow_classes"], app_class):
+    raise PermissionError(f"drive policy never allows class {app_class!r}")
+  if has_tag(window, tag):
+    return tag, False
+  automatic = workspace in settings["agent_workspaces"] or workspace in settings["extra_workspaces"] or matches(settings["always_allow_classes"], app_class)
+  choice = "Allow until the window closes" if automatic else ask(window)
+  if choice == "Deny":
+    raise PermissionError("the user did not allow this window")
+  if choice not in {"Allow once", "Allow until the window closes"}:
+    raise PermissionError("the window was not allowed")
+  set_tag(window["address"], tag, True)
+  return tag, choice == "Allow once"
+
+
+def shortcut(address, modifiers, key):
+  expression = f"hl.dsp.send_shortcut({{ mods = {quote(' + '.join(modifiers))}, key = {quote(key)}, window = {quote('address:' + address)} }})"
+  dispatch(expression)
+
+
+def type_text(address, text):
+  for character in text:
+    if "a" <= character <= "z" or "0" <= character <= "9":
+      shortcut(address, [], character)
+    elif "A" <= character <= "Z":
+      shortcut(address, ["SHIFT"], character.lower())
+    elif character in PLAIN:
+      shortcut(address, [], PLAIN[character])
+    elif character in SHIFTED:
+      shortcut(address, ["SHIFT"], SHIFTED[character])
+    else:
+      raise ValueError(f"cannot type character U+{ord(character):04X}")
+
+
+def key_combo(address, combo):
+  parts = combo.lower().split("+")
+  if not parts or not parts[-1]:
+    raise ValueError("key combo is empty")
+  modifiers = [MODIFIERS[part] for part in parts[:-1] if part in MODIFIERS]
+  if len(modifiers) != len(parts) - 1:
+    raise ValueError(f"invalid key combo {combo!r}")
+  key = KEYS.get(parts[-1], parts[-1].upper())
+  shortcut(address, modifiers, key)
+
+
+def capture_window(window, output):
+  output = os.path.abspath(output or os.path.join(RUNTIME_DIR, f"agent-desktop-{window['stableId']}.png"))
+  os.makedirs(os.path.dirname(output), exist_ok=True)
+  helper = os.path.join(os.environ["OMARCHY_PATH"], "bin", "omarchy-agent-seat-broker")
+  result = run(helper, "capture-identifier", window["stableId"], output, check=False)
+  data = json.loads(result.stdout or "{}")
+  if result.returncode:
+    raise RuntimeError(data.get("error", result.stderr.strip() or "window capture failed"))
+  print(json.dumps({"path": output, **data}))
+
+
+def list_windows():
+  settings = policy()
+  rows = []
+  for window in clients():
+    app_class = window.get("class", "")
+    workspace = window.get("workspace", {}).get("id")
+    if matches(settings["never_allow_classes"], app_class):
+      access = "never"
+    elif has_tag(window, settings["tag"]):
+      access = "allowed"
+    elif workspace in settings["agent_workspaces"] or workspace in settings["extra_workspaces"] or matches(settings["always_allow_classes"], app_class):
+      access = "automatic"
+    else:
+      access = "ask"
+    rows.append({key: window.get(key) for key in ("address", "stableId", "class", "title")} | {"workspace": workspace, "access": access})
+  print(json.dumps(rows, indent=2))
+
+
+def parser():
+  result = argparse.ArgumentParser(description="Drive desktop windows without moving the user's focus or pointer")
+  commands = result.add_subparsers(dest="command", required=True)
+  commands.add_parser("list")
+  screenshot = commands.add_parser("screenshot")
+  screenshot.add_argument("address")
+  screenshot.add_argument("output", nargs="?")
+  typing = commands.add_parser("type")
+  typing.add_argument("address")
+  typing.add_argument("text")
+  key = commands.add_parser("key")
+  key.add_argument("address")
+  key.add_argument("combo")
+  close = commands.add_parser("close")
+  close.add_argument("address")
+  return result
+
+
+def main():
+  args = parser().parse_args()
+  if args.command == "list":
+    list_windows()
+    return
+  window = window_at(args.address)
+  tag, remove_after = authorize(window)
+  try:
+    if args.command == "screenshot":
+      capture_window(window, args.output)
+    elif args.command == "type":
+      type_text(window["address"], args.text)
+    elif args.command == "key":
+      key_combo(window["address"], args.combo)
+    elif args.command == "close":
+      dispatch(f"hl.dsp.window.close({{ window = {quote('address:' + window['address'])} }})")
+  finally:
+    if remove_after and args.command != "close":
+      try:
+        set_tag(window["address"], tag, False)
+      except RuntimeError:
+        pass
+
+
+if __name__ == "__main__":
+  try:
+    main()
+  except (OSError, ValueError, RuntimeError, PermissionError, json.JSONDecodeError) as error:
+    print(f"omarchy-agent-desktop: {error}", file=sys.stderr)
+    sys.exit(1)

@@ -24,6 +24,17 @@
 -- they open:
 --
 --   require("default.hypr.agent-workspaces").set({ route_spawned = false })
+--
+-- Agents may drive desktop windows freely on their own workspaces and ask
+-- before driving one anywhere else. Extend or narrow that policy here:
+--
+--   require("default.hypr.agent-workspaces").set({
+--     drive = {
+--       extra_workspaces = { 7 },
+--       always_allow_classes = { "^org\\.example\\.Editor$" },
+--       never_allow_classes = { "^1[Pp]assword$", "^Bitwarden$" },
+--     },
+--   })
 
 local M = {}
 
@@ -33,6 +44,11 @@ M.settings = {
   per_monitor = 0,
   monitors = {},
   route_spawned = true,
+  drive = {
+    extra_workspaces = {},
+    always_allow_classes = {},
+    never_allow_classes = { "^1[Pp]assword$", "^Bitwarden$" },
+  },
 }
 
 -- An agent's children inherit its environment, and Omarchy's launchers pass the
@@ -52,6 +68,54 @@ local AGENTS = {
 -- Rules are named so rewriting one replaces it rather than stacking another,
 -- which is how the workspace follows the monitor you're on.
 local placements = {}
+
+local function json_escape(value)
+  return '"' .. tostring(value):gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
+end
+
+local function json_array(values, encode)
+  local items = {}
+  for _, value in ipairs(values or {}) do
+    table.insert(items, encode(value))
+  end
+  return "[" .. table.concat(items, ",") .. "]"
+end
+
+local function agent_workspaces()
+  local values = {}
+  local count = M.settings.per_monitor == 0 and 1 or math.max(#(hl.get_monitors() or {}), 1)
+  for index = 0, count - 1 do
+    for _, kind in ipairs({ "room", "seat" }) do
+      table.insert(values, M.settings[kind] + index * M.settings.per_monitor)
+    end
+  end
+  return values
+end
+
+local function write_drive_policy()
+  local runtime = os.getenv("XDG_RUNTIME_DIR")
+  if not runtime then
+    return
+  end
+  local directory = runtime .. "/omarchy"
+  os.execute("mkdir -p " .. string.format("%q", directory))
+  local path = directory .. "/agent-drive.json"
+  local temporary = path .. ".tmp"
+  local file = io.open(temporary, "wb")
+  if not file then
+    return
+  end
+  local drive = M.settings.drive or {}
+  file:write("{\n")
+  file:write('  "agent_workspaces": ', json_array(agent_workspaces(), tostring), ",\n")
+  file:write('  "extra_workspaces": ', json_array(drive.extra_workspaces, tostring), ",\n")
+  file:write('  "always_allow_classes": ', json_array(drive.always_allow_classes, json_escape), ",\n")
+  file:write('  "never_allow_classes": ', json_array(drive.never_allow_classes, json_escape), ",\n")
+  file:write('  "tag": "agent-drive"\n')
+  file:write("}\n")
+  file:close()
+  os.rename(temporary, path)
+end
 
 local function monitor_index(active)
   if M.settings.per_monitor == 0 or not active then
@@ -103,6 +167,7 @@ local function apply()
       workspace = placement.silent and workspace .. " silent" or workspace,
     })
   end
+  write_drive_policy()
 end
 
 local function read(path)
@@ -165,18 +230,21 @@ end
 
 function M.set(settings)
   for key, value in pairs(settings) do
-    M.settings[key] = value
+    if key == "drive" then
+      for drive_key, drive_value in pairs(value) do
+        M.settings.drive[drive_key] = drive_value
+      end
+    else
+      M.settings[key] = value
+    end
   end
   apply()
 end
 
 local function is_agent_workspace(id)
-  local count = M.settings.per_monitor == 0 and 1 or math.max(#(hl.get_monitors() or {}), 1)
-  for index = 0, count - 1 do
-    for _, kind in ipairs({ "room", "seat" }) do
-      if id == M.settings[kind] + index * M.settings.per_monitor then
-        return true
-      end
+  for _, workspace in ipairs(agent_workspaces()) do
+    if id == workspace then
+      return true
     end
   end
   return false
