@@ -271,9 +271,16 @@ class Channel:
 
 
 class Keymap:
-  """A compiled XKB keymap plus the reverse lookup from characters to keys."""
+  """A compiled XKB keymap plus the reverse lookup from characters to keys.
 
-  def __init__(self, text=None):
+  Keys are (evdev keycode, modifier mask) in this keymap's modifier indices,
+  taken from the layout group in use, so AltGr and other layouts type right.
+  """
+
+  # Hyprland's modifier names for the real modifiers a level can need.
+  HYPRLAND_MODIFIERS = {"Shift": "SHIFT", "Control": "CTRL", "Mod1": "ALT", "Mod3": "MOD3", "Mod4": "SUPER", "Mod5": "MOD5"}
+
+  def __init__(self, text=None, names=None, layout=0):
     xkb = ctypes.CDLL(ctypes.util.find_library("xkbcommon"))
 
     class RuleNames(ctypes.Structure):
@@ -284,35 +291,66 @@ class Keymap:
     xkb.xkb_keymap_new_from_names.argtypes = [ctypes.c_void_p, ctypes.POINTER(RuleNames), ctypes.c_int]
     xkb.xkb_keymap_new_from_string.restype = ctypes.c_void_p
     xkb.xkb_keymap_new_from_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
-    xkb.xkb_keymap_min_keycode.argtypes = xkb.xkb_keymap_max_keycode.argtypes = [ctypes.c_void_p]
+    xkb.xkb_keymap_min_keycode.argtypes = xkb.xkb_keymap_max_keycode.argtypes = xkb.xkb_keymap_num_mods.argtypes = [ctypes.c_void_p]
+    xkb.xkb_keymap_num_layouts.argtypes = [ctypes.c_void_p]
     xkb.xkb_keymap_num_levels_for_key.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
     xkb.xkb_keymap_key_get_syms_by_level.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.POINTER(ctypes.c_uint32))]
+    xkb.xkb_keymap_key_get_mods_for_level.restype = ctypes.c_size_t
+    xkb.xkb_keymap_key_get_mods_for_level.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint32), ctypes.c_size_t]
     xkb.xkb_keymap_mod_get_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    xkb.xkb_keymap_mod_get_name.restype = ctypes.c_char_p
+    xkb.xkb_keymap_mod_get_name.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     xkb.xkb_keysym_from_name.argtypes = [ctypes.c_char_p, ctypes.c_int]
     xkb.xkb_utf32_to_keysym.argtypes = [ctypes.c_uint32]
     self.xkb = xkb
 
     # The keymap Hyprland gives the user's keyboard, so the agent's keys mean
-    # the same thing to apps; US until Hyprland has sent one.
+    # the same thing to apps; or one built from its layout names; US otherwise.
     context = xkb.xkb_context_new(0)
     keymap = xkb.xkb_keymap_new_from_string(context, text.rstrip(b"\0"), 1, 0) if text else None
+    if not keymap and names:
+      keymap = xkb.xkb_keymap_new_from_names(context, ctypes.byref(RuleNames(*(value.encode() if value else None for value in names))), 0)
     keymap = keymap or xkb.xkb_keymap_new_from_names(context, ctypes.byref(RuleNames(b"evdev", b"pc105", b"us", b"", b"")), 0)
     self.text = text
+    layout = layout if layout < xkb.xkb_keymap_num_layouts(keymap) else 0
 
-    self.modifiers = {name: 1 << xkb.xkb_keymap_mod_get_index(keymap, xkb_name) for name, xkb_name in (("shift", b"Shift"), ("ctrl", b"Control"), ("alt", b"Mod1"), ("super", b"Mod4"))}
-    self.keys = {}
+    self.mod_names = [xkb.xkb_keymap_mod_get_name(keymap, index).decode() for index in range(xkb.xkb_keymap_num_mods(keymap))]
+    self.modifiers = {name: 1 << xkb.xkb_keymap_mod_get_index(keymap, xkb_name) for name, xkb_name in (("shift", b"Shift"), ("ctrl", b"Control"), ("alt", b"Mod1"), ("super", b"Mod4"), ("altgr", b"Mod5"))}
+    # Levels reached through Caps Lock or Num Lock are skipped: their result
+    # depends on lock state the agent does not control.
+    locked = sum(1 << index for index, name in enumerate(self.mod_names) if name in ("Lock", "Mod2"))
+    self.keys, ranks = {}, {}
     syms = ctypes.POINTER(ctypes.c_uint32)()
+    masks = (ctypes.c_uint32 * 8)()
     for keycode in range(xkb.xkb_keymap_min_keycode(keymap), xkb.xkb_keymap_max_keycode(keymap) + 1):
-      for level in range(min(2, xkb.xkb_keymap_num_levels_for_key(keymap, keycode, 0))):
-        for index in range(xkb.xkb_keymap_key_get_syms_by_level(keymap, keycode, 0, level, ctypes.byref(syms))):
-          self.keys.setdefault(syms[index], (keycode - 8, level))
+      for level in range(xkb.xkb_keymap_num_levels_for_key(keymap, keycode, layout)):
+        usable = [mask for mask in masks[: xkb.xkb_keymap_key_get_mods_for_level(keymap, keycode, layout, level, masks, 8)] if not mask & locked]
+        if not usable:
+          continue
+        mask = min(usable, key=lambda mask: bin(mask).count("1"))
+        rank = (bin(mask).count("1"), level)
+        for index in range(xkb.xkb_keymap_key_get_syms_by_level(keymap, keycode, layout, level, ctypes.byref(syms))):
+          # Prefer the fewest modifiers, then the lowest level (Shift before
+          # AltGr), then the lowest keycode.
+          if syms[index] not in ranks or rank < ranks[syms[index]]:
+            ranks[syms[index]] = rank
+            self.keys[syms[index]] = (keycode - 8, mask)
 
   def for_char(self, char):
+    if char == "\n":
+      return self.for_name("Return")
     return self.keys.get(self.xkb.xkb_utf32_to_keysym(ord(char)))
 
   def for_name(self, name):
-    aliases = {"enter": "Return", "esc": "Escape", "pgup": "Prior", "pgdown": "Next", "del": "Delete", "bksp": "BackSpace", "backspace": "BackSpace", "space": "space", "tab": "Tab"}
+    aliases = {"enter": "Return", "esc": "Escape", "pgup": "Prior", "pgdown": "Next", "pageup": "Prior", "pagedown": "Next", "del": "Delete", "bksp": "BackSpace", "backspace": "BackSpace", "space": "space", "tab": "Tab"}
     return self.keys.get(self.xkb.xkb_keysym_from_name(aliases.get(name.lower(), name).encode(), 1))
+
+  def hyprland_modifiers(self, mask):
+    """Hyprland's names for a mask, or None if it needs one Hyprland lacks."""
+    names = [self.mod_names[index] for index in range(len(self.mod_names)) if mask >> index & 1]
+    if any(name not in self.HYPRLAND_MODIFIERS for name in names):
+      return None
+    return [self.HYPRLAND_MODIFIERS[name] for name in names]
 
 
 class Pool:
@@ -1279,8 +1317,8 @@ class Broker:
     if missing:
       raise ValueError(f"cannot type {''.join(sorted(set(missing)))!r} with the agent keymap")
     for char in text:
-      key, level = self.keymap.for_char(char)
-      self.tap(client, key, self.keymap.modifiers["shift"] if level else 0)
+      key, mask = self.keymap.for_char(char)
+      self.tap(client, key, mask)
 
   def do_key(self, window, combo):
     client = self.do_focus(window)
@@ -1291,7 +1329,7 @@ class Broker:
     target = self.keymap.for_name(name)
     if not target:
       raise ValueError(f"unknown key {name}")
-    mask = sum(self.keymap.modifiers[m.lower()] for m in modifiers) | (self.keymap.modifiers["shift"] if target[1] else 0)
+    mask = sum(self.keymap.modifiers[m.lower()] for m in modifiers) | target[1]
     self.tap(client, target[0], mask)
 
 

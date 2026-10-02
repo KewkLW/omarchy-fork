@@ -5,6 +5,8 @@
 # omarchy:examples=omarchy agent desktop list | omarchy agent desktop screenshot 0x1234 | omarchy agent desktop type 0x1234 "hello" | omarchy agent desktop key 0x1234 ctrl+l
 
 import argparse
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -22,21 +24,9 @@ DEFAULT_POLICY = {
   "tag": "agent-drive",
 }
 
-SHIFTED = {
-  "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
-  "_": "MINUS", "+": "EQUAL", "{": "LEFTBRACE", "}": "RIGHTBRACE", "|": "BACKSLASH", ":": "SEMICOLON",
-  '"': "APOSTROPHE", "<": "COMMA", ">": "DOT", "?": "SLASH", "~": "GRAVE",
-}
-PLAIN = {
-  " ": "SPACE", "\n": "RETURN", "\t": "TAB", "-": "MINUS", "=": "EQUAL", "[": "LEFTBRACE", "]": "RIGHTBRACE",
-  "\\": "BACKSLASH", ";": "SEMICOLON", "'": "APOSTROPHE", ",": "COMMA", ".": "DOT", "/": "SLASH", "`": "GRAVE",
-}
-MODIFIERS = {"ctrl": "CTRL", "control": "CTRL", "shift": "SHIFT", "alt": "ALT", "super": "SUPER", "meta": "SUPER"}
-KEYS = {
-  "enter": "RETURN", "return": "RETURN", "space": "SPACE", "tab": "TAB", "esc": "ESCAPE", "escape": "ESCAPE",
-  "backspace": "BACKSPACE", "delete": "DELETE", "left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN",
-  "home": "HOME", "end": "END", "pageup": "PAGEUP", "pagedown": "PAGEDOWN",
-}
+# What callers may write before "+" in a key combo, as Keymap modifier names.
+MODIFIERS = {"ctrl": "ctrl", "control": "ctrl", "shift": "shift", "alt": "alt", "super": "super", "meta": "super", "altgr": "altgr"}
+BATCH_SIZE = 200  # keys per hyprctl call, to keep each command line modest
 
 
 def run(*args, check=True, capture=True):
@@ -126,34 +116,63 @@ def authorize(window):
   return tag, choice == "Allow once"
 
 
-def shortcut(address, modifiers, key):
-  expression = f"hl.dsp.send_shortcut({{ mods = {quote(' + '.join(modifiers))}, key = {quote(key)}, window = {quote('address:' + address)} }})"
-  dispatch(expression)
+def keymap():
+  """The user's keymap and layout, so characters land as they would from their keyboard."""
+  keyboards = json.loads(run("hyprctl", "devices", "-j").stdout).get("keyboards", [])
+  keyboard = next((keyboard for keyboard in keyboards if keyboard.get("main")), keyboards[0] if keyboards else {})
+  broker = os.path.join(os.environ["OMARCHY_PATH"], "bin", "omarchy-agent-seat-broker")
+  loader = importlib.machinery.SourceFileLoader("omarchy_agent_seat_broker", broker)
+  module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+  loader.exec_module(module)
+  names = (keyboard.get("rules") or "evdev", keyboard.get("model") or "pc105", keyboard.get("layout") or "us", keyboard.get("variant") or "", keyboard.get("options") or "")
+  return module.Keymap(names=names, layout=keyboard.get("active_layout_index") or 0)
+
+
+def shortcut(address, modifiers, keycode):
+  # Hyprland's code: keys are XKB keycodes, which are evdev keycodes plus 8.
+  return f"hl.dsp.send_shortcut({{ mods = {quote(' + '.join(modifiers))}, key = {quote(f'code:{keycode + 8}')}, window = {quote('address:' + address)} }})"
+
+
+def send(expressions):
+  """Send in batches. Hyprland answers ok even for keys it cannot deliver, so callers resolve every key first."""
+  for start in range(0, len(expressions), BATCH_SIZE):
+    result = run("hyprctl", "--batch", " ; ".join(f"dispatch {expression}" for expression in expressions[start : start + BATCH_SIZE]), check=False)
+    replies = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if result.returncode or any(reply != "ok" for reply in replies):
+      raise RuntimeError(next((reply for reply in replies if reply != "ok"), result.stderr.strip() or "Hyprland rejected the keys"))
+
+
+def resolve(layout, key):
+  keycode, mask = key
+  modifiers = layout.hyprland_modifiers(mask)
+  if modifiers is None:
+    raise ValueError("the keyboard layout needs a modifier Hyprland cannot send for that key")
+  return keycode, modifiers
 
 
 def type_text(address, text):
-  for character in text:
-    if "a" <= character <= "z" or "0" <= character <= "9":
-      shortcut(address, [], character)
-    elif "A" <= character <= "Z":
-      shortcut(address, ["SHIFT"], character.lower())
-    elif character in PLAIN:
-      shortcut(address, [], PLAIN[character])
-    elif character in SHIFTED:
-      shortcut(address, ["SHIFT"], SHIFTED[character])
-    else:
-      raise ValueError(f"cannot type character U+{ord(character):04X}")
+  layout = keymap()
+  missing = sorted({character for character in text if not layout.for_char(character)})
+  if missing:
+    raise ValueError("the keyboard layout cannot type " + ", ".join(f"{character!r} (U+{ord(character):04X})" for character in missing) + "; nothing was sent")
+  keys = [resolve(layout, layout.for_char(character)) for character in text]
+  send([shortcut(address, modifiers, keycode) for keycode, modifiers in keys])
 
 
 def key_combo(address, combo):
-  parts = combo.lower().split("+")
-  if not parts or not parts[-1]:
+  *words, name = combo.split("+")
+  if not name:
     raise ValueError("key combo is empty")
-  modifiers = [MODIFIERS[part] for part in parts[:-1] if part in MODIFIERS]
-  if len(modifiers) != len(parts) - 1:
-    raise ValueError(f"invalid key combo {combo!r}")
-  key = KEYS.get(parts[-1], parts[-1].upper())
-  shortcut(address, modifiers, key)
+  unknown = [word for word in words if word.lower() not in MODIFIERS]
+  if unknown:
+    raise ValueError(f"unknown modifier {unknown[0]!r} in {combo!r}")
+  layout = keymap()
+  target = layout.for_name(name) or (layout.for_char(name) if len(name) == 1 else None)
+  if not target:
+    raise ValueError(f"unknown key {name!r} in {combo!r}")
+  mask = sum(layout.modifiers[MODIFIERS[word.lower()]] for word in words) | target[1]
+  keycode, modifiers = resolve(layout, (target[0], mask))
+  send([shortcut(address, modifiers, keycode)])
 
 
 def capture_window(window, output):
