@@ -33,6 +33,7 @@ import array
 import collections
 import ctypes
 import ctypes.util
+import errno
 import glob
 import json
 import mmap
@@ -45,6 +46,7 @@ import struct
 import subprocess
 import sys
 import time
+import weakref
 import xml.etree.ElementTree as ET
 import zlib
 
@@ -52,6 +54,9 @@ RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.get
 WAYLAND_SOCKET = os.path.join(RUNTIME_DIR, "wayland-0")
 CONTROL_SOCKET = os.path.join(RUNTIME_DIR, "control")
 MAX_FDS_PER_MESSAGE = 28
+MAX_QUEUED_FDS = 4 * MAX_FDS_PER_MESSAGE  # received but not yet claimed by a message
+MAX_POOLS_PER_CLIENT = 256  # shared memory pools the broker keeps a descriptor of
+LISTENER_PAUSE_SECONDS = 1  # how long to stop accepting when out of descriptors
 DEBUG = bool(os.environ.get("OMARCHY_AGENT_SEAT_DEBUG"))  # libwayland's receive limit
 
 # Everything an app needs to draw windows. Anything not listed is hidden,
@@ -198,6 +203,13 @@ def encode_bytes(data):
   return struct.pack("<I", len(data)) + data + b"\0" * (-len(data) % 4)
 
 
+def close_fds(signature, args):
+  """Close the descriptors a decoded message carried, when it goes no further."""
+  for (kind, _), value in zip(signature, args):
+    if kind == "fd":
+      os.close(value)
+
+
 class Channel:
   """One Wayland socket with its own read buffer, fd queue and write queue."""
 
@@ -209,12 +221,17 @@ class Channel:
     self.out = []  # [message bytes, fds] waiting to be sent
 
   def receive(self):
-    data, ancillary, _, _ = self.sock.recvmsg(65536, socket.CMSG_SPACE(4 * 255))
+    data, ancillary, flags, _ = self.sock.recvmsg(65536, socket.CMSG_SPACE(4 * MAX_FDS_PER_MESSAGE))
     for level, kind, payload in ancillary:
       if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
         fds = array.array("i")
         fds.frombytes(payload[: len(payload) - len(payload) % 4])
         self.infds.extend(fds)
+    # More descriptors at once than libwayland ever sends (the kernel closed
+    # the rest), or more piling up than messages claim: a peer trying to fill
+    # the broker's descriptor table.
+    if flags & socket.MSG_CTRUNC or len(self.infds) > MAX_QUEUED_FDS:
+      raise ValueError("too many file descriptors")
     self.inbuf += data
     return bool(data)
 
@@ -360,8 +377,12 @@ class Pool:
   def __init__(self, fd, size):
     self.fd, self.size = fd, size
 
-  def __del__(self):
-    os.close(self.fd)
+  def close(self):
+    if self.fd >= 0:
+      os.close(self.fd)
+      self.fd = -1
+
+  __del__ = close
 
 
 def write_png(path, canvas, width, height):
@@ -388,7 +409,11 @@ class Client:
     self.allowed = {**ALLOWED_GLOBALS, **GPU_GLOBALS} if grant else ALLOWED_GLOBALS
     self.down = Channel(sock)
     upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    upstream.connect(upstream_path)
+    try:
+      upstream.connect(upstream_path)
+    except OSError:
+      upstream.close()
+      raise
     self.up = Channel(upstream)
     self.objects = {1: ("wl_display", 1)}
     self.advertised = {}
@@ -396,6 +421,7 @@ class Client:
     self.placeholders = set()  # objects that only exist between the app and the broker
     self.pointers, self.keyboards = {}, {}  # object -> the surface this app believes it is focused on
     self.surfaces, self.regions, self.buffers, self.pools = {}, {}, {}, {}
+    self.pool_fds = weakref.WeakSet()  # every Pool still holding a descriptor, destroyed or not
     self.roles = {}  # role object (subsurface, viewport, xdg_surface, toplevel, popup) -> surface id or xdg surface id
     self.xdg_surfaces = {}  # xdg_surface -> {"surface", "geometry", "popups"}
     self.toplevels = {}  # xdg_toplevel -> {"xdg", "window", "title", "app_id"}
@@ -459,9 +485,13 @@ class Client:
       if cap and requested_version > cap:
         args[1] = (bound, cap, new_id)
 
-    self.track_new_objects(signature, args, version)
-    handler = getattr(self, f"request_{interface}_{name}", None)
-    result = handler(object_id, args) if handler else True
+    try:
+      self.track_new_objects(signature, args, version)
+      handler = getattr(self, f"request_{interface}_{name}", None)
+      result = handler(object_id, args) if handler else True
+    except Exception:
+      close_fds(signature, args)
+      raise
 
     if object_id in self.placeholders:
       result = False
@@ -473,9 +503,7 @@ class Client:
     if result is True:
       self.up.queue(*encode(object_id, opcode, signature, args))
     else:
-      for kind, value in zip((kind for kind, _ in signature), args):
-        if kind == "fd":
-          os.close(value)
+      close_fds(signature, args)
 
   # The clipboard is the user's. An app reads it only while the user's keyboard
   # is in it and the user acted last, so the agent can't paste it out, and it
@@ -584,7 +612,10 @@ class Client:
     return True
 
   def request_wl_shm_create_pool(self, _, args):
+    if len(self.pool_fds) >= MAX_POOLS_PER_CLIENT:
+      raise ValueError("too many shared memory pools")
     self.pools[args[0]] = Pool(os.dup(args[1]), args[2])
+    self.pool_fds.add(self.pools[args[0]])
     return True
 
   def request_wl_shm_pool_resize(self, pool, args):
@@ -643,9 +674,13 @@ class Client:
     args = decode(signature, raw[8:], self.up.infds)
     if DEBUG:
       log(f"<- {interface}@{object_id}.{name}{args}")
-    self.track_new_objects(signature, args, version)
-    handler = getattr(self, f"event_{interface}_{name}", None)
-    result = handler(object_id, args) if handler else True
+    try:
+      self.track_new_objects(signature, args, version)
+      handler = getattr(self, f"event_{interface}_{name}", None)
+      result = handler(object_id, args) if handler else True
+    except Exception:
+      close_fds(signature, args)
+      raise
 
     if interface == "wl_pointer" and name not in ("enter", "leave", "motion") and self.user_pointer:
       self.focus_pointer(object_id, *self.user_pointer)  # the agent may have moved this app's focus
@@ -653,9 +688,7 @@ class Client:
     if result is True:
       self.down.queue(*encode(object_id, opcode, signature, args))
     else:
-      for kind, value in zip((kind for kind, _ in signature), args):
-        if kind == "fd":
-          os.close(value)
+      close_fds(signature, args)
 
   def event_wl_display_delete_id(self, _, args):
     self.forget(args[0])
@@ -877,6 +910,8 @@ class Client:
   def close(self):
     self.down.close()
     self.up.close()
+    for pool in list(self.pool_fds):
+      pool.close()  # now, not whenever the last buffer using it is collected
 
 
 # The broker ---------------------------------------------------------------------
@@ -913,6 +948,7 @@ class Broker:
     self.serial = 0x40000000  # kept apart from Hyprland's serials
     self.user_serials = collections.deque(maxlen=256)  # recent serials from the user's seat
     self.stopping = False
+    self.paused = []  # (when to resume, listener, selector data) of listeners out of descriptors
     self.captures = {}  # window -> (left, top, scale) of its last screenshot
     self.grants = []
     self.gpu_session = False  # the user allowed the GPU for the rest of this session
@@ -936,7 +972,7 @@ class Broker:
     log(f"serving {WAYLAND_SOCKET} for {self.upstream}")
 
     while True:
-      for key, events in self.selector.select(timeout=5):
+      for key, events in self.selector.select(timeout=LISTENER_PAUSE_SECONDS if self.paused else 5):
         kind, owner = key.data
         if isinstance(owner, Client) and owner not in self.clients or isinstance(owner, Job) and owner not in self.jobs:
           continue  # dropped or finished earlier in this round
@@ -959,11 +995,39 @@ class Broker:
             self.drop(owner)
           else:
             log(f"error: {error}")
+      self.resume_listeners()
       self.expire_grants()
 
+  def accept(self, listener):
+    """A new connection, or None while the broker is out of file descriptors."""
+    try:
+      return listener.accept()[0]
+    except OSError as error:
+      if error.errno not in (errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM):
+        raise
+      # The connection stays queued, so the listener would wake the loop
+      # again at once: stop watching it for a moment instead of spinning.
+      log(f"out of file descriptors, not accepting for {LISTENER_PAUSE_SECONDS}s")
+      data = self.selector.unregister(listener).data
+      self.paused.append((time.monotonic() + LISTENER_PAUSE_SECONDS, listener, data))
+      return None
+
+  def resume_listeners(self):
+    now = time.monotonic()
+    for paused in [paused for paused in self.paused if paused[0] <= now]:
+      self.paused.remove(paused)
+      if paused[1].fileno() >= 0:
+        self.selector.register(paused[1], selectors.EVENT_READ, paused[2])
+
   def accept_client(self, listener, grant):
-    sock, _ = listener.accept()
-    client = Client(self, sock, self.upstream, grant)
+    sock = self.accept(listener)
+    if not sock:
+      return
+    try:
+      client = Client(self, sock, self.upstream, grant)
+    except Exception:
+      sock.close()
+      raise
     if grant:
       grant.clients += 1
       grant.used = True
@@ -1007,7 +1071,9 @@ class Broker:
   # Control socket
 
   def control(self, listener):
-    conn, _ = listener.accept()
+    conn = self.accept(listener)
+    if not conn:
+      return
     uid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
     if uid != os.getuid():
       conn.close()
@@ -1136,7 +1202,11 @@ class Broker:
 
   def close_grant(self, grant):
     self.grants.remove(grant)
-    self.selector.unregister(grant.listener)
+    self.paused = [paused for paused in self.paused if paused[1] is not grant.listener]
+    try:
+      self.selector.unregister(grant.listener)
+    except KeyError:
+      pass  # paused while the broker was out of descriptors
     grant.listener.close()
     if os.path.exists(grant.path):
       os.unlink(grant.path)

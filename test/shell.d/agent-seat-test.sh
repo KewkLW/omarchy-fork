@@ -234,6 +234,27 @@ elif step == "vanish":
     finally:
         os.kill(broker, signal.SIGCONT)
 
+elif step in ("fdflood", "poolflood"):
+    # Fill the broker's descriptor table: one message with as many
+    # descriptors as the kernel allows, or more pools than an app needs.
+    try:
+        if step == "fdflood":
+            fds = [os.open("/dev/null", os.O_RDONLY) for _ in range(253)]
+            conn.sock.sendmsg([message(1, 0, struct.pack("<I", 4))], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))])
+        else:
+            bind("wl_shm", 1, 4)
+            memory = os.memfd_create("pool")
+            os.ftruncate(memory, 4096)
+            for start in range(100, 400, 28):
+                data = b"".join(message(4, 0, struct.pack("<Ii", pool, 4096)) for pool in range(start, start + 28))
+                conn.sock.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [memory] * 28))])
+        conn.send(message(1, 0, struct.pack("<I", 5)))
+        while (msg := conn.read()) is not None and msg[0] != 5:
+            pass
+        print("disconnected" if msg is None else "connected")
+    except OSError:
+        print("disconnected")
+
 elif step == "seat":
     bind("wl_seat", 7, 4)
     for object_id, opcode, body in roundtrip(5):
@@ -611,6 +632,19 @@ for _ in {1..5}; do
 done
 stop_draw
 pass "an app shrinking its pool under a screenshot leaves the broker running"
+
+descriptors() {
+  local fds=(/proc/"$broker"/fd/*)
+  echo "${#fds[@]}"
+}
+
+before=$(descriptors)
+[[ $(python3 "$test_dir/app.py" "$socket" fdflood) == "disconnected" ]] || fail "an app sending more descriptors than libwayland would is dropped"
+[[ $(python3 "$test_dir/app.py" "$socket" poolflood) == "disconnected" ]] || fail "an app making hundreds of pools is dropped"
+sleep 0.2
+(( $(descriptors) <= before )) || fail "a dropped app leaves no descriptors behind" "$before -> $(descriptors)"
+[[ $(python3 "$test_dir/app.py" "$socket" globals) == *wl_seat* ]] || fail "the broker serves apps after a descriptor flood"
+pass "apps flooding the broker with descriptors are dropped without a leak"
 
 sandbox_marker="agent-seat-test-$$"
 run_broker omarchy-agent-seat-run --no-wait /usr/bin/bash -c '/usr/bin/sleep 300 & /usr/bin/sleep 300' "$sandbox_marker" || fail "a headless sandbox starts"
