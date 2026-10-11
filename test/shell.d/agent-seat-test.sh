@@ -478,6 +478,10 @@ while True:
         command = sys.stdin.readline().strip()
         if command in ("", "quit"):
             break
+        if command == "geometry":
+            # A window geometry far larger than anything the window draws.
+            conn.send(message(XDG, 3, struct.pack("<iiii", 0, 0, 4000, 4000)))
+            conn.send(message(ROOT, 6))
         roundtrip()
         out("done")
 EOF
@@ -705,6 +709,11 @@ pass "the agent scrolls"
 
 pointer move 30 10 2>/dev/null && fail "the agent pointer can't point outside a surface's input region"
 pass "the agent pointer can't point outside a surface's input region"
+
+draw_command geometry
+shot=$(run_broker omarchy-agent-seat-screenshot "$window") || fail "a window declaring a huge geometry still gets a screenshot"
+[[ $(python3 "$test_dir/pixels.py" "$shot") == "50x35" ]] || fail "a screenshot is only as large as what the window draws" "$(python3 "$test_dir/pixels.py" "$shot")"
+pass "a screenshot is only as large as what the window draws"
 stop_draw
 
 descriptors() {
