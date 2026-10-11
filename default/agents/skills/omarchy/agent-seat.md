@@ -1,6 +1,6 @@
 # The Agent Seat
 
-Use the agent seat whenever a task needs a graphical app: clicking through a web page, filling a form, checking how a UI renders, reading what is on screen. Never drive the user's desktop with `ydotool`, `wtype`, `hyprctl dispatch` or `grim` on their session; those move the user's cursor, type into whatever the user has focused, and capture their private windows.
+Use the agent seat whenever a task needs a graphical app: clicking through a web page, filling a form, checking how a UI renders, reading what is on screen. Never drive the user's desktop with `ydotool`, `wtype`, raw `hyprctl` or `grim` on their session; those move the user's cursor, type into whatever the user has focused, and capture their private windows. When a task needs a window the user already has open outside the seat, use `omarchy agent desktop ...` as [`agent-desktop.md`](agent-desktop.md) describes, never raw `hyprctl`.
 
 Apps started on the agent seat are real windows on the seat's own workspace (10 unless the user moved it), outlined in orange. You drive them with your own pointer and keyboard, which reach nothing else, while the user keeps working. The user can also use these windows with their own mouse and keyboard at the same time. The apps are sandboxed: their own home, no access to the user's windows, screen, keyring or files. The user's clipboard reaches an app only when the user pastes into it themselves; your own paste gets nothing, and your copies never reach the user's clipboard.
 

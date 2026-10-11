@@ -4,6 +4,17 @@
 # omarchy:args=list | screenshot <address> [output] | type <address> <text> | key <address> <combo> | close <address>
 # omarchy:examples=omarchy agent desktop list | omarchy agent desktop screenshot 0x1234 | omarchy agent desktop type 0x1234 "hello" | omarchy agent desktop key 0x1234 ctrl+l
 
+# Lets an agent act on one of the user's own windows without moving the user's
+# focus or pointer: window screenshots, keys sent straight to the window, and
+# close. There is no pointer input; Hyprland can only click by moving the
+# user's cursor.
+#
+# Every command goes through the drive policy default/hypr/agent-workspaces.lua
+# writes to $XDG_RUNTIME_DIR/omarchy/agent-drive.json. That policy is a guard
+# rail for an agent that follows it, not a sandbox: the file, the agent-drive
+# tag and the window's workspace can all be changed by anything running as the
+# user, the agent included.
+
 import argparse
 import ctypes
 import ctypes.util
