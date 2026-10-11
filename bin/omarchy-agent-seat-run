@@ -126,13 +126,21 @@ windows() {
 
 mkdir -p "$runtime/sandboxes"
 
+# The new window is the one missing from the list taken before the launch, so
+# launches take turns from that list until their window appears (or the wait
+# times out); otherwise two at once could each be handed the other's window.
+# A --no-wait launch takes its turn too, but its window may still appear while
+# a later launch waits. Stop never takes this lock.
+exec 8>"$runtime/launch.lock"
+flock 8
+
 # Serialize seat startup and shutdown so stop cannot miss a sandbox whose
 # supervisor is still being registered.
 exec 9>"$runtime/sandboxes.lock"
 flock 9
 
 if ! omarchy-agent-seat-broker call '{"command":"windows"}' >/dev/null 2>&1; then
-  setsid -f omarchy-agent-seat-broker serve >>"$runtime/broker.log" 2>&1 9>&-
+  setsid -f omarchy-agent-seat-broker serve >>"$runtime/broker.log" 2>&1 8>&- 9>&-
   for _ in {1..50}; do
     [[ -S $runtime/control ]] && break
     sleep 0.1
@@ -180,7 +188,7 @@ sandbox+=("${shares[@]}")
 
 record=$(mktemp "$runtime/sandboxes/sandbox.XXXXXX")
 marker=${record##*.}
-setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 9>&- &
+setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 8>&- 9>&- &
 supervisor_pid=$!
 for _ in {1..50}; do
   read -r _ _ _ tracked_bwrap _ <"$record" || true

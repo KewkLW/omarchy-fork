@@ -145,3 +145,26 @@ run_headless --share "$test_dir/out" "$test_dir/opt/tool/tool" || fail "a lone p
 [[ $(tr '\n' ' ' <"$test_dir/out/bundle") == "app lib " ]] || fail "an app bundle gets its directory" "$(cat "$test_dir/out/bundle")"
 [[ $(tr '\n' ' ' <"$test_dir/out/plain") == "tool " ]] || fail "a directory that is no bundle stays hidden" "$(cat "$test_dir/out/plain")"
 pass "an app bundle gets its directory, other programs only their file"
+
+# A launch that waits for its window keeps other launches from diffing the
+# window list until it has one, without holding up stop.
+"${on_seat[@]}" omarchy-agent-seat-run /usr/bin/sleep 30 >/dev/null 2>&1 &
+launcher_pid=$!
+for _ in {1..50}; do
+  compgen -G "$seat/sandboxes/sandbox.*" >/dev/null && break
+  sleep 0.05
+done
+sleep 0.2
+flock -n "$seat/launch.lock" true && fail "a waiting launch holds the launch lock"
+flock -n "$seat/sandboxes.lock" true || fail "a waiting launch does not hold up stop"
+"${on_seat[@]}" omarchy-agent-seat-run --no-wait /usr/bin/true &
+second_pid=$!
+sleep 0.5
+kill -0 "$second_pid" 2>/dev/null || fail "a second launch waits for the first to find its window"
+kill "$launcher_pid"
+wait "$launcher_pid" 2>/dev/null
+launcher_pid=
+for _ in {1..50}; do kill -0 "$second_pid" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$second_pid" 2>/dev/null && fail "the second launch goes ahead once the first is done"
+wait "$second_pid" || fail "the second launch succeeds"
+pass "launches find their windows one at a time, and stop is not held up"
