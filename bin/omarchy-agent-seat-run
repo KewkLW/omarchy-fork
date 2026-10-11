@@ -16,7 +16,50 @@
 # --share and --share-ro hand the app one of the user's files or directories,
 # read-write or read-only, at the same path. The seat asks nothing of its own
 # here: sharing is part of the command, so the agent's own permission rules
-# decide it, like any file the agent touches itself.
+# decide it, like any file the agent touches itself. Shares that would undo
+# the sandbox are refused: the root, the user's home or /tmp as a whole, the
+# X11 sockets, $XDG_RUNTIME_DIR and /run/user (Hyprland, D-Bus, the keyring),
+# /proc and /dev, any directory holding one of those, and anything inside
+# ~/.config, ~/.ssh, ~/.gnupg or ~/.local/share/keyrings.
+
+home=$(realpath -m -- "$HOME")
+runtime_dir=$(realpath -m -- "$XDG_RUNTIME_DIR")
+# Refused when a path is one of these or holds one.
+broad=("$home" /tmp)
+# Refused when a path is one of these, lies inside one, or holds one.
+private=("$home/.config" "$home/.ssh" "$home/.gnupg" "$home/.local/share/keyrings" "$runtime_dir" /run/user /tmp/.X11-unix /proc /dev)
+
+# Prints what a resolved path would expose to an agent app, if anything.
+exposes() {
+  local path=$1 root
+
+  if [[ $path == "/" ]]; then
+    echo "/"
+    return 0
+  fi
+  for root in "${broad[@]}"; do
+    if [[ $root == "$path" || $root == "$path"/* ]]; then
+      echo "$root"
+      return 0
+    fi
+  done
+  for root in "${private[@]}"; do
+    if [[ $path == "$root" || $path == "$root"/* || $root == "$path"/* ]]; then
+      echo "$root"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# A directory that is plainly one app's own install: its libraries or
+# resources sit beside the executable. A bin directory never counts.
+app_bundle() {
+  local directory=$1
+
+  [[ ${directory##*/} == "bin" || ${directory##*/} == "sbin" ]] && return 1
+  [[ -d $directory/lib || -d $directory/resources || -e $directory/resources.pak || -e $directory/AppRun ]]
+}
 
 wait_for_window=true
 gpu=false
@@ -28,6 +71,10 @@ while [[ $1 == --* ]]; do
     --share | --share-ro)
       if ! path=$(realpath -e -- "${2:-}" 2>/dev/null); then
         echo "Nothing to share at ${2:-(no path given)}" >&2
+        exit 1
+      fi
+      if exposed=$(exposes "$path"); then
+        echo "Refusing to share $path with an agent app: it would expose $exposed" >&2
         exit 1
       fi
       if [[ $1 == "--share" ]]; then
@@ -48,6 +95,25 @@ done
 if (($# == 0)); then
   echo "Usage: omarchy agent seat run [--no-wait] [--gpu] [--share <path>] [--share-ro <path>] <command> [args...]" >&2
   exit 1
+fi
+
+# An app installed outside /usr gets its executable read-only. Its directory
+# comes along only when it is an app bundle (under ~/.local/opt, say) that
+# exposes nothing, so running a program from $HOME or /tmp never hands the app
+# the rest of that directory.
+program=()
+executable=$(realpath -e -- "$(type -P -- "$1")" 2>/dev/null)
+if [[ -n $executable && $executable != /usr/* ]]; then
+  bundle=$(dirname -- "$executable")
+  if exposed=$(exposes "$executable"); then
+    echo "Refusing to run $executable on the agent seat: it would expose $exposed" >&2
+    exit 1
+  elif app_bundle "$bundle" && ! exposes "$bundle" >/dev/null; then
+    program=(--ro-bind "$bundle" "$bundle")
+  else
+    program=(--ro-bind "$executable" "$executable")
+  fi
+  set -- "$executable" "${@:2}"
 fi
 
 runtime="$XDG_RUNTIME_DIR/omarchy/agent-seat"
@@ -106,15 +172,10 @@ if [[ $gpu == "true" ]]; then
   done
 fi
 
-# Apps installed outside /usr (an AppImage-style bundle under ~/.local/opt)
-# get their own directory mounted read-only.
-executable=$(realpath -e "$(type -P "$1")" 2>/dev/null)
-if [[ -n $executable && $executable != /usr/* ]]; then
-  sandbox+=(--ro-bind "$(dirname "$executable")" "$(dirname "$executable")")
-  set -- "$executable" "${@:2}"
-fi
+sandbox+=("${program[@]}")
 
-# Last, so a share's own mode wins over the mounts above.
+# Last, so a share's own mode wins over the mounts above. Nothing a share can
+# name reaches the sandbox's own runtime directory or /tmp as a whole.
 sandbox+=("${shares[@]}")
 
 record=$(mktemp "$runtime/sandboxes/sandbox.XXXXXX")
