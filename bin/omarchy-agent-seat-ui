@@ -159,6 +159,11 @@ class Space:
 
   def __init__(self, state):
     self.left, self.top, self.scale = state["origin"]
+    self.width, self.height = (value * self.scale for value in state["geometry"][2:])
+
+  def visible(self, box):
+    """Whether a box in screenshot pixels overlaps the window; pages report what is scrolled away too."""
+    return box[0] < self.width and box[1] < self.height and box[0] + box[2] > 0 and box[1] + box[3] > 0
 
   def box(self, x, y, width, height):
     return [round((x - self.left) * self.scale), round((y - self.top) * self.scale), round(width * self.scale), round(height * self.scale)]
@@ -289,8 +294,8 @@ def flatten(accessible, offset, space, nodes, depth, parent_name=None):
   x, y, width, height = accessible["extents"]
   named = (accessible["name"] and accessible["name"] != parent_name) or accessible["value"] not in (None, "")
   shown = width > 0 and height > 0 and x > -1000000 and y > -1000000
-  if shown and (named or accessible["role"] in ACTIONABLE or depth == 0):
-    box = space.box(x - offset[0], y - offset[1], width, height)
+  box = space.box(x - offset[0], y - offset[1], width, height)
+  if shown and (named or accessible["role"] in ACTIONABLE or depth == 0) and (depth == 0 or space.visible(box)):
     nodes.append(node(accessible["role"], accessible["name"], accessible["value"], accessible["states"], box, depth))
     depth += 1
   for child in accessible["children"]:
