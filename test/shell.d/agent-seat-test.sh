@@ -852,35 +852,41 @@ run_broker omarchy-agent-seat-status >/dev/null || fail "the broker answers whil
 wait "$flood_pid"
 pass "an app that never reads is held back instead of buffered"
 
-sandbox_marker="agent-seat-test-$$"
-run_broker omarchy-agent-seat-run --no-wait /usr/bin/bash -c '/usr/bin/sleep 300 & /usr/bin/sleep 300' "$sandbox_marker" || fail "a headless sandbox starts"
-records=("$test_dir/runtime/omarchy/agent-seat/sandboxes"/sandbox.*)
-(( ${#records[@]} == 1 )) || fail "a sandbox has one lifecycle record" "${records[*]}"
-for _ in {1..50}; do
-  read -r supervisor_pid _ _ bwrap_pid _ <"${records[0]}" || true
-  [[ ${bwrap_pid:-0} != 0 ]] && break
-  sleep 0.01
-done
-[[ ${supervisor_pid:-} =~ ^[0-9]+$ && ${bwrap_pid:-0} != 0 ]] || fail "a sandbox records its supervisor and bwrap processes" "$(cat "${records[0]}")"
-sandbox_pids=("$supervisor_pid" "$bwrap_pid")
-for _ in {1..50}; do
-  known=${#sandbox_pids[@]}
-  for pid in "${sandbox_pids[@]}"; do
-    while read -r child; do
-      [[ " ${sandbox_pids[*]} " == *" $child "* ]] || sandbox_pids+=("$child")
-    done < <(pgrep -P "$pid" || true)
+sandbox_pids=()
+if bwrap_works; then
+  sandbox_marker="agent-seat-test-$$"
+  run_broker omarchy-agent-seat-run --no-wait /usr/bin/bash -c '/usr/bin/sleep 300 & /usr/bin/sleep 300' "$sandbox_marker" || fail "a headless sandbox starts"
+  records=("$test_dir/runtime/omarchy/agent-seat/sandboxes"/sandbox.*)
+  (( ${#records[@]} == 1 )) || fail "a sandbox has one lifecycle record" "${records[*]}"
+  for _ in {1..50}; do
+    read -r supervisor_pid _ _ bwrap_pid _ <"${records[0]}" || true
+    [[ ${bwrap_pid:-0} != 0 ]] && break
+    sleep 0.01
   done
-  (( ${#sandbox_pids[@]} >= 5 )) && break
-  (( known == ${#sandbox_pids[@]} )) && sleep 0.01
-done
-(( ${#sandbox_pids[@]} >= 5 )) || fail "a headless sandbox starts helper processes" "${sandbox_pids[*]}"
-pass "a headless sandbox and its helpers are tracked"
+  [[ ${supervisor_pid:-} =~ ^[0-9]+$ && ${bwrap_pid:-0} != 0 ]] || fail "a sandbox records its supervisor and bwrap processes" "$(cat "${records[0]}")"
+  sandbox_pids=("$supervisor_pid" "$bwrap_pid")
+  for _ in {1..50}; do
+    known=${#sandbox_pids[@]}
+    for pid in "${sandbox_pids[@]}"; do
+      while read -r child; do
+        [[ " ${sandbox_pids[*]} " == *" $child "* ]] || sandbox_pids+=("$child")
+      done < <(pgrep -P "$pid" || true)
+    done
+    (( ${#sandbox_pids[@]} >= 5 )) && break
+    (( known == ${#sandbox_pids[@]} )) && sleep 0.01
+  done
+  (( ${#sandbox_pids[@]} >= 5 )) || fail "a headless sandbox starts helper processes" "${sandbox_pids[*]}"
+  pass "a headless sandbox and its helpers are tracked"
+else
+  skip "bubblewrap cannot create a sandbox here; skipping the sandbox lifecycle"
+fi
 
 /usr/bin/sleep 300 &
 unrelated_pid=$!
 unrelated_stat=$(<"/proc/$unrelated_pid/stat")
 unrelated_stat=${unrelated_stat##*) }
 read -ra unrelated_fields <<<"$unrelated_stat"
+mkdir -p "$test_dir/runtime/omarchy/agent-seat/sandboxes"
 printf '%s %s stale-marker 0 0\n' "$unrelated_pid" "${unrelated_fields[19]}" >"$test_dir/runtime/omarchy/agent-seat/sandboxes/sandbox.stale"
 
 run_broker omarchy-agent-seat-stop >/dev/null
@@ -890,7 +896,9 @@ compgen -G "$test_dir/runtime/omarchy/agent-seat/gpu-*" >/dev/null && fail "stop
 for pid in "${sandbox_pids[@]}"; do
   [[ ! -e /proc/$pid ]] || fail "stop ends every process in a sandbox" "${sandbox_pids[*]}"
 done
-pass "stop ends every process in a sandbox"
+if (( ${#sandbox_pids[@]} )); then
+  pass "stop ends every process in a sandbox"
+fi
 kill -0 "$unrelated_pid" 2>/dev/null || fail "a stale lifecycle record does not kill an unrelated process"
 kill "$unrelated_pid"
 wait "$unrelated_pid" 2>/dev/null || true

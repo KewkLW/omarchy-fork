@@ -23,6 +23,10 @@ fail() {
   exit 1
 }
 
+skip() {
+  printf 'ok - %s # SKIP\n' "$1"
+}
+
 require_command() {
   local command="$1"
 
@@ -74,6 +78,13 @@ require_compositor() {
 
   pass "no Wayland compositor; skipping $description"
   exit 0
+}
+
+# Whether bubblewrap can make a sandbox here. Where unprivileged user
+# namespaces are off it fails with EPERM, and a sandboxed test has nothing to
+# run.
+bwrap_works() {
+  bwrap --unshare-all --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 --proc /proc --dev /dev --tmpfs /tmp /usr/bin/true 2>/dev/null
 }
 
 run_node_test() {

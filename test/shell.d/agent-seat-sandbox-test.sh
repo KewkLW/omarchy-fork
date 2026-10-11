@@ -3,6 +3,10 @@
 source "$(dirname "$0")/base-test.sh"
 
 require_command bwrap
+if ! bwrap_works; then
+  skip "bubblewrap cannot create a sandbox here; skipping the agent seat sandbox"
+  exit 0
+fi
 require_command jq
 require_command python3
 
