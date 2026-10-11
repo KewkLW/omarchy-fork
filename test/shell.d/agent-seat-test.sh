@@ -484,6 +484,15 @@ while True:
         command = sys.stdin.readline().strip()
         if command in ("", "quit"):
             break
+        if command == "unsub":
+            # Destroy the subsurface, then reuse its surface's id for a
+            # surface that is no part of the window.
+            conn.send(message(SUBSURFACE, 0))
+            conn.send(message(CHILD, 0))
+            roundtrip()
+            conn.send(message(COMPOSITOR, 0, struct.pack("<I", CHILD)))
+            conn.send(message(CHILD, 1, struct.pack("<Iii", 12, 0, 0)))
+            conn.send(message(CHILD, 6))
         if command == "geometry":
             # A window geometry far larger than anything the window draws.
             conn.send(message(XDG, 3, struct.pack("<iiii", 0, 0, 4000, 4000)))
@@ -737,6 +746,13 @@ ln -s "$test_dir/elsewhere.png" "$test_dir/work/link.png"
 ) || exit 1
 [[ ! -e $test_dir/outside.png && ! -e /tmp/agent-seat-test-$$.png && ! -e $test_dir/elsewhere.png && ! -e $test_dir/work/sub/missing ]] || fail "refused screenshots write nothing"
 pass "a screenshot only goes under the current directory or the seat's own"
+
+draw_command unsub
+shot=$(run_broker omarchy-agent-seat-screenshot "$window")
+[[ $(python3 "$test_dir/pixels.py" "$shot" 1,1 6,6) == "50x35 ff0000 ff0000" ]] || fail "a destroyed subsurface leaves its window's screenshot" "$(python3 "$test_dir/pixels.py" "$shot" 1,1 6,6)"
+pointer move 6 6 || fail "a destroyed subsurface leaves its window's hit testing"
+[[ $(pointer_events 1) == "motion 6 6;frame" ]] || fail "a destroyed subsurface leaves its window's hit testing"
+pass "a destroyed subsurface leaves its window, even when its id comes back"
 stop_draw
 
 # A caller that never finishes its request, one that sends too much, and a

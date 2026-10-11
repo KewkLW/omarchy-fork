@@ -625,7 +625,7 @@ class Client:
     return True
 
   def request_wl_compositor_create_surface(self, _, args):
-    self.surfaces[args[0]] = {"buffer": None, "pending": None, "scale": 1, "viewport": None, "input": None, "children": [], "position": (0, 0)}
+    self.surfaces[args[0]] = {"buffer": None, "pending": None, "scale": 1, "viewport": None, "input": None, "children": [], "parent": None, "position": (0, 0)}
     return True
 
   def request_wl_compositor_create_region(self, _, args):
@@ -704,7 +704,35 @@ class Client:
   def request_wl_subcompositor_get_subsurface(self, _, args):
     self.roles[args[0]] = args[1]
     self.surfaces[args[2]]["children"].append(args[1])
+    self.surfaces[args[1]]["parent"] = args[2]
     return True
+
+  # A destroyed subsurface leaves its parent at once, before its id can come
+  # back as an unrelated surface.
+
+  def request_wl_subsurface_destroy(self, subsurface, _):
+    self.unparent(self.roles.get(subsurface))
+    return True
+
+  def request_wl_surface_destroy(self, surface, _):
+    self.unparent(surface)
+    for child in self.surfaces[surface]["children"]:
+      if child in self.surfaces:
+        self.surfaces[child]["parent"] = None
+    return True
+
+  def request_wp_viewport_destroy(self, viewport, _):
+    if self.roles.get(viewport) in self.surfaces:
+      self.surfaces[self.roles[viewport]]["viewport"] = None
+    return True
+
+  def unparent(self, surface):
+    state = self.surfaces.get(surface)
+    if not state:
+      return
+    if state["parent"] in self.surfaces and surface in self.surfaces[state["parent"]]["children"]:
+      self.surfaces[state["parent"]]["children"].remove(surface)
+    state["parent"] = None
 
   def request_wl_subsurface_set_position(self, subsurface, args):
     self.surfaces[self.roles[subsurface]]["position"] = tuple(args)
