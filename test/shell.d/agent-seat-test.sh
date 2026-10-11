@@ -2,6 +2,9 @@
 
 source "$(dirname "$0")/base-test.sh"
 
+# The seat commands find their sandbox supervisor under $OMARCHY_PATH.
+export OMARCHY_PATH="$ROOT"
+
 require_command python3
 require_command jq
 require_command xkbcli
