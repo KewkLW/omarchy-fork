@@ -123,6 +123,7 @@ Resizing uses the two keys right of 0, whatever your keyboard prints on them: `-
 | `Super + Shift + Ctrl + A` | Start your default agent |
 | `Power` key | System menu |
 | `Super + Shift + Copilot` key | Omarchy menu |
+| `Super + Ctrl + Alt + A` | Jump to the agent seat |
 
 ## Adjustments
 
