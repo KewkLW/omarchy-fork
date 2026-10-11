@@ -1343,6 +1343,9 @@ class Broker:
     self.stopping = True
 
   def do_focus(self, window):
+    self.focus(window)
+
+  def focus(self, window):
     client, toplevel = self.window(window)
     client.last_actor = "agent"
     surface = client.xdg_surfaces[client.toplevels[toplevel]["xdg"]]["surface"]
@@ -1360,7 +1363,7 @@ class Broker:
   # Pointer coordinates are pixels of the window's screenshot.
 
   def do_move(self, window, x, y):
-    return self.move(window, *self.to_logical(window, x, y))
+    self.move(window, *self.to_logical(window, x, y))
 
   def move(self, window, x, y):
     client, toplevel = self.window(window)
@@ -1377,8 +1380,8 @@ class Broker:
     return client
 
   def do_click(self, window, x, y, button="left", double=False):
-    client = self.do_move(window, x, y)
-    self.do_focus(window)
+    client = self.move(window, *self.to_logical(window, x, y))
+    self.focus(window)
     for _ in range(2 if double else 1):
       for state in (1, 0):
         for pointer in client.pointers:
@@ -1398,7 +1401,7 @@ class Broker:
     self.pointer_frame(client)
 
   def do_scroll(self, window, x, y, dy=0, dx=0):
-    client = self.do_move(window, x, y)
+    client = self.move(window, *self.to_logical(window, x, y))
     for axis, notches in ((0, dy), (1, dx)):
       if not notches:
         continue
@@ -1423,7 +1426,7 @@ class Broker:
       self.send_modifiers(client, 0)
 
   def do_type(self, window, text):
-    client = self.do_focus(window)
+    client = self.focus(window)
     missing = [char for char in text if not self.keymap.for_char(char)]
     if missing:
       raise ValueError(f"cannot type {''.join(sorted(set(missing)))!r} with the agent keymap")
@@ -1432,7 +1435,7 @@ class Broker:
       self.tap(client, key, mask)
 
   def do_key(self, window, combo):
-    client = self.do_focus(window)
+    client = self.focus(window)
     *modifiers, name = combo.split("+")
     unknown = [m for m in modifiers if m.lower() not in self.keymap.modifiers]
     if unknown:

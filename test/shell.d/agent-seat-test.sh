@@ -530,6 +530,17 @@ draw_command() {
   [[ $line == "done" ]] || fail "the drawing app runs $1" "$line"
 }
 
+# The agent pointer's events the drawing app saw, up to the given number of
+# frames, joined with semicolons.
+pointer_events() {
+  local frames=0 line events=() IFS=";"
+  while (( frames < $1 )) && read -r -t 5 line <&"$draw_out"; do
+    events+=("$line")
+    [[ $line == "frame" ]] && (( frames++ ))
+  done
+  echo "${events[*]}"
+}
+
 window_of() {
   run_broker omarchy-agent-seat-windows | jq -r --arg app "$1" '[.[] | select(.app_id == $app)][-1].window'
 }
@@ -661,6 +672,40 @@ for _ in {1..5}; do
 done
 stop_draw
 pass "an app shrinking its pool under a screenshot leaves the broker running"
+
+# The scene: a red 40x30 window (surface 20) taking input on its left half,
+# a green 10x10 subsurface (21) at 5,5 and a blue 20x10 popup (22) at 30,25.
+start_draw scene
+window=$(window_of scene)
+
+pointer() {
+  run_broker omarchy-agent-seat-pointer "$window" "$@"
+}
+
+pointer move 2 2 || fail "the agent pointer moves onto a window"
+[[ $(pointer_events 1) == "enter 20 2 2;frame" ]] || fail "the agent pointer moves onto a window" "$(pointer_events 1)"
+pointer move 10 10 || fail "the agent pointer moves onto a subsurface"
+[[ $(pointer_events 1) == "leave 20;enter 21 5 5;frame" ]] || fail "the agent pointer moves onto a subsurface"
+pass "the agent pointer moves between a window and its subsurface"
+
+pointer click 35 27 || fail "the agent clicks in a popup"
+events=$(pointer_events 3)
+[[ $events == "leave 21;enter 22 5 2;frame;button 272 1;frame;button 272 0;frame" ]] || fail "the agent clicks in a popup" "$events"
+pass "the agent clicks in a popup"
+
+pointer drag 2 2 18 2 || fail "the agent drags"
+events=$(pointer_events 15)
+[[ $events == "leave 22;enter 20 2 2;frame;button 272 1;frame;"*";motion 18 2;frame;button 272 0;frame" ]] || fail "the agent drags" "$events"
+pass "the agent drags"
+
+pointer scroll 2 2 3 || fail "the agent scrolls"
+events=$(pointer_events 2)
+[[ $events == "motion 2 2;frame;discrete 0 3;axis 0 45;frame" ]] || fail "the agent scrolls" "$events"
+pass "the agent scrolls"
+
+pointer move 30 10 2>/dev/null && fail "the agent pointer can't point outside a surface's input region"
+pass "the agent pointer can't point outside a surface's input region"
+stop_draw
 
 descriptors() {
   local fds=(/proc/"$broker"/fd/*)
