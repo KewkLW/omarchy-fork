@@ -9,6 +9,10 @@
 # D-Bus (so no keyring and no portals), no /dev/uinput, no GPU and its own
 # home, so it can neither drive nor read the user's seat.
 #
+# It does share the host's network: besides the internet it reaches every
+# service listening on the host's localhost (databases, dev servers, browser
+# debugging ports), and a port it opens is reachable from the whole machine.
+#
 # --gpu asks the user first, in their own menu, to let this launch use the GPU
 # (once, or for the rest of the session). Only then does the app get the GPU
 # devices, and a broker socket of its own that also offers GPU buffers.
@@ -16,7 +20,50 @@
 # --share and --share-ro hand the app one of the user's files or directories,
 # read-write or read-only, at the same path. The seat asks nothing of its own
 # here: sharing is part of the command, so the agent's own permission rules
-# decide it, like any file the agent touches itself.
+# decide it, like any file the agent touches itself. Shares that would undo
+# the sandbox are refused: the root, the user's home or /tmp as a whole, the
+# X11 sockets, $XDG_RUNTIME_DIR and /run/user (Hyprland, D-Bus, the keyring),
+# /proc and /dev, any directory holding one of those, and anything inside
+# ~/.config, ~/.ssh, ~/.gnupg or ~/.local/share/keyrings.
+
+home=$(realpath -m -- "$HOME")
+runtime_dir=$(realpath -m -- "$XDG_RUNTIME_DIR")
+# Refused when a path is one of these or holds one.
+broad=("$home" /tmp)
+# Refused when a path is one of these, lies inside one, or holds one.
+private=("$home/.config" "$home/.ssh" "$home/.gnupg" "$home/.local/share/keyrings" "$runtime_dir" /run/user /tmp/.X11-unix /proc /dev)
+
+# Prints what a resolved path would expose to an agent app, if anything.
+exposes() {
+  local path=$1 root
+
+  if [[ $path == "/" ]]; then
+    echo "/"
+    return 0
+  fi
+  for root in "${broad[@]}"; do
+    if [[ $root == "$path" || $root == "$path"/* ]]; then
+      echo "$root"
+      return 0
+    fi
+  done
+  for root in "${private[@]}"; do
+    if [[ $path == "$root" || $path == "$root"/* || $root == "$path"/* ]]; then
+      echo "$root"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# A directory that is plainly one app's own install: its libraries or
+# resources sit beside the executable. A bin directory never counts.
+app_bundle() {
+  local directory=$1
+
+  [[ ${directory##*/} == "bin" || ${directory##*/} == "sbin" ]] && return 1
+  [[ -d $directory/lib || -d $directory/resources || -e $directory/resources.pak || -e $directory/AppRun ]]
+}
 
 wait_for_window=true
 gpu=false
@@ -28,6 +75,10 @@ while [[ $1 == --* ]]; do
     --share | --share-ro)
       if ! path=$(realpath -e -- "${2:-}" 2>/dev/null); then
         echo "Nothing to share at ${2:-(no path given)}" >&2
+        exit 1
+      fi
+      if exposed=$(exposes "$path"); then
+        echo "Refusing to share $path with an agent app: it would expose $exposed" >&2
         exit 1
       fi
       if [[ $1 == "--share" ]]; then
@@ -50,9 +101,28 @@ if (($# == 0)); then
   exit 1
 fi
 
+# An app installed outside /usr gets its executable read-only. Its directory
+# comes along only when it is an app bundle (under ~/.local/opt, say) that
+# exposes nothing, so running a program from $HOME or /tmp never hands the app
+# the rest of that directory.
+program=()
+executable=$(realpath -e -- "$(type -P -- "$1")" 2>/dev/null)
+if [[ -n $executable && $executable != /usr/* ]]; then
+  bundle=$(dirname -- "$executable")
+  if exposed=$(exposes "$executable"); then
+    echo "Refusing to run $executable on the agent seat: it would expose $exposed" >&2
+    exit 1
+  elif app_bundle "$bundle" && ! exposes "$bundle" >/dev/null; then
+    program=(--ro-bind "$bundle" "$bundle")
+  else
+    program=(--ro-bind "$executable" "$executable")
+  fi
+  set -- "$executable" "${@:2}"
+fi
+
 runtime="$XDG_RUNTIME_DIR/omarchy/agent-seat"
 agent_home="$HOME/.local/share/omarchy/agent-seat/home"
-sandbox_supervisor=$(realpath -e "$(dirname "$0")/omarchy-agent-seat-sandbox")
+sandbox_supervisor=$(realpath -e "$OMARCHY_PATH/bin/omarchy-agent-seat-sandbox")
 
 windows() {
   omarchy-agent-seat-broker call '{"command":"windows"}' 2>/dev/null | jq -r '.windows[].window'
@@ -60,13 +130,21 @@ windows() {
 
 mkdir -p "$runtime/sandboxes"
 
+# The new window is the one missing from the list taken before the launch, so
+# launches take turns from that list until their window appears (or the wait
+# times out); otherwise two at once could each be handed the other's window.
+# A --no-wait launch takes its turn too, but its window may still appear while
+# a later launch waits. Stop never takes this lock.
+exec 8>"$runtime/launch.lock"
+flock 8
+
 # Serialize seat startup and shutdown so stop cannot miss a sandbox whose
 # supervisor is still being registered.
 exec 9>"$runtime/sandboxes.lock"
 flock 9
 
 if ! omarchy-agent-seat-broker call '{"command":"windows"}' >/dev/null 2>&1; then
-  setsid -f omarchy-agent-seat-broker serve >>"$runtime/broker.log" 2>&1 9>&-
+  setsid -f omarchy-agent-seat-broker serve >>"$runtime/broker.log" 2>&1 8>&- 9>&-
   for _ in {1..50}; do
     [[ -S $runtime/control ]] && break
     sleep 0.1
@@ -106,24 +184,19 @@ if [[ $gpu == "true" ]]; then
   done
 fi
 
-# Apps installed outside /usr (an AppImage-style bundle under ~/.local/opt)
-# get their own directory mounted read-only.
-executable=$(realpath -e "$(type -P "$1")" 2>/dev/null)
-if [[ -n $executable && $executable != /usr/* ]]; then
-  sandbox+=(--ro-bind "$(dirname "$executable")" "$(dirname "$executable")")
-  set -- "$executable" "${@:2}"
-fi
+sandbox+=("${program[@]}")
 
-# Last, so a share's own mode wins over the mounts above.
+# Last, so a share's own mode wins over the mounts above. Nothing a share can
+# name reaches the sandbox's own runtime directory or /tmp as a whole.
 sandbox+=("${shares[@]}")
 
 record=$(mktemp "$runtime/sandboxes/sandbox.XXXXXX")
 marker=${record##*.}
-setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 9>&- &
+setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 8>&- 9>&- &
 supervisor_pid=$!
 for _ in {1..50}; do
   read -r _ _ _ tracked_bwrap _ <"$record" || true
-  [[ ${tracked_bwrap:-0} != 0 ]] && break
+  (( ${tracked_bwrap:-0} != 0 )) && break
   kill -0 "$supervisor_pid" 2>/dev/null || break
   sleep 0.01
 done
