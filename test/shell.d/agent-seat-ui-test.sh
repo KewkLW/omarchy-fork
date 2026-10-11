@@ -39,6 +39,39 @@ trap cleanup EXIT
 printf '#!/bin/bash\necho "[]"\n' >"$test_dir/bin/hyprctl"
 chmod +x "$test_dir/bin/hyprctl"
 
+# Without python-gobject or the Atspi typelib, the reader says what to install
+# instead of failing with a traceback.
+mkdir -p "$test_dir/no-gi/gi"
+echo 'raise ImportError("no gi here")' >"$test_dir/no-gi/gi/__init__.py"
+missing=$(PYTHONPATH="$test_dir/no-gi" "$ROOT/bin/omarchy-agent-seat-ui" --atspi-dump "unix:path=$test_dir/no-bus" 2>&1)
+(( $? == 3 )) && [[ -z $missing ]] || fail "the AT-SPI reader reports a missing gi quietly" "$missing"
+pass "the AT-SPI reader reports a missing python-gobject without a traceback"
+
+if ! bwrap_works; then
+  skip "bubblewrap cannot create a sandbox here; skipping the agent seat UI"
+  exit 0
+fi
+
+# The sandbox's init starts the app even where its bus daemons are missing,
+# masked here by /dev/null, which is not executable. Its own PID namespace ends
+# a daemon it did start when the app exits.
+init_without() {
+  local masks=() daemon
+  for daemon in "$@"; do
+    masks+=(--ro-bind /dev/null "$daemon")
+  done
+  rm -rf "$test_dir/init-bus"
+  mkdir -p "$test_dir/init-bus"
+  bwrap --dev-bind / / --unshare-pid --die-with-parent "${masks[@]}" \
+    --setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$test_dir/init-bus/bus" \
+    "$ROOT/bin/omarchy-agent-seat-init" /usr/bin/echo started 2>&1
+}
+started=$(init_without /usr/bin/dbus-daemon /usr/lib/at-spi2-registryd)
+[[ $started == "started" && ! -e $test_dir/init-bus/bus ]] || fail "init starts the app without dbus-daemon" "$started"
+started=$(init_without /usr/lib/at-spi2-registryd)
+[[ $started == "started" && -S $test_dir/init-bus/bus ]] || fail "init starts the app on its bus without at-spi2-registryd" "$started"
+pass "init starts the app without dbus-daemon or at-spi2-registryd"
+
 seat omarchy-agent-seat-broker serve 2>"$test_dir/broker.log" &
 broker_pid=$!
 for _ in {1..50}; do [[ -S $runtime/omarchy/agent-seat/control ]] && break; sleep 0.1; done
@@ -79,7 +112,7 @@ pass "the seat reaches the private bus from outside, and it is not the user's bu
 # The accessibility tree of a GTK app, and clicking by name -----------------------------
 
 if [[ -z $compositor ]] || ! python3 -c 'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("Atspi", "2.0")' 2>/dev/null; then
-  pass "no Wayland compositor or GTK 3; skipping the GTK window"
+  skip "no Wayland compositor or GTK 3; skipping the GTK window"
 else
   program='
 import gi
@@ -145,6 +178,10 @@ Gtk.main()
   grep -q 'button "Fill later"' <<<"$candidates" || fail "an ambiguous name lists the candidates" "$candidates"
   seat omarchy-agent-seat-click-ui "$window" "Nothing here" 2>/dev/null && fail "click-ui refuses a name that matches nothing"
   pass "click-ui matches exact, then by substring, and lists ambiguous candidates"
+
+  missing=$(PYTHONPATH="$test_dir/no-gi" seat omarchy-agent-seat-ui "$window" 2>&1)
+  (( $? == 2 )) && [[ $missing == "Install python-gobject and at-spi2-core to read accessibility trees" ]] || fail "ui without python-gobject says what to install and exits 2" "$missing"
+  pass "ui without python-gobject says what to install and exits 2"
 fi
 
 # The DevTools route, against a fake DevTools endpoint ------------------------------------

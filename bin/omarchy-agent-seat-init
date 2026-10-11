@@ -14,7 +14,8 @@
 
 bus=${DBUS_SESSION_BUS_ADDRESS#unix:path=}
 
-if [[ $bus != "$DBUS_SESSION_BUS_ADDRESS" && -d ${bus%/*} ]] && command -v dbus-daemon >/dev/null; then
+# Only /usr is mounted in here, so Omarchy's command helpers are out of reach.
+if [[ $bus != "$DBUS_SESSION_BUS_ADDRESS" && -d ${bus%/*} && -x /usr/bin/dbus-daemon ]]; then
   config="${bus%/*}/bus.conf"
   cat >"$config" <<EOF
 <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
