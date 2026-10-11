@@ -119,6 +119,19 @@ sandbox+=("${shares[@]}")
 
 record=$(mktemp "$runtime/sandboxes/sandbox.XXXXXX")
 marker=${record##*.}
+
+# A private session bus, reachable only from this sandbox and the seat's own
+# commands, carries the app's accessibility tree (omarchy agent seat ui).
+session="$runtime/sandboxes/$marker.d"
+mkdir -p -m 0700 "$session" "$session/bus"
+bus="unix:path=$XDG_RUNTIME_DIR/agent-bus/bus"
+sandbox+=(
+  --bind "$session/bus" "$XDG_RUNTIME_DIR/agent-bus"
+  --ro-bind "$(realpath -e "$(dirname "$0")/omarchy-agent-seat-init")" /run/omarchy-agent-seat-init
+  --setenv DBUS_SESSION_BUS_ADDRESS "$bus" --setenv AT_SPI_BUS_ADDRESS "$bus"
+  --setenv GTK_A11Y atspi --setenv NO_AT_BRIDGE 0 --setenv QT_LINUX_ACCESSIBILITY_ALWAYS_ON 1
+)
+set -- /run/omarchy-agent-seat-init "$@"
 setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 9>&- &
 supervisor_pid=$!
 for _ in {1..50}; do

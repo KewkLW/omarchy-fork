@@ -1,0 +1,47 @@
+#!/bin/bash
+
+# omarchy:summary=Start an agent seat sandbox's private session bus, then its app
+# omarchy:hidden=true
+
+# Runs inside the sandbox, as its first process. The bus is the sandbox's own:
+# its socket sits in a directory only this sandbox and the seat's commands can
+# reach, it activates no services, and the user's session bus, keyring and
+# portals stay out of reach. Apps publish their accessibility tree on it, which
+# omarchy agent seat ui reads from outside.
+#
+# The daemons are orphaned to the sandbox's init, so the app never sees them as
+# children, and they end with the sandbox.
+
+bus=${DBUS_SESSION_BUS_ADDRESS#unix:path=}
+
+if [[ $bus != "$DBUS_SESSION_BUS_ADDRESS" && -d ${bus%/*} ]] && command -v dbus-daemon >/dev/null; then
+  config="$XDG_RUNTIME_DIR/bus.conf"
+  cat >"$config" <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path=$bus</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+EOF
+  (dbus-daemon --config-file="$config" --nofork --nopidfile --nosyslog </dev/null &)
+  for _ in {1..100}; do
+    [[ -S $bus ]] && break
+    sleep 0.01
+  done
+  if [[ -S $bus && -x /usr/lib/at-spi2-registryd ]]; then
+    (/usr/lib/at-spi2-registryd </dev/null >/dev/null 2>&1 &)
+    # Apps register with the registry as they start, so it must be up first.
+    for _ in {1..100}; do
+      dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.a11y.atspi.Registry 2>/dev/null | grep -q "boolean true" && break
+      sleep 0.01
+    done
+  fi
+fi
+
+exec "$@"

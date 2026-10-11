@@ -82,6 +82,7 @@ for record in "$runtime"/sandboxes/sandbox.*; do
     fi
   fi
   unlink "$record" 2>/dev/null || true
+  [[ $marker =~ ^[[:alnum:]]+$ ]] && rm -rf -- "$runtime/sandboxes/$marker.d"
 done
 
 flock -u 9
