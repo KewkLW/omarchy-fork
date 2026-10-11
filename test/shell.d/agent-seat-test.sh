@@ -686,6 +686,23 @@ run_broker omarchy-agent-seat-type 1 "é" 2>/dev/null && fail "untypeable text i
 run_broker omarchy-agent-seat-type 1 --key hyper+x 2>/dev/null && fail "unknown modifiers are refused"
 pass "bad keys are refused"
 
+# The broker builds a keymap each time the user switches layouts.
+growth=$(python3 - "$ROOT/bin/omarchy-agent-seat-broker" <<'EOF'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("broker", sys.argv[1])
+broker = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(broker)
+rss = lambda: int(open("/proc/self/status").read().split("VmRSS:")[1].split()[0])
+broker.Keymap()
+before = rss()
+for _ in range(100):
+    broker.Keymap()
+print(rss() - before)
+EOF
+)
+(( growth < 4096 )) || fail "building keymaps does not leak" "${growth} kB"
+pass "building keymaps does not leak"
+
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 
 python3 "$test_dir/app.py" "$socket" vanish "$broker"

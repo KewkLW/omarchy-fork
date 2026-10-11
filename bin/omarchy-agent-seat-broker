@@ -55,7 +55,7 @@ import zlib
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy", "agent-seat")
 WAYLAND_SOCKET = os.path.join(RUNTIME_DIR, "wayland-0")
 CONTROL_SOCKET = os.path.join(RUNTIME_DIR, "control")
-MAX_FDS_PER_MESSAGE = 28
+MAX_FDS_PER_MESSAGE = 28  # libwayland's receive limit
 MAX_QUEUED_FDS = 4 * MAX_FDS_PER_MESSAGE  # received but not yet claimed by a message
 MAX_POOLS_PER_CLIENT = 256  # shared memory pools the broker keeps a descriptor of
 LISTENER_PAUSE_SECONDS = 1  # how long to stop accepting when out of descriptors
@@ -64,7 +64,7 @@ MAX_UNSENT_BYTES = 16 << 20  # and drop the app if its queue grows past this any
 MAX_REQUEST_BYTES = 1 << 20  # one control request
 REQUEST_SECONDS = 5  # to send one
 HYPRCTL_SECONDS = 5  # for Hyprland to list its windows
-DEBUG = bool(os.environ.get("OMARCHY_AGENT_SEAT_DEBUG"))  # libwayland's receive limit
+DEBUG = bool(os.environ.get("OMARCHY_AGENT_SEAT_DEBUG"))
 
 # Everything an app needs to draw windows. Anything not listed is hidden,
 # including GPU buffers: agent apps draw into shared memory, which keeps the GPU
@@ -336,6 +336,7 @@ class Keymap:
     xkb.xkb_keymap_mod_get_name.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     xkb.xkb_keysym_from_name.argtypes = [ctypes.c_char_p, ctypes.c_int]
     xkb.xkb_utf32_to_keysym.argtypes = [ctypes.c_uint32]
+    xkb.xkb_keymap_unref.argtypes = xkb.xkb_context_unref.argtypes = [ctypes.c_void_p]
     self.xkb = xkb
 
     # The keymap Hyprland gives the user's keyboard, so the agent's keys mean
@@ -369,6 +370,10 @@ class Keymap:
           if syms[index] not in ranks or rank < ranks[syms[index]]:
             ranks[syms[index]] = rank
             self.keys[syms[index]] = (keycode - 8, mask)
+
+    # Everything needed is copied out; the lookups left need neither.
+    xkb.xkb_keymap_unref(keymap)
+    xkb.xkb_context_unref(context)
 
   def for_char(self, char):
     if char == "\n":
@@ -454,7 +459,6 @@ class Client:
     self.objects = {1: ("wl_display", 1)}
     self.advertised = {}
     self.params = {}  # GPU buffer params -> the size of the buffer they will create
-    self.placeholders = set()  # objects that only exist between the app and the broker
     self.pointers, self.keyboards = {}, {}  # object -> the surface this app believes it is focused on
     self.surfaces, self.regions, self.buffers, self.pools = {}, {}, {}, {}
     self.pool_fds = weakref.WeakSet()  # every Pool still holding a descriptor, destroyed or not
@@ -536,13 +540,6 @@ class Client:
     except Exception:
       close_fds(signature, args)
       raise
-
-    if object_id in self.placeholders:
-      result = False
-      if destructor:
-        self.placeholders.discard(object_id)
-        self.forget(object_id)
-        self.send_event(1, "delete_id", object_id)
 
     if result is True:
       self.up.queue(*encode(object_id, opcode, signature, args))
@@ -1180,6 +1177,7 @@ class Broker:
 
   def remove_window(self, window):
     self.windows.pop(window, None)
+    self.captures.pop(window, None)
 
   # Control socket. Requests arrive alongside everything else, so a caller that
   # is slow to send one never holds up the apps.
@@ -1733,15 +1731,9 @@ def call(request):
 if __name__ == "__main__":
   if len(sys.argv) >= 2 and sys.argv[1] == "call":
     call(sys.argv[2])
-  elif len(sys.argv) == 4 and sys.argv[1] == "capture":
+  elif len(sys.argv) == 4 and sys.argv[1] in ("capture", "capture-identifier"):
     try:
-      capture(sys.argv[2], sys.argv[3])
-    except Exception as error:
-      print(json.dumps({"error": str(error)}))
-      sys.exit(1)
-  elif len(sys.argv) == 4 and sys.argv[1] == "capture-identifier":
-    try:
-      capture(sys.argv[2], sys.argv[3], identifier=True)
+      capture(sys.argv[2], sys.argv[3], identifier=sys.argv[1] == "capture-identifier")
     except Exception as error:
       print(json.dumps({"error": str(error)}))
       sys.exit(1)
