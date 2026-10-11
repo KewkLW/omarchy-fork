@@ -221,7 +221,7 @@ while True:
         conn.close()
 EOF
 
-coproc CDP { python3 "$test_dir/cdp.py" 1.5; }
+coproc CDP { exec python3 "$test_dir/cdp.py" 1.5 2>/dev/null; }
 cdp_pid=$CDP_PID
 read -r -t 5 cdp_port <&"${CDP[0]}" || fail "the fake DevTools endpoint starts"
 
