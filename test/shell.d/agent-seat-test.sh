@@ -82,7 +82,7 @@ server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(path)
 server.listen(64)
 
-GLOBALS = {1: ("wl_seat", 7), 2: ("wl_compositor", 6), 3: ("xdg_wm_base", 6), 4: ("wl_data_device_manager", 3), 5: ("zwlr_virtual_pointer_manager_v1", 2), 6: ("zwp_linux_dmabuf_v1", 5), 7: ("wl_shm", 1), 8: ("wl_subcompositor", 1)}
+GLOBALS = {1: ("wl_seat", 9), 2: ("wl_compositor", 99), 3: ("xdg_wm_base", 6), 4: ("wl_data_device_manager", 3), 5: ("zwlr_virtual_pointer_manager_v1", 2), 6: ("zwp_linux_dmabuf_v1", 5), 7: ("wl_shm", 1), 8: ("wl_subcompositor", 1)}
 SLOW_SYNC = 999  # a sync with this callback is answered late, for tests that need an event in flight
 POPUP = (30, 25, 20, 10)  # where every popup opens, relative to its parent
 
@@ -199,15 +199,20 @@ def roundtrip(callback):
 
 conn.send(message(1, 1, struct.pack("<I", 2)))
 globals_ = {}
+versions = {}
 for object_id, opcode, body in roundtrip(3):
     if object_id == 2 and opcode == 0:
         globals_[read_string(body, 4)] = struct.unpack_from("<I", body)[0]
+        versions[read_string(body, 4)] = struct.unpack_from("<I", body, len(body) - 4)[0]
 
 def bind(interface, version, new_id):
     conn.send(message(2, 0, struct.pack("<I", globals_[interface]) + string(interface) + struct.pack("<II", version, new_id)))
 
 if step == "globals":
     print(" ".join(sorted(globals_)))
+
+elif step == "versions":
+    print(" ".join(f"{name}:{version}" for name, version in sorted(versions.items())))
 
 elif step == "hidden":
     hidden = next(name for name in range(1, 50) if name not in globals_.values())
@@ -570,6 +575,10 @@ pass "control socket is private to the user"
 globals=$(python3 "$test_dir/app.py" "$socket" globals)
 [[ $globals == "wl_compositor wl_data_device_manager wl_seat wl_shm wl_subcompositor xdg_wm_base" ]] || fail "only allowlisted globals are advertised" "$globals"
 pass "only allowlisted globals are advertised"
+
+versions=$(python3 "$test_dir/app.py" "$socket" versions)
+[[ " $versions " == *" wl_compositor:7 "* && " $versions " == *" wl_seat:7 "* && " $versions " == *" xdg_wm_base:6 "* ]] || fail "globals are advertised no newer than the broker understands" "$versions"
+pass "globals are advertised no newer than the broker understands"
 
 hidden=$(python3 "$test_dir/app.py" "$socket" hidden 2>&1)
 [[ $hidden == "disconnected" ]] || fail "binding a hidden global disconnects the app" "$hidden $(cat "$test_dir/broker.log")"

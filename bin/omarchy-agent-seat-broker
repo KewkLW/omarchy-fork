@@ -131,11 +131,14 @@ def load_protocols():
 
     for interface in root.iter("interface"):
       interfaces[interface.get("name")] = {
-        kind: [
-          (message.get("name"), [(arg.get("type"), arg.get("interface")) for arg in message.findall("arg")], message.get("type") == "destructor")
-          for message in interface.findall(kind[:-1])
-        ]
-        for kind in ("requests", "events")
+        "version": int(interface.get("version", 1)),
+        **{
+          kind: [
+            (message.get("name"), [(arg.get("type"), arg.get("interface")) for arg in message.findall("arg")], message.get("type") == "destructor")
+            for message in interface.findall(kind[:-1])
+          ]
+          for kind in ("requests", "events")
+        },
       }
 
   return interfaces
@@ -522,9 +525,8 @@ class Client:
       bound, requested_version, new_id = args[1]
       if self.advertised.get(args[0]) != bound:
         raise PermissionError(f"tried to bind hidden global {bound}")
-      cap = self.allowed[bound]
-      if cap and requested_version > cap:
-        args[1] = (bound, cap, new_id)
+      if requested_version > self.version_cap(bound):
+        args[1] = (bound, self.version_cap(bound), new_id)
 
     try:
       self.track_new_objects(signature, args, version)
@@ -740,10 +742,12 @@ class Client:
     if interface not in self.allowed or interface not in PROTOCOLS:
       return False
     self.advertised[name] = interface
-    cap = self.allowed[interface]
-    if cap and version > cap:
-      args[2] = cap
+    args[2] = min(version, self.version_cap(interface))
     return True
+
+  def version_cap(self, interface):
+    """The newest version of a global the broker lets apps use: no newer than it can decode."""
+    return min(self.allowed[interface] or PROTOCOLS[interface]["version"], PROTOCOLS[interface]["version"])
 
   def event_wl_registry_global_remove(self, _, args):
     return self.advertised.pop(args[0], None) is not None
