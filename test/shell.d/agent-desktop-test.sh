@@ -193,3 +193,48 @@ set_window foot 10
 echo 'not json' >"$state/active.json"
 drive type 0xa1 hi >/dev/null 2>&1 && fail "type refuses when the focus cannot be read"
 pass "type refuses when the user's focus cannot be read"
+
+# Grants -----------------------------------------------------------------------
+
+reset
+set_window foot 10
+drive type 0xa1 hi >/dev/null || fail "a window on an agent workspace is allowed"
+(( $(keys_sent) == 2 && $(questions) == 0 && $(tag_changes) == 0 )) && [[ $(window_tags) == "[]" ]] ||
+  fail "a window on an agent workspace is driven without asking or tagging" "$(cat "$state/hyprctl.log")"
+pass "a window on an agent workspace is allowed without asking or tagging"
+
+# The same window, after the user moved it back to their own workspace.
+set_window foot 2
+drive type 0xa1 hi >/dev/null 2>&1 && fail "a window that left the agent workspace is refused"
+(( $(keys_sent) == 2 && $(questions) == 1 )) || fail "a window that left the agent workspace asks again and gets nothing"
+pass "a window that left the agent workspace asks again on the next call"
+
+reset
+set_window foot 2
+echo "Allow once" >"$state/menu-answer"
+drive type 0xa1 hi >/dev/null || fail "Allow once allows the command"
+(( $(keys_sent) == 2 && $(questions) == 1 && $(tag_changes) == 0 )) && [[ $(window_tags) == "[]" ]] ||
+  fail "Allow once leaves no tag" "$(cat "$state/hyprctl.log")"
+echo "Deny" >"$state/menu-answer"
+drive type 0xa1 hi >/dev/null 2>&1 && fail "Allow once lasts one command"
+(( $(keys_sent) == 2 && $(questions) == 2 )) || fail "Allow once asks again on the next command"
+pass "Allow once grants one command and leaves no tag"
+
+reset
+set_window foot 2
+echo "Allow until the window closes" >"$state/menu-answer"
+drive type 0xa1 hi >/dev/null || fail "Allow until the window closes allows the command"
+(( $(grep -c 'tag = "+agent-drive"' "$state/hyprctl.log") == 1 )) && [[ $(window_tags) == '["agent-drive*"]' ]] ||
+  fail "Allow until the window closes tags the window" "$(cat "$state/hyprctl.log")"
+echo "Deny" >"$state/menu-answer"
+drive key 0xa1 ctrl+l >/dev/null || fail "a later call honours the tag"
+(( $(keys_sent) == 3 && $(questions) == 1 && $(tag_changes) == 1 )) || fail "a later call honours the tag without asking"
+pass "Allow until the window closes tags the window and later calls honour it"
+
+reset
+set_window foot 2 '["agent-drive*"]'
+drive type 0xa1 hi >/dev/null || fail "a tag set by another call allows the window"
+drive close 0xa1 >/dev/null || fail "a tagged window can be closed"
+(( $(tag_changes) == 0 && $(questions) == 0 )) && [[ $(window_tags) == '["agent-drive*"]' ]] ||
+  fail "a tag set by another call is never removed" "$(cat "$state/hyprctl.log")"
+pass "a tag set by another call is honoured and never removed"

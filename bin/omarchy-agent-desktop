@@ -23,6 +23,8 @@ POLICY_LISTS = {"agent_workspaces": int, "extra_workspaces": int, "always_allow_
 # What callers may write before "+" in a key combo, as Keymap modifier names.
 MODIFIERS = {"ctrl": "ctrl", "control": "ctrl", "shift": "shift", "alt": "alt", "super": "super", "meta": "super", "altgr": "altgr"}
 BATCH_SIZE = 200  # keys per hyprctl call, to keep each command line modest
+ALLOW_ONCE = "Allow once"
+ALLOW_UNTIL_CLOSED = "Allow until the window closes"
 
 
 def run(*args, check=True, capture=True):
@@ -106,38 +108,47 @@ def quote(value):
   return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def set_tag(address, tag, enabled):
-  operation = "+" if enabled else "-"
-  dispatch(f"hl.dsp.window.tag({{ window = {quote('address:' + address)}, tag = {quote(operation + tag)} }})")
+def tag_window(address, tag):
+  # Only the user's "until the window closes" answer is written down. The drive
+  # never removes a tag: one it finds was set by an earlier answer, not by it.
+  dispatch(f"hl.dsp.window.tag({{ window = {quote('address:' + address)}, tag = {quote('+' + tag)} }})")
 
 
 def ask(window):
   title = window.get("title") or "untitled"
   app_class = window.get("class") or "unknown"
   prompt = f"Let the agent drive {app_class}: {title}?"
-  result = run("omarchy-menu-select", prompt, "Allow once", "Allow until the window closes", "Deny", check=False)
+  result = run("omarchy-menu-select", prompt, ALLOW_ONCE, ALLOW_UNTIL_CLOSED, "Deny", check=False)
   return result.stdout.strip() if result.returncode == 0 else "Deny"
 
 
-def authorize(window, typing):
-  settings = policy()
+def workspace_of(window):
+  return (window.get("workspace") or {}).get("id")
+
+
+def automatic(window, settings):
+  """Whether the policy allows the window without asking. Judged afresh on every
+  call and never written down, so a window that leaves the agent workspaces
+  stops being drivable."""
+  workspace = workspace_of(window)
+  return workspace in settings["agent_workspaces"] or workspace in settings["extra_workspaces"] or matches(settings["always_allow_classes"], window.get("class", ""))
+
+
+def authorize(window, settings, typing):
+  """Allows this command on the window or raises. "Allow once" lasts only as
+  long as this process, so nothing outside it can reuse or strand the grant."""
   app_class = window.get("class", "")
-  workspace = window.get("workspace", {}).get("id")
-  tag = settings["tag"]
   if matches(settings["never_allow_classes"], app_class):
     raise PermissionError(f"drive policy never allows class {app_class!r}")
   if typing:
     refuse_if_focused(window["address"])
-  if has_tag(window, tag):
-    return tag, False
-  automatic = workspace in settings["agent_workspaces"] or workspace in settings["extra_workspaces"] or matches(settings["always_allow_classes"], app_class)
-  choice = "Allow until the window closes" if automatic else ask(window)
-  if choice == "Deny":
+  if automatic(window, settings) or has_tag(window, settings["tag"]):
+    return
+  choice = ask(window)
+  if choice == ALLOW_UNTIL_CLOSED:
+    tag_window(window["address"], settings["tag"])
+  elif choice != ALLOW_ONCE:
     raise PermissionError("the user did not allow this window")
-  if choice not in {"Allow once", "Allow until the window closes"}:
-    raise PermissionError("the window was not allowed")
-  set_tag(window["address"], tag, True)
-  return tag, choice == "Allow once"
 
 
 def broker_path():
@@ -291,21 +302,18 @@ def capture_window(window, output):
   print(json.dumps({"path": output, **data}))
 
 
-def list_windows():
-  settings = policy()
+def list_windows(settings):
   rows = []
   for window in clients():
-    app_class = window.get("class", "")
-    workspace = window.get("workspace", {}).get("id")
-    if matches(settings["never_allow_classes"], app_class):
+    if matches(settings["never_allow_classes"], window.get("class", "")):
       access = "never"
+    elif automatic(window, settings):
+      access = "automatic"
     elif has_tag(window, settings["tag"]):
       access = "allowed"
-    elif workspace in settings["agent_workspaces"] or workspace in settings["extra_workspaces"] or matches(settings["always_allow_classes"], app_class):
-      access = "automatic"
     else:
       access = "ask"
-    rows.append({key: window.get(key) for key in ("address", "stableId", "class", "title")} | {"workspace": workspace, "access": access})
+    rows.append({key: window.get(key) for key in ("address", "stableId", "class", "title")} | {"workspace": workspace_of(window), "access": access})
   print(json.dumps(rows, indent=2))
 
 
@@ -329,26 +337,20 @@ def parser():
 
 def main():
   args = parser().parse_args()
+  settings = policy()
   if args.command == "list":
-    list_windows()
+    list_windows(settings)
     return
   window = window_at(args.address)
-  tag, remove_after = authorize(window, args.command in ("type", "key"))
-  try:
-    if args.command == "screenshot":
-      capture_window(window, args.output)
-    elif args.command == "type":
-      type_text(window["address"], args.text)
-    elif args.command == "key":
-      key_combo(window["address"], args.combo)
-    elif args.command == "close":
-      dispatch(f"hl.dsp.window.close({{ window = {quote('address:' + window['address'])} }})")
-  finally:
-    if remove_after and args.command != "close":
-      try:
-        set_tag(window["address"], tag, False)
-      except RuntimeError:
-        pass
+  authorize(window, settings, args.command in ("type", "key"))
+  if args.command == "screenshot":
+    capture_window(window, args.output)
+  elif args.command == "type":
+    type_text(window["address"], args.text)
+  elif args.command == "key":
+    key_combo(window["address"], args.combo)
+  elif args.command == "close":
+    dispatch(f"hl.dsp.window.close({{ window = {quote('address:' + window['address'])} }})")
 
 
 if __name__ == "__main__":
