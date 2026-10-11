@@ -60,6 +60,9 @@ MAX_POOLS_PER_CLIENT = 256  # shared memory pools the broker keeps a descriptor 
 LISTENER_PAUSE_SECONDS = 1  # how long to stop accepting when out of descriptors
 PAUSE_READING_BYTES = 256 << 10  # stop reading one side while this much waits for the other
 MAX_UNSENT_BYTES = 16 << 20  # and drop the app if its queue grows past this anyway
+MAX_REQUEST_BYTES = 1 << 20  # one control request
+REQUEST_SECONDS = 5  # to send one
+HYPRCTL_SECONDS = 5  # for Hyprland to list its windows
 DEBUG = bool(os.environ.get("OMARCHY_AGENT_SEAT_DEBUG"))  # libwayland's receive limit
 
 # Everything an app needs to draw windows. Anything not listed is hidden,
@@ -974,11 +977,20 @@ class Grant:
     self.idle = time.monotonic()  # since when no app has been connected
 
 
+class Request:
+  """A control connection whose request is still arriving."""
+
+  def __init__(self, conn, caller):
+    self.conn, self.caller, self.data = conn, caller, bytearray()
+    self.deadline = time.monotonic() + REQUEST_SECONDS
+
+
 class Job:
   """A helper process whose output answers a control request."""
 
-  def __init__(self, conn, argv, finish):
+  def __init__(self, conn, argv, finish, timeout=None):
     self.conn, self.finish, self.output = conn, finish, bytearray()
+    self.deadline = time.monotonic() + timeout if timeout else None  # then it is killed
     self.process = subprocess.Popen(argv, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
 
 
@@ -998,6 +1010,7 @@ class Broker:
     self.gpu_session = False  # the user allowed the GPU for the rest of this session
     self.gpu_requests = collections.deque()  # (conn, app) waiting for the user, the first one asked
     self.jobs = []
+    self.requests = []
 
   def listen(self, path, mode):
     if os.path.exists(path):
@@ -1016,15 +1029,18 @@ class Broker:
     log(f"serving {WAYLAND_SOCKET} for {self.upstream}")
 
     while True:
-      for key, events in self.selector.select(timeout=LISTENER_PAUSE_SECONDS if self.paused else 5):
+      waiting = self.paused or self.requests or any(job.deadline for job in self.jobs)
+      for key, events in self.selector.select(timeout=1 if waiting else 5):
         kind, owner = key.data
-        if isinstance(owner, Client) and owner not in self.clients or isinstance(owner, Job) and owner not in self.jobs:
+        if isinstance(owner, Client) and owner not in self.clients or isinstance(owner, Job) and owner not in self.jobs or isinstance(owner, Request) and owner not in self.requests:
           continue  # dropped or finished earlier in this round
         try:
           if kind == "wayland":
             self.accept_client(key.fileobj, owner)
           elif kind == "control":
             self.control(key.fileobj)
+          elif kind == "request":
+            self.request_data(owner)
           elif kind == "job":
             self.job_output(owner)
           elif kind == "requester":
@@ -1040,6 +1056,7 @@ class Broker:
           else:
             log(f"error: {error}")
       self.resume_listeners()
+      self.expire_requests()
       self.expire_grants()
 
   def accept(self, listener):
@@ -1129,7 +1146,8 @@ class Broker:
   def remove_window(self, window):
     self.windows.pop(window, None)
 
-  # Control socket
+  # Control socket. Requests arrive alongside everything else, so a caller that
+  # is slow to send one never holds up the apps.
 
   def control(self, listener):
     conn = self.accept(listener)
@@ -1139,26 +1157,53 @@ class Broker:
     if uid != os.getuid():
       conn.close()
       return
-    conn.settimeout(2)
-    data = b""
-    while not data.endswith(b"\n"):
-      chunk = conn.recv(65536)
-      if not chunk:
-        break
-      data += chunk
+    conn.setblocking(False)
+    request = Request(conn, caller)
+    self.requests.append(request)
+    self.selector.register(conn, selectors.EVENT_READ, ("request", request))
+
+  def end_request(self, request):
+    self.requests.remove(request)
+    self.selector.unregister(request.conn)
+    request.conn.settimeout(2)  # for the reply
+
+  def request_data(self, request):
     try:
-      request = json.loads(data)
-      command, args = request["command"], request.get("args", {})
+      chunk = request.conn.recv(65536)
+    except BlockingIOError:
+      return
+    except OSError:
+      chunk = b""
+    request.data += chunk
+    if chunk and b"\n" not in chunk and len(request.data) <= MAX_REQUEST_BYTES:
+      return
+    self.end_request(request)
+    if len(request.data) > MAX_REQUEST_BYTES:
+      self.reply(request.conn, error="the request is too large")
+      return
+    try:
+      message = json.loads(request.data)
+      command, args = message["command"], message.get("args", {})
       deferred = getattr(self, f"defer_{command}", None)
       if deferred:
-        deferred(conn, caller, **args)  # replies itself, now or once the user or a helper answers
+        deferred(request.conn, request.caller, **args)  # replies itself, now or once the user or a helper answers
       else:
-        self.reply(conn, getattr(self, f"do_{command}")(**args))
+        self.reply(request.conn, getattr(self, f"do_{command}")(**args))
     except Exception as error:
-      self.reply(conn, error=error)
+      self.reply(request.conn, error=error)
     self.flush_clients()
     if self.stopping:
       self.stop()
+
+  def expire_requests(self):
+    now = time.monotonic()
+    for request in [request for request in self.requests if request.deadline < now]:
+      self.end_request(request)
+      request.conn.close()
+    for job in self.jobs:
+      if job.deadline and job.deadline < now:
+        job.deadline = None
+        job.process.kill()  # its output ends, and the job finishes with what it had
 
   def reply(self, conn, result=None, error=None):
     reply = {"ok": False, "error": str(error)} if error else {"ok": True, **(result or {})}
@@ -1187,8 +1232,8 @@ class Broker:
   # Helper processes answer requests that take a while, so the seat keeps
   # running meanwhile. A caller that hangs up cancels its helper.
 
-  def start_job(self, conn, argv, finish):
-    job = Job(conn, argv, finish)
+  def start_job(self, conn, argv, finish, timeout=None):
+    job = Job(conn, argv, finish, timeout)
     self.jobs.append(job)
     self.selector.register(job.process.stdout, selectors.EVENT_READ, ("job", job))
     self.selector.register(conn, selectors.EVENT_READ, ("requester", job))
@@ -1294,11 +1339,12 @@ class Broker:
       raise ValueError(f"no agent window {window}")
     return self.windows[int(window)]
 
-  def hyprland_windows(self):
-    """Hyprland's address and workspace for each agent window."""
+  @staticmethod
+  def hyprland_windows(output):
+    """Hyprland's address and workspace for each agent window, from hyprctl clients -j."""
     try:
-      clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=5).stdout)
-    except (OSError, ValueError, subprocess.SubprocessError):
+      clients = json.loads(output)
+    except ValueError:
       return {}
     found = {}
     for client in clients:
@@ -1347,8 +1393,13 @@ class Broker:
       self.captures[int(window)] = (0, 0, width / (gw or width))
     return {"path": path, "width": width, "height": height}
 
-  def do_windows(self):
-    hyprland = self.hyprland_windows()
+  def defer_windows(self, conn, caller):
+    try:
+      self.start_job(conn, ["hyprctl", "clients", "-j"], lambda output, _: self.list_windows(self.hyprland_windows(output)), HYPRCTL_SECONDS)
+    except OSError:
+      self.reply(conn, self.list_windows({}))
+
+  def list_windows(self, hyprland):
     windows = []
     for window, (client, toplevel) in sorted(self.windows.items()):
       info = client.toplevels[toplevel]

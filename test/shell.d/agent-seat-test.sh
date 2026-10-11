@@ -19,7 +19,8 @@ cleanup() {
 trap cleanup EXIT
 
 # The broker asks Hyprland where agent windows are; there is no Hyprland here.
-printf '#!/bin/bash\necho "[]"\n' >"$test_dir/bin/hyprctl"
+# A test can make it slow to answer.
+printf '#!/bin/bash\n[[ -f %s/hyprctl-delay ]] && sleep "$(<%s/hyprctl-delay)"\necho "[]"\n' "$test_dir" "$test_dir" >"$test_dir/bin/hyprctl"
 chmod +x "$test_dir/bin/hyprctl"
 
 # The user's menu: logs each question and gives the answer the test set.
@@ -728,6 +729,40 @@ ln -s "$test_dir/elsewhere.png" "$test_dir/work/link.png"
 [[ ! -e $test_dir/outside.png && ! -e /tmp/agent-seat-test-$$.png && ! -e $test_dir/elsewhere.png && ! -e $test_dir/work/sub/missing ]] || fail "refused screenshots write nothing"
 pass "a screenshot only goes under the current directory or the seat's own"
 stop_draw
+
+# A caller that never finishes its request, one that sends too much, and a
+# slow Hyprland all leave the broker answering everyone else.
+exec {stalled}< <(python3 -c '
+import socket, sys, time
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(sys.argv[1])
+sock.sendall(b"{\"command\": ")
+print("connected", flush=True)
+time.sleep(3)
+' "$test_dir/runtime/omarchy/agent-seat/control")
+read -r -t 5 line <&"$stalled"
+timeout 1 bash -c "XDG_RUNTIME_DIR='$test_dir/runtime' PATH='$test_dir/bin:$ROOT/bin:$PATH' omarchy-agent-seat-status" >/dev/null || fail "a caller that never finishes its request does not hold up the broker"
+exec {stalled}<&-
+oversized=$(python3 -c '
+import socket, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(sys.argv[1])
+try:
+    sock.sendall(b"x" * (4 << 20))
+except OSError:
+    pass
+print(sock.recv(4096).decode().strip())
+' "$test_dir/runtime/omarchy/agent-seat/control" 2>&1)
+[[ $oversized == *"too large"* ]] || fail "an oversized request is refused" "$oversized"
+echo 2 >"$test_dir/hyprctl-delay"
+run_broker omarchy-agent-seat-windows >"$test_dir/slow-windows.json" &
+slow_windows=$!
+sleep 0.3
+timeout 1 bash -c "XDG_RUNTIME_DIR='$test_dir/runtime' PATH='$test_dir/bin:$ROOT/bin:$PATH' omarchy-agent-seat-status" >/dev/null || fail "a slow Hyprland does not hold up the broker"
+wait "$slow_windows" || fail "windows answers once Hyprland does"
+rm "$test_dir/hyprctl-delay"
+jq -e 'type == "array"' "$test_dir/slow-windows.json" >/dev/null || fail "windows answers once Hyprland does" "$(cat "$test_dir/slow-windows.json")"
+pass "slow or oversized control requests and a slow Hyprland do not hold up the broker"
 
 descriptors() {
   local fds=(/proc/"$broker"/fd/*)
