@@ -14,6 +14,7 @@ bluez-utils
 bolt
 brightnessctl
 btop
+bubblewrap
 chromium
 cliamp
 cups
@@ -149,6 +150,7 @@ unzip
 usage
 uwsm
 vi
+wayland-protocols
 whois
 wireless-regdb
 wireplumber
