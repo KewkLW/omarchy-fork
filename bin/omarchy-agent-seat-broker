@@ -41,6 +41,7 @@ import os
 import re
 import secrets
 import selectors
+import shutil
 import socket
 import stat
 import struct
@@ -98,7 +99,7 @@ GPU_GLOBALS = {
   "wp_linux_drm_syncobj_manager_v1": None,
 }
 GPU_CHOICES = {"Allow once": "once", "Allow for this session": "session"}
-GPU_GRANT_UNUSED_SECONDS = 60  # an allowed launch that never connects gives its socket back
+GPU_GRANT_UNUSED_SECONDS = 300  # an allowed launch that never connects gives its socket back, after a cold start's worth
 GPU_GRANT_IDLE_SECONDS = 10  # and one whose app has gone, after a grace for apps that reconnect
 
 MAX_CAPTURE_SIZE = 8192  # pixels a side, beyond any real screen
@@ -1040,7 +1041,7 @@ class Broker:
     self.captures = {}  # window -> (left, top, scale) of its last screenshot
     self.grants = []
     self.gpu_session = False  # the user allowed the GPU for the rest of this session
-    self.gpu_requests = collections.deque()  # (conn, app) waiting for the user, the first one asked
+    self.gpu_requests = collections.deque()  # (conn, program) waiting for the user, the first one asked
     self.jobs = []
     self.requests = []
 
@@ -1056,6 +1057,8 @@ class Broker:
   def serve(self):
     os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
     os.chmod(RUNTIME_DIR, 0o700)
+    for path in glob.glob(os.path.join(RUNTIME_DIR, "gpu-*")):
+      os.unlink(path)  # grants of a broker that died; nothing listens on them
     self.selector.register(self.listen(WAYLAND_SOCKET, 0o600), selectors.EVENT_READ, ("wayland", None))
     self.selector.register(self.listen(CONTROL_SOCKET, 0o600), selectors.EVENT_READ, ("control", None))
     log(f"serving {WAYLAND_SOCKET} for {self.upstream}")
@@ -1310,13 +1313,25 @@ class Broker:
     if self.gpu_session:
       self.reply(conn, self.grant_gpu("session"))
       return
-    self.gpu_requests.append((conn, app))
+    self.gpu_requests.append((conn, self.program(app, caller)))
     if len(self.gpu_requests) == 1:
       self.ask_gpu()
 
+  @staticmethod
+  def program(app, caller):
+    """What the user is asked about: the file the agent's app name runs on the caller's PATH, not the agent's words."""
+    name = "".join(character for character in str(app) if character.isprintable())[:80]
+    try:
+      with open(f"/proc/{caller}/environ", "rb") as environ:
+        path = next((item[5:].decode(errors="replace") for item in environ.read().split(b"\0") if item.startswith(b"PATH=")), "")
+    except OSError:
+      path = os.environ.get("PATH", "")
+    found = shutil.which(name, path=path) if name else None
+    return os.path.realpath(found) if found else f"unknown program {name!r}"
+
   def ask_gpu(self):
-    conn, app = self.gpu_requests[0]
-    self.start_job(conn, ["omarchy-menu-select", f"Let the agent's {app} use the GPU?", *GPU_CHOICES, "Deny"], self.answered_gpu)
+    conn, program = self.gpu_requests[0]
+    self.start_job(conn, ["omarchy-menu-select", f"Let the agent's {program} use the GPU?", *GPU_CHOICES, "Deny"], self.answered_gpu)
 
   def answered_gpu(self, output, _):
     self.gpu_requests.popleft()
@@ -1350,7 +1365,7 @@ class Broker:
 
   def expire_grants(self):
     # A grant ends a little after its app's last connection closes, since apps
-    # may probe the display and reconnect, or after a minute if nothing came.
+    # may probe the display and reconnect, or after five minutes if nothing came.
     now = time.monotonic()
     for grant in list(self.grants):
       if grant.clients:

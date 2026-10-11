@@ -23,6 +23,10 @@ trap cleanup EXIT
 printf '#!/bin/bash\n[[ -f %s/hyprctl-delay ]] && sleep "$(<%s/hyprctl-delay)"\necho "[]"\n' "$test_dir" "$test_dir" >"$test_dir/bin/hyprctl"
 chmod +x "$test_dir/bin/hyprctl"
 
+# The app agents ask to give the GPU, as the user's menu should name it.
+printf '#!/bin/bash\n' >"$test_dir/bin/vkcube"
+chmod +x "$test_dir/bin/vkcube"
+
 # The user's menu: logs each question and gives the answer the test set.
 printf '#!/bin/bash\necho "$1" >>"%s/menu.log"\ncat "%s/menu-answer"\n' "$test_dir" "$test_dir" >"$test_dir/bin/omarchy-menu-select"
 chmod +x "$test_dir/bin/omarchy-menu-select"
@@ -611,8 +615,12 @@ questions() {
 echo "Deny" >"$test_dir/menu-answer"
 gpu_request 2>"$test_dir/gpu.err" && fail "a declined GPU request fails"
 grep -q "did not allow" "$test_dir/gpu.err" || fail "a declined GPU request says why" "$(cat "$test_dir/gpu.err")"
-grep -qx "Let the agent's vkcube use the GPU?" "$test_dir/menu.log" || fail "the user is asked before an app gets the GPU" "$(cat "$test_dir/menu.log")"
-pass "the user is asked before an app gets the GPU, and can decline"
+grep -qxF "Let the agent's $(realpath "$test_dir/bin/vkcube") use the GPU?" "$test_dir/menu.log" || fail "the user is asked before an app gets the GPU, by the program's path" "$(cat "$test_dir/menu.log")"
+pass "the user is asked before an app gets the GPU, by the program's path, and can decline"
+
+run_broker omarchy-agent-seat-broker call "$(jq -cn '{command: "gpu", args: {app: "no-such-app\nAllow for this session"}}')" 2>/dev/null && fail "a declined GPU request for an unknown program fails"
+[[ $(tail -1 "$test_dir/menu.log") == "Let the agent's unknown program 'no-such-appAllow for this session' use the GPU?" ]] || fail "an unknown program is named as the agent's words, on one line" "$(tail -1 "$test_dir/menu.log")"
+pass "an unknown program is named as the agent's words, on one line"
 
 echo "Allow once" >"$test_dir/menu-answer"
 grant=$(gpu_request) || fail "the user can allow the GPU once" "$(cat "$test_dir/broker.log")"
@@ -626,14 +634,14 @@ globals=$(python3 "$test_dir/app.py" "$socket" globals)
 pass "an allowed app gets GPU buffers on a socket of its own, other apps do not"
 
 gpu_request >/dev/null 2>&1
-(( $(questions) == 3 )) || fail "allowing once asks again next launch" "$(cat "$test_dir/menu.log")"
+(( $(questions) == 4 )) || fail "allowing once asks again next launch" "$(cat "$test_dir/menu.log")"
 pass "allowing once asks again next launch"
 
 echo "Allow for this session" >"$test_dir/menu-answer"
 gpu_request >/dev/null || fail "the user can allow the GPU for the session"
 echo "Deny" >"$test_dir/menu-answer"
 grant=$(gpu_request) || fail "a session grant covers later launches"
-(( $(questions) == 4 )) || fail "a session grant asks only once" "$(cat "$test_dir/menu.log")"
+(( $(questions) == 5 )) || fail "a session grant asks only once" "$(cat "$test_dir/menu.log")"
 [[ $(jq -r '.scope' <<<"$grant") == "session" ]] || fail "later launches get the session grant" "$grant"
 [[ $(run_broker omarchy-agent-seat-status --json | jq -r '.gpu') == "session" ]] || fail "status shows the session grant"
 pass "allowing for the session asks only once"
@@ -860,3 +868,25 @@ run_broker omarchy-agent-seat-run --share "$test_dir/missing" foot 2>/dev/null &
 pass "sharing a missing path is refused"
 [[ $(run_broker omarchy-agent-seat-status) == "Agent seat: stopped" ]] || fail "status reports a stopped seat"
 pass "stop ends the broker"
+
+start_broker() {
+  run_broker omarchy-agent-seat-broker serve 2>>"$test_dir/broker.log" &
+  broker_pid=$!
+  for _ in {1..50}; do run_broker omarchy-agent-seat-status >/dev/null && break; sleep 0.1; done
+  broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
+}
+
+# A broker that dies leaves its sockets behind, a GPU grant's among them.
+start_broker
+echo "Allow once" >"$test_dir/menu-answer"
+gpu_socket=$(gpu_request | jq -r '.socket')
+[[ -S $gpu_socket ]] || fail "a restarted broker grants the GPU"
+kill -KILL "$broker"
+wait "$broker_pid" 2>/dev/null
+[[ -S $socket && -S $gpu_socket ]] || fail "a killed broker leaves its sockets behind"
+start_broker
+[[ $(python3 "$test_dir/app.py" "$socket" globals) == *wl_seat* ]] || fail "a broker starts over the sockets of one that died"
+[[ ! -e $gpu_socket ]] || fail "a broker removes the GPU sockets of one that died"
+pass "a broker starts over the sockets of one that died"
+run_broker omarchy-agent-seat-stop >/dev/null
+wait "$broker_pid" 2>/dev/null
