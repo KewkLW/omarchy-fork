@@ -317,9 +317,24 @@ def key_combo(address, combo, check):
   send([shortcut(address, modifiers, keycode)], check)
 
 
+def screenshot_path(window, output):
+  """Where a screenshot may go: the runtime directory by default, or a path
+  under it or under the caller's current directory, whose directory must
+  already exist. Symlinks are resolved before the check."""
+  if not output:
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+    return os.path.join(RUNTIME_DIR, f"agent-desktop-{window['stableId']}.png")
+  path = os.path.realpath(output)
+  roots = {os.path.realpath(RUNTIME_DIR), os.path.realpath(os.getcwd())}
+  if not any(os.path.commonpath([path, root]) == root and path != root for root in roots):
+    raise PermissionError(f"screenshots go under {RUNTIME_DIR} or the current directory, not {output}")
+  if not os.path.isdir(os.path.dirname(path)):
+    raise ValueError(f"no directory for {output}")
+  return path
+
+
 def capture_window(window, output):
-  output = os.path.abspath(output or os.path.join(RUNTIME_DIR, f"agent-desktop-{window['stableId']}.png"))
-  os.makedirs(os.path.dirname(output), exist_ok=True)
+  output = screenshot_path(window, output)
   helper = broker_path()
   result = run(helper, "capture-identifier", window["stableId"], output, check=False)
   data = json.loads(result.stdout or "{}")

@@ -266,3 +266,22 @@ echo '{"address": "0xa1"}' >"$state/active.next.json"
 drive type 0xa1 "$(printf 'a%.0s' {1..300})" >/dev/null 2>&1 && fail "typing stops when the user focuses the window"
 (( $(keys_sent) == 200 )) || fail "typing stops at the batch after the user focuses the window" "$(keys_sent) keys sent"
 pass "typing stops at the next batch once the user focuses the window"
+
+# Screenshot paths -------------------------------------------------------------
+
+reset
+set_window foot 10
+output=$(drive screenshot 0xa1) && [[ $(jq -r .path <<<"$output") == "$runtime/omarchy/agent-desktop-s1.png" && -f $runtime/omarchy/agent-desktop-s1.png ]] ||
+  fail "a screenshot goes to the runtime directory by default" "$output"
+mkdir -p "$test_dir/cwd/shots"
+drive screenshot 0xa1 shots/notes.png >/dev/null && [[ -f $test_dir/cwd/shots/notes.png ]] ||
+  fail "a screenshot may go under the current directory"
+drive screenshot 0xa1 "$runtime/omarchy/notes.png" >/dev/null || fail "a screenshot may go under the runtime directory"
+pass "a screenshot goes to the runtime directory or under the current directory"
+
+ln -s "$test_dir/elsewhere" "$test_dir/cwd/link"
+for target in "$test_dir/elsewhere/notes.png" ../elsewhere/notes.png link/notes.png new/notes.png; do
+  drive screenshot 0xa1 "$target" >/dev/null 2>&1 && fail "a screenshot is refused at $target"
+done
+[[ -z $(ls -A "$test_dir/elsewhere") && ! -e $test_dir/cwd/new ]] || fail "a refused screenshot writes and creates nothing"
+pass "a screenshot is refused outside the runtime and current directories, through symlinks, or in a missing directory"
