@@ -42,6 +42,7 @@ import re
 import secrets
 import selectors
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -393,6 +394,21 @@ class Pool:
   __del__ = close
 
 
+def screenshot_path(path, caller):
+  """Where a caller may have a screenshot written: the seat's runtime directory, or under its working directory."""
+  if not os.path.isabs(path) or not path.endswith(".png"):
+    raise ValueError("a screenshot needs an absolute path ending in .png")
+  folder = os.path.realpath(os.path.dirname(path))
+  roots = [os.path.realpath(RUNTIME_DIR)]
+  try:
+    roots.append(os.readlink(f"/proc/{caller}/cwd"))
+  except OSError:
+    pass
+  if not any(os.path.commonpath([folder, root]) == root for root in roots):
+    raise PermissionError("a screenshot can only go in the agent seat's runtime directory or under the current directory")
+  return os.path.join(folder, os.path.basename(path))
+
+
 def write_png(path, canvas, width, height):
   rows, rgb = bytearray(), bytearray(width * 3)
   for y in range(height):
@@ -403,7 +419,12 @@ def write_png(path, canvas, width, height):
   def chunk(kind, data):
     return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
-  with open(path, "wb") as png:
+  # Never through a symlink, into a FIFO or onto a device.
+  fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+  with open(fd, "wb") as png:
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+      raise ValueError(f"{path} is not a regular file")
+    png.truncate()
     png.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(rows), 1)) + chunk(b"IEND", b""))
 
 
@@ -1114,7 +1135,7 @@ class Broker:
     conn = self.accept(listener)
     if not conn:
       return
-    uid = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+    caller, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
     if uid != os.getuid():
       conn.close()
       return
@@ -1130,7 +1151,7 @@ class Broker:
       command, args = request["command"], request.get("args", {})
       deferred = getattr(self, f"defer_{command}", None)
       if deferred:
-        deferred(conn, **args)  # replies itself, now or once the user or a helper answers
+        deferred(conn, caller, **args)  # replies itself, now or once the user or a helper answers
       else:
         self.reply(conn, getattr(self, f"do_{command}")(**args))
     except Exception as error:
@@ -1208,7 +1229,7 @@ class Broker:
   # agent's pointer and keyboard cannot reach. Asking again while the user
   # decides waits in line.
 
-  def defer_gpu(self, conn, app="an app"):
+  def defer_gpu(self, conn, caller, app="an app"):
     if self.gpu_session:
       self.reply(conn, self.grant_gpu("session"))
       return
@@ -1292,8 +1313,9 @@ class Broker:
     left, top, scale = self.captures.get(int(window), (0, 0, client.scale(toplevel)))
     return [value / scale + (top if index % 2 else left) for index, value in enumerate(coordinates)]
 
-  def defer_screenshot(self, conn, window, path):
+  def defer_screenshot(self, conn, caller, window, path=None):
     client, _ = self.window(window)
+    path = screenshot_path(path or os.path.join(RUNTIME_DIR, f"window-{int(window)}.png"), caller)
     if client.grant:
       # A GPU window's buffers are opaque to the broker, so Hyprland draws it.
       self.start_job(conn, [sys.executable, os.path.abspath(__file__), "capture", str(window), path], lambda output, code: self.captured(window, path, output, code))

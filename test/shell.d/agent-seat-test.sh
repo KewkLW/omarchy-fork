@@ -714,6 +714,19 @@ draw_command geometry
 shot=$(run_broker omarchy-agent-seat-screenshot "$window") || fail "a window declaring a huge geometry still gets a screenshot"
 [[ $(python3 "$test_dir/pixels.py" "$shot") == "50x35" ]] || fail "a screenshot is only as large as what the window draws" "$(python3 "$test_dir/pixels.py" "$shot")"
 pass "a screenshot is only as large as what the window draws"
+
+mkdir -p "$test_dir/work/sub"
+ln -s "$test_dir/elsewhere.png" "$test_dir/work/link.png"
+(
+  cd "$test_dir/work/sub" || exit 1
+  [[ $(run_broker omarchy-agent-seat-screenshot "$window" --output shot.png) == "$test_dir/work/sub/shot.png" && -f shot.png ]] || fail "a screenshot can go under the current directory"
+  for output in ../../outside.png /tmp/agent-seat-test-$$.png shot.txt ../link.png missing/shot.png; do
+    run_broker omarchy-agent-seat-screenshot "$window" --output "$output" 2>/dev/null && fail "a screenshot can't go to $output"
+  done
+  exit 0
+) || exit 1
+[[ ! -e $test_dir/outside.png && ! -e /tmp/agent-seat-test-$$.png && ! -e $test_dir/elsewhere.png && ! -e $test_dir/work/sub/missing ]] || fail "refused screenshots write nothing"
+pass "a screenshot only goes under the current directory or the seat's own"
 stop_draw
 
 descriptors() {

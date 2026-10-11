@@ -6,6 +6,7 @@
 # The broker composes the image from the app's own buffers, so it works while
 # the seat's workspace is hidden and includes menus that open outside the window.
 # Pixels in the image are the coordinates omarchy agent seat pointer takes.
+# An --output path must end in .png and lie under the current directory.
 
 if (($# < 1)); then
   echo "Usage: omarchy agent seat screenshot <window> [--output <path>]" >&2
@@ -16,4 +17,5 @@ window=$1
 output="$XDG_RUNTIME_DIR/omarchy/agent-seat/window-$window.png"
 [[ $2 == "--output" ]] && output=$(realpath -m "$3")
 
-omarchy-agent-seat-broker call "$(jq -cn --argjson window "$window" --arg path "$output" '{command: "screenshot", args: {window: $window, path: $path}}')" | jq -r '.path'
+result=$(omarchy-agent-seat-broker call "$(jq -cn --argjson window "$window" --arg path "$output" '{command: "screenshot", args: {window: $window, path: $path}}')") || exit 1
+jq -r '.path' <<<"$result"
