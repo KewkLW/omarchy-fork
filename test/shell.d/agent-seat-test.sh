@@ -809,7 +809,7 @@ except OSError:
 print(sock.recv(4096).decode().strip())
 ' "$test_dir/runtime/omarchy/agent-seat/control" 2>&1)
 [[ $oversized == *"too large"* ]] || fail "an oversized request is refused" "$oversized"
-echo 2 >"$test_dir/hyprctl-delay"
+echo 1 >"$test_dir/hyprctl-delay"
 run_broker omarchy-agent-seat-windows >"$test_dir/slow-windows.json" &
 slow_windows=$!
 sleep 0.3
