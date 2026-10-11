@@ -46,7 +46,9 @@ done
 
 shopt -s nullglob
 for record in "$runtime"/sandboxes/sandbox.*; do
-  read -r supervisor_pid supervisor_start marker bwrap_pid bwrap_start <"$record" || true
+  # A sandbox that exits on its own removes its record, which can happen
+  # between the listing and the read; there is nothing left to stop then.
+  read -r supervisor_pid supervisor_start marker bwrap_pid bwrap_start 2>/dev/null <"$record" || continue
   # A PID is never enough: match its kernel start time and private command-line
   # marker as well, so a stale record cannot hit a reused PID.
   if [[ $supervisor_pid =~ ^[0-9]+$ && $supervisor_start =~ ^[0-9]+$ && -n $marker ]] && supervisor_matches "$supervisor_pid" "$supervisor_start" "$record" "$marker"; then
