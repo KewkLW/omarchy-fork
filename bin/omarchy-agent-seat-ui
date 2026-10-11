@@ -241,11 +241,11 @@ def atspi_dump(address):
 
 
 def atspi_apps(address):
-  result = subprocess.run([sys.executable, os.path.abspath(__file__), "--atspi-dump", address], capture_output=True, text=True, timeout=30)
   try:
+    result = subprocess.run([sys.executable, os.path.abspath(__file__), "--atspi-dump", address], capture_output=True, text=True, timeout=30)
     return json.loads(result.stdout)
-  except ValueError:
-    return []
+  except (subprocess.TimeoutExpired, ValueError):
+    return []  # an app that stops answering has no tree to read
 
 
 def near(a, b, slack=2):
