@@ -135,20 +135,45 @@ def automatic(window, settings):
 
 
 def authorize(window, settings, typing):
-  """Allows this command on the window or raises. "Allow once" lasts only as
-  long as this process, so nothing outside it can reuse or strand the grant."""
+  """Allows this command on the window or raises, and says on what grounds:
+  "policy", "tag" or "asked". "Allow once" lasts only as long as this process,
+  so nothing outside it can reuse or strand the grant."""
   app_class = window.get("class", "")
   if matches(settings["never_allow_classes"], app_class):
     raise PermissionError(f"drive policy never allows class {app_class!r}")
   if typing:
     refuse_if_focused(window["address"])
-  if automatic(window, settings) or has_tag(window, settings["tag"]):
-    return
+  if automatic(window, settings):
+    return "policy"
+  if has_tag(window, settings["tag"]):
+    return "tag"
   choice = ask(window)
+  if choice not in (ALLOW_ONCE, ALLOW_UNTIL_CLOSED):
+    raise PermissionError("the user did not allow this window")
+  # The user can take a while to answer; the answer is for the window they saw.
+  verify(window, settings, "asked", typing)
   if choice == ALLOW_UNTIL_CLOSED:
     tag_window(window["address"], settings["tag"])
-  elif choice != ALLOW_ONCE:
-    raise PermissionError("the user did not allow this window")
+  return "asked"
+
+
+def verify(window, settings, grant, typing):
+  """Refuses unless the window is still the one that was allowed: same app at
+  the same address, on the same workspace, still tagged if the tag was the
+  grant, and for keys, still not the window the user is typing in. Runs right
+  before every action and every batch of keys."""
+  address = window["address"]
+  current = next((other for other in clients() if other.get("address", "").lower() == address.lower()), None)
+  if current is None:
+    raise PermissionError(f"window {address} closed; stopped")
+  if current.get("stableId") != window.get("stableId") or current.get("class") != window.get("class"):
+    raise PermissionError(f"window {address} is no longer the {window.get('class')} window that was allowed; stopped")
+  if workspace_of(current) != workspace_of(window):
+    raise PermissionError(f"window {address} moved to workspace {workspace_of(current)} after it was allowed; stopped")
+  if grant == "tag" and not has_tag(current, settings["tag"]):
+    raise PermissionError(f"window {address} is no longer tagged {settings['tag']}; stopped")
+  if typing:
+    refuse_if_focused(address)
 
 
 def broker_path():
@@ -249,9 +274,10 @@ def shortcut(address, modifiers, keycode):
   return f"hl.dsp.send_shortcut({{ mods = {quote(' + '.join(modifiers))}, key = {quote(f'code:{keycode + 8}')}, window = {quote('address:' + address)} }})"
 
 
-def send(expressions):
-  """Send in batches. Hyprland answers ok even for keys it cannot deliver, so callers resolve every key first."""
+def send(expressions, check):
+  """Send in batches, calling check before each. Hyprland answers ok even for keys it cannot deliver, so callers resolve every key first."""
   for start in range(0, len(expressions), BATCH_SIZE):
+    check()
     result = run("hyprctl", "--batch", " ; ".join(f"dispatch {expression}" for expression in expressions[start : start + BATCH_SIZE]), check=False)
     replies = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if result.returncode or any(reply != "ok" for reply in replies):
@@ -266,16 +292,16 @@ def resolve(layout, key):
   return keycode, modifiers
 
 
-def type_text(address, text):
+def type_text(address, text, check):
   layout = keymap()
   missing = sorted({character for character in text if not layout.for_char(character)})
   if missing:
     raise ValueError("the keyboard layout cannot type " + ", ".join(f"{character!r} (U+{ord(character):04X})" for character in missing) + "; nothing was sent")
   keys = [resolve(layout, layout.for_char(character)) for character in text]
-  send([shortcut(address, modifiers, keycode) for keycode, modifiers in keys])
+  send([shortcut(address, modifiers, keycode) for keycode, modifiers in keys], check)
 
 
-def key_combo(address, combo):
+def key_combo(address, combo, check):
   *words, name = combo.split("+")
   if not name:
     raise ValueError("key combo is empty")
@@ -288,7 +314,7 @@ def key_combo(address, combo):
     raise ValueError(f"unknown key {name!r} in {combo!r}")
   mask = sum(layout.modifiers[MODIFIERS[word.lower()]] for word in words) | target[1]
   keycode, modifiers = resolve(layout, (target[0], mask))
-  send([shortcut(address, modifiers, keycode)])
+  send([shortcut(address, modifiers, keycode)], check)
 
 
 def capture_window(window, output):
@@ -342,14 +368,21 @@ def main():
     list_windows(settings)
     return
   window = window_at(args.address)
-  authorize(window, settings, args.command in ("type", "key"))
+  typing = args.command in ("type", "key")
+  grant = authorize(window, settings, typing)
+
+  def check():
+    verify(window, settings, grant, typing)
+
   if args.command == "screenshot":
+    check()
     capture_window(window, args.output)
   elif args.command == "type":
-    type_text(window["address"], args.text)
+    type_text(window["address"], args.text, check)
   elif args.command == "key":
-    key_combo(window["address"], args.combo)
+    key_combo(window["address"], args.combo, check)
   elif args.command == "close":
+    check()
     dispatch(f"hl.dsp.window.close({{ window = {quote('address:' + window['address'])} }})")
 
 

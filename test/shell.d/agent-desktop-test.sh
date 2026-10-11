@@ -238,3 +238,31 @@ drive close 0xa1 >/dev/null || fail "a tagged window can be closed"
 (( $(tag_changes) == 0 && $(questions) == 0 )) && [[ $(window_tags) == '["agent-drive*"]' ]] ||
   fail "a tag set by another call is never removed" "$(cat "$state/hyprctl.log")"
 pass "a tag set by another call is honoured and never removed"
+
+# Checked again right before acting -------------------------------------------
+
+reset
+set_window foot 10
+# The user moves the window off the agent workspace right after it was allowed.
+cp "$state/clients.json" "$state/clients.next.json"
+sed -i 's/"id": 10/"id": 2/' "$state/clients.next.json"
+drive type 0xa1 hi >/dev/null 2>&1 && fail "a window that moves after it was allowed is refused"
+(( $(keys_sent) == 0 )) || fail "nothing is typed into a window that moved after it was allowed"
+pass "a window that moves after it was allowed gets no keys"
+
+reset
+set_window foot 2
+echo "Allow until the window closes" >"$state/menu-answer"
+# While the user reads the menu, another app takes over the address.
+sed 's/"foot"/"1Password"/; s/"s1"/"s2"/' "$state/clients.json" >"$state/clients.next.json"
+drive type 0xa1 hi >/dev/null 2>&1 && fail "a window replaced while the user answered is refused"
+(( $(keys_sent) == 0 && $(tag_changes) == 0 )) || fail "a window replaced while the user answered gets no keys and no tag"
+pass "a window replaced while the user answered gets no keys and no tag"
+
+reset
+set_window foot 10
+# The user focuses the window while a long text is being typed.
+echo '{"address": "0xa1"}' >"$state/active.next.json"
+drive type 0xa1 "$(printf 'a%.0s' {1..300})" >/dev/null 2>&1 && fail "typing stops when the user focuses the window"
+(( $(keys_sent) == 200 )) || fail "typing stops at the batch after the user focuses the window" "$(keys_sent) keys sent"
+pass "typing stops at the next batch once the user focuses the window"
