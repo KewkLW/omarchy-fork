@@ -532,8 +532,9 @@ def main(args):
 
   directory = sandbox_of(state["pid"]) if state.get("pid") else None
   candidates = [directory] if directory else sorted(glob.glob(os.path.join(SANDBOXES, "*.d")))
-  nodes, source = None, None
+  found = []
   for candidate in candidates:
+    nodes = None
     port = cdp_port(candidate)
     if port:
       try:
@@ -543,7 +544,16 @@ def main(args):
     if not nodes and bus_address(candidate):
       nodes, source = atspi_tree(state, atspi_apps(bus_address(candidate)), not directory), "atspi"
     if nodes:
-      break
+      found.append((nodes, source))
+
+  # Without the app's pid, two sandboxes can show windows of the same title:
+  # take the one whose size matches, or refuse to guess.
+  if len(found) > 1:
+    size = [round(value * state["scale"]) for value in state["geometry"][2:]]
+    found = [f for f in found if f[1] == "cdp" or near(f[0][0]["box"][2:], size, 3)]
+    if len(found) != 1:
+      fail(f"Several apps show a window titled {state.get('title')!r} and this broker cannot tell which is window {window}. Close the others, or use omarchy agent seat screenshot {window}.")
+  nodes, source = found[0] if found else (None, None)
 
   if not nodes or len(nodes) < 2:
     fail(f"Window {window} has no accessibility tree to read (an app without one, like Wine, a game or a canvas, or Electron without --cdp). Use omarchy agent seat screenshot {window}.", 2)
