@@ -264,6 +264,7 @@ class Channel:
   def close(self):
     for fd in self.infds + [fd for _, fds in self.out for fd in fds]:
       os.close(fd)
+    self.infds, self.out = [], []
     self.sock.close()
 
 
@@ -931,6 +932,8 @@ class Broker:
     while True:
       for key, events in self.selector.select(timeout=5):
         kind, owner = key.data
+        if isinstance(owner, Client) and owner not in self.clients or isinstance(owner, Job) and owner not in self.jobs:
+          continue  # dropped or finished earlier in this round
         try:
           if kind == "wayland":
             self.accept_client(key.fileobj, owner)
@@ -971,6 +974,8 @@ class Broker:
       self.selector.modify(sock, selectors.EVENT_READ, ("client", client))
 
   def drop(self, client):
+    if client not in self.clients:
+      return
     for channel in (client.down, client.up):
       try:
         self.selector.unregister(channel.sock)

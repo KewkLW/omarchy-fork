@@ -220,6 +220,20 @@ elif step == "hidden":
     except socket.timeout:
         print("connected")
 
+elif step == "vanish":
+    # Hang up while Hyprland's answer to this app is on its way, so the broker
+    # finds both of the app's sockets ready at once.
+    import signal, time
+    broker = int(sys.argv[3])
+    conn.send(message(1, 0, struct.pack("<I", 999)))  # answered late
+    time.sleep(0.2)
+    os.kill(broker, signal.SIGSTOP)
+    try:
+        time.sleep(0.8)
+        sock.close()
+    finally:
+        os.kill(broker, signal.SIGCONT)
+
 elif step == "seat":
     bind("wl_seat", 7, 4)
     for object_id, opcode, body in roundtrip(5):
@@ -386,6 +400,14 @@ pass "the agent can't read or set the user's clipboard"
 run_broker omarchy-agent-seat-type 1 "é" 2>/dev/null && fail "untypeable text is refused"
 run_broker omarchy-agent-seat-type 1 --key hyper+x 2>/dev/null && fail "unknown modifiers are refused"
 pass "bad keys are refused"
+
+broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
+
+python3 "$test_dir/app.py" "$socket" vanish "$broker"
+sleep 0.2
+kill -0 "$broker" 2>/dev/null || fail "an app hanging up with an event in flight leaves the broker running" "$(cat "$test_dir/broker.log")"
+[[ $(python3 "$test_dir/app.py" "$socket" globals) == *wl_seat* ]] || fail "the broker still serves apps after one hangs up mid-event"
+pass "an app hanging up with an event in flight leaves the broker running"
 
 sandbox_marker="agent-seat-test-$$"
 run_broker omarchy-agent-seat-run --no-wait /usr/bin/bash -c '/usr/bin/sleep 300 & /usr/bin/sleep 300' "$sandbox_marker" || fail "a headless sandbox starts"
