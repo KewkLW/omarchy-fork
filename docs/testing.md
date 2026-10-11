@@ -99,6 +99,8 @@ Gate only what needs gating — put `require_compositor` in files whose runtime
 half needs a live session, and keep static analysis of the same area in code
 that runs unconditionally before or beside it.
 
+The runner routes a file to the private compositor only when a line starts with `require_compositor` or `require_quickshell`. A file that gates itself inline with `compositor_reachable` stays in the other group and keeps the caller's `WAYLAND_DISPLAY`, so anything it draws opens on the desktop. A file that opens a window therefore calls `require_compositor` at the start of a line, in a file of its own when the rest should run everywhere, as `agent-seat-ui-gtk-test.sh` does beside `agent-seat-ui-test.sh`.
+
 ## Performance guards
 
 A handful of tests fail when a fast path gets slow again. Each prefers a count that is the same on every machine over a wall-clock time. Where it has to time something it takes the fastest of several runs, and either compares two paths timed in the same run or scales its budget with `process_speed_percent` from `base-test.sh`: how long 100 fork/execs take here against the 25ms they take on the laptop the budgets were set on. A machine more than 8x slower skips the timing (`require_comparable_speed`) rather than guess.
