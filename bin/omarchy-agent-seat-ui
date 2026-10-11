@@ -20,6 +20,7 @@
 
 import base64
 import glob
+import html
 import json
 import os
 import re
@@ -406,9 +407,11 @@ def cdp_target(port, title, strict):
     targets = [t for t in json.load(response) if t.get("type") == "page" and t.get("webSocketDebuggerUrl") and not t.get("url", "").startswith("devtools://")]
   if not targets:
     return None
-  # A browser window is titled after its active tab.
+  # A browser window is titled after its active tab. DevTools reports titles
+  # HTML-escaped ("&amp;" for "&"), the window title is plain text.
   for target in targets:
-    if target.get("title") and title and (title == target["title"] or title.startswith(target["title"] + " - ")):
+    name = html.unescape(target.get("title") or "")
+    if name and title and (title == name or title.startswith(name + " - ")):
       return target
   return None if strict else targets[0]
 

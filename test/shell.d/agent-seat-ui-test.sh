@@ -225,7 +225,11 @@ while True:
     head, rest = request.split(b"\r\n\r\n", 1)
     lines = head.decode().split("\r\n")
     if lines[0].startswith("GET /json/list"):
-        body = json.dumps([{"type": "page", "title": "Fake page", "url": "https://example.org", "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/1"}]).encode()
+        # DevTools reports titles HTML-escaped.
+        body = json.dumps([
+            {"type": "page", "title": "Fake page", "url": "https://example.org", "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/1"},
+            {"type": "page", "title": "Q&amp;A &lt;draft&gt; &quot;one&quot; &#39;two&#39;", "url": "https://example.org/qa", "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/2"},
+        ]).encode()
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
         conn.close()
         continue
@@ -286,6 +290,21 @@ pass "the DevTools route positions controls in screenshot pixels"
 [[ $(jq -r '.box[0].value' <<<"$cdp") == "hi" && $(jq -r '.box[0].states[0]' <<<"$cdp") == "focused" ]] || fail "the DevTools route reports values and focus" "$cdp"
 jq -r '.listing[]' <<<"$cdp" | grep -qx 'textbox "Message" = "hi" @525,60 \[focused\]' || fail "the DevTools route lists controls for people" "$cdp"
 pass "the DevTools route reports values and focus"
+
+escaped=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" "$cdp_port" <<'EOF'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("seat_ui", loader)
+ui = importlib.util.module_from_spec(spec)
+loader.exec_module(ui)
+title = "Q&A <draft> \"one\" 'two' - Chromium"
+for strict in (True, False):
+  target = ui.cdp_target(int(sys.argv[2]), title, strict)
+  print(target and target["url"])
+EOF
+)
+[[ $escaped == $'https://example.org/qa\nhttps://example.org/qa' ]] || fail "a tab whose DevTools title is HTML-escaped matches its window" "$escaped"
+pass "a tab whose DevTools title is HTML-escaped matches its window"
 
 # Stopping ----------------------------------------------------------------------------
 
