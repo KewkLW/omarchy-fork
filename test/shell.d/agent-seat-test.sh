@@ -332,10 +332,15 @@ elif step == "window":
         conn.send(message(12, 1, struct.pack("<II", 20, serial)))
         print(f"pasted:{data.decode()}", flush=True)
 
+    # The app runs until the test has nothing more for it: the broker going
+    # quiet for a while ends it as cleanly as the broker hanging up.
     def events():
         yield from early
-        while (msg := conn.read(timeout=5)) is not None:
-            yield msg
+        try:
+            while (msg := conn.read(timeout=5)) is not None:
+                yield msg
+        except TimeoutError:
+            return
 
     for object_id, opcode, body in events():
         if object_id == 8 and opcode == 1:
