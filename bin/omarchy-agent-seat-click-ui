@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# omarchy:group=agent
+# omarchy:name=seat click-ui
 # omarchy:summary=Click a control in an agent seat window by its name
 # omarchy:args=<window> <name> | <window> <role>:<name> [--button left|right|middle] [--double]
 # omarchy:examples=omarchy agent seat click-ui 1 Save | omarchy agent seat click-ui 1 "push button:OK" | omarchy agent seat click-ui 1 link:Docs --double
