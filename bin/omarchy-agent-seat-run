@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # omarchy:summary=Launch a sandboxed app on the agent seat and print its agent window number
-# omarchy:args=[--no-wait] [--gpu] [--share <path>] [--share-ro <path>] <command> [args...]
+# omarchy:args=[--no-wait] [--gpu] [--cdp] [--share <path>] [--share-ro <path>] <command> [args...]
 # omarchy:examples=omarchy agent seat run chromium https://omarchy.org | omarchy agent seat run foot | omarchy agent seat run --gpu vkcube | omarchy agent seat run --share ~/Projects/site chromium ~/Projects/site/index.html
 
 # The app runs in a bubblewrap sandbox whose only way to the desktop is the
@@ -13,6 +13,9 @@
 # (once, or for the rest of the session). Only then does the app get the GPU
 # devices, and a broker socket of its own that also offers GPU buffers.
 #
+# --cdp starts a Chromium or Electron app with its DevTools protocol on a free
+# localhost port, which omarchy agent seat ui reads its page through.
+#
 # --share and --share-ro hand the app one of the user's files or directories,
 # read-write or read-only, at the same path. The seat asks nothing of its own
 # here: sharing is part of the command, so the agent's own permission rules
@@ -20,11 +23,13 @@
 
 wait_for_window=true
 gpu=false
+cdp=false
 shares=()
 while [[ $1 == --* ]]; do
   case $1 in
     --no-wait) wait_for_window=false ;;
     --gpu) gpu=true ;;
+    --cdp) cdp=true ;;
     --share | --share-ro)
       if ! path=$(realpath -e -- "${2:-}" 2>/dev/null); then
         echo "Nothing to share at ${2:-(no path given)}" >&2
@@ -46,7 +51,7 @@ while [[ $1 == --* ]]; do
 done
 
 if (($# == 0)); then
-  echo "Usage: omarchy agent seat run [--no-wait] [--gpu] [--share <path>] [--share-ro <path>] <command> [args...]" >&2
+  echo "Usage: omarchy agent seat run [--no-wait] [--gpu] [--cdp] [--share <path>] [--share-ro <path>] <command> [args...]" >&2
   exit 1
 fi
 
@@ -132,6 +137,11 @@ sandbox+=(
   --setenv GTK_A11Y atspi --setenv NO_AT_BRIDGE 0 --setenv QT_LINUX_ACCESSIBILITY_ALWAYS_ON 1
 )
 set -- /run/omarchy-agent-seat-init "$@"
+if [[ $cdp == "true" ]]; then
+  port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  echo "$port" >"$session/cdp-port"
+  set -- "$@" "--remote-debugging-port=$port"
+fi
 setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 9>&- &
 supervisor_pid=$!
 for _ in {1..50}; do

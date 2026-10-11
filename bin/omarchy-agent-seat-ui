@@ -1,0 +1,560 @@
+#!/usr/bin/python3
+
+# omarchy:summary=Read the controls of an agent seat window by name, role and position
+# omarchy:args=<window> [--json] [--find <name> | --find <role>:<name>]
+# omarchy:examples=omarchy agent seat ui 1 | omarchy agent seat ui 1 --find button:Save --json
+
+# Lists what an app on the agent seat shows, from its accessibility tree rather
+# than its pixels: each control's role, name, value and state, and its centre
+# in the pixels omarchy agent seat pointer takes (those of the window's last
+# screenshot). GTK and Qt apps publish the tree on their sandbox's private bus;
+# Chromium and Electron apps launched with omarchy agent seat run --cdp are read
+# over the DevTools protocol instead, which knows the page far better.
+#
+# --find resolves one control: an exact name, then a case-insensitive one, then
+# a unique substring, optionally narrowed by role ("button:Save"). Several
+# matches list the candidates and exit 1.
+#
+# Exits 2 when the window has no tree to read (Wine, games, canvas apps, or an
+# Electron app without --cdp): take a screenshot instead.
+
+import base64
+import glob
+import json
+import os
+import re
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy", "agent-seat")
+SANDBOXES = os.path.join(RUNTIME_DIR, "sandboxes")
+MAX_NODES = 5000
+
+# Roles worth listing even without a name: what an agent can act on.
+ACTIONABLE = {
+  "push button", "toggle button", "check box", "radio button", "text", "entry", "password text", "combo box", "menu item",
+  "check menu item", "radio menu item", "link", "slider", "spin button", "page tab", "list item", "tree item", "table cell",
+  "button", "textbox", "searchbox", "checkbox", "radio", "combobox", "menuitem", "menuitemcheckbox", "menuitemradio",
+  "option", "switch", "tab", "treeitem", "spinbutton", "listbox", "textarea",
+}
+POPUP_ROLES = {"window", "menu", "popup menu", "tool tip", "tooltip", "combo box", "list"}
+STATES = ("focused", "checked", "pressed", "selected", "expanded", "collapsed", "editable")
+
+
+def fail(message, code=1):
+  print(message, file=sys.stderr)
+  sys.exit(code)
+
+
+def broker(request):
+  result = subprocess.run(["omarchy-agent-seat-broker", "call", json.dumps(request)], capture_output=True, text=True)
+  if result.returncode != 0:
+    raise RuntimeError(result.stderr.strip() or "The agent seat broker is not running")
+  return json.loads(result.stdout)
+
+
+# The window as the broker knows it ------------------------------------------------
+
+
+def window_state(window):
+  """Geometry, scale, the last screenshot's origin and the app's pid of one seat window."""
+  try:
+    return broker({"command": "state", "args": {"window": window}})["windows"][0]
+  except RuntimeError as error:
+    if "do_state" not in str(error) and "has no attribute" not in str(error):
+      fail(str(error))
+
+  # A broker from before the state command: take its size from the window list
+  # and its scale from a fresh screenshot, whose origin is then the window's.
+  try:
+    found = [w for w in broker({"command": "windows"})["windows"] if w["window"] == window]
+  except RuntimeError as error:
+    fail(str(error))
+  if not found:
+    fail(f"no agent window {window}")
+  info = found[0]
+  path = os.path.join(RUNTIME_DIR, f"window-{window}.png")
+  shot = broker({"command": "screenshot", "args": {"window": window, "path": path}})
+  width, height = info["size"] or (shot["width"], shot["height"])
+  # A popup hanging outside the window widens the image; fractional scales
+  # are multiples of 1/120.
+  scale = round(min(shot["width"] / width, shot["height"] / height) * 120) / 120 if width and height else 1
+  popups = [{"position": popup[:2], "size": popup[2:]} for popup in info.get("popups") or []]
+  return {**info, "popups": popups, "pid": None, "geometry": [0, 0, width, height], "surface": [width, height], "scale": scale, "origin": [0, 0, scale], "drawn": True}
+
+
+def process_start_time(pid):
+  try:
+    with open(f"/proc/{pid}/stat") as stat:
+      return stat.read().rsplit(") ", 1)[1].split()[19]
+  except (OSError, IndexError):
+    return None
+
+
+def parent(pid):
+  try:
+    with open(f"/proc/{pid}/stat") as stat:
+      return int(stat.read().rsplit(") ", 1)[1].split()[1])
+  except (OSError, IndexError, ValueError):
+    return 0
+
+
+def sandboxes():
+  """Live sandboxes as {supervisor pid: their directory}."""
+  found = {}
+  for record in glob.glob(os.path.join(SANDBOXES, "sandbox.*")):
+    try:
+      with open(record) as data:
+        pid, start, marker = data.read().split()[:3]
+    except (OSError, ValueError):
+      continue
+    if re.fullmatch(r"[A-Za-z0-9]+", marker) and process_start_time(pid) == start:
+      found[int(pid)] = os.path.join(SANDBOXES, f"{marker}.d")
+  return found
+
+
+def sandbox_of(pid):
+  """The directory of the sandbox an app's process runs in, found through its parents.
+
+  An app cannot change its ancestry, so it cannot point the seat at another
+  sandbox's bus.
+  """
+  supervisors = sandboxes()
+  while pid and pid > 1:
+    if pid in supervisors:
+      return supervisors[pid]
+    pid = parent(pid)
+  return None
+
+
+def bus_address(directory):
+  path = os.path.join(directory, "bus", "bus")
+  try:
+    # The directory is the sandbox's to write in: never follow a link out of it.
+    if not stat.S_ISSOCK(os.lstat(path).st_mode):
+      return None
+  except OSError:
+    return None
+  return f"unix:path={path}"
+
+
+def cdp_port(directory):
+  try:
+    with open(os.path.join(directory, "cdp-port")) as data:
+      return int(data.read().strip())
+  except (OSError, ValueError):
+    return None
+
+
+# Coordinates ------------------------------------------------------------------------
+
+
+class Space:
+  """Logical window coordinates (from the window geometry's corner) to screenshot pixels."""
+
+  def __init__(self, state):
+    self.left, self.top, self.scale = state["origin"]
+
+  def box(self, x, y, width, height):
+    return [round((x - self.left) * self.scale), round((y - self.top) * self.scale), round(width * self.scale), round(height * self.scale)]
+
+
+def node(role, name, value, states, box, depth):
+  return {"role": role, "name": name, "value": value, "states": states, "x": box[0] + box[2] // 2, "y": box[1] + box[3] // 2, "box": box, "depth": depth}
+
+
+# AT-SPI ----------------------------------------------------------------------------
+
+
+def atspi_dump(address):
+  """Every showing window of every app on one sandbox bus, as JSON on stdout.
+
+  Runs in a process of its own: libatspi reads its bus address once.
+  """
+  os.environ["AT_SPI_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"] = address
+  import gi
+
+  gi.require_version("Atspi", "2.0")
+  from gi.repository import Atspi
+
+  Atspi.init()
+  Atspi.set_timeout(2000, 2000)
+  count = 0
+
+  def dump(accessible):
+    nonlocal count
+    count += 1
+    try:
+      states = accessible.get_state_set()
+      if not states.contains(Atspi.StateType.SHOWING):
+        return None
+      extents = accessible.get_extents(Atspi.CoordType.WINDOW)
+      role = accessible.get_role_name()
+      interfaces = accessible.get_interfaces()
+      value = None
+      try:
+        if "Text" in interfaces and (states.contains(Atspi.StateType.EDITABLE) or role in ("text", "entry")) and role != "password text":
+          value = Atspi.Text.get_text(accessible, 0, min(Atspi.Text.get_character_count(accessible), 4000))
+        elif "Value" in interfaces:
+          value = Atspi.Value.get_current_value(accessible)
+      except Exception:
+        pass
+      flags = [name for name in STATES if states.contains(getattr(Atspi.StateType, name.upper()))]
+      if not states.contains(Atspi.StateType.ENABLED) and not states.contains(Atspi.StateType.SENSITIVE):
+        flags.append("disabled")
+      children = []
+      for index in range(accessible.get_child_count()):
+        if count >= MAX_NODES:
+          break
+        child = accessible.get_child_at_index(index)
+        if child:
+          dumped = dump(child)
+          if dumped:
+            children.append(dumped)
+      return {"role": role, "name": accessible.get_name() or "", "value": value, "states": flags, "extents": [extents.x, extents.y, extents.width, extents.height], "children": children}
+    except Exception:
+      return None
+
+  desktop = Atspi.get_desktop(0)
+  apps = []
+  for index in range(desktop.get_child_count()):
+    app = desktop.get_child_at_index(index)
+    if not app:
+      continue
+    windows = []
+    for window in range(app.get_child_count()):
+      dumped = dump(app.get_child_at_index(window))
+      if dumped:
+        windows.append(dumped)
+    apps.append({"name": app.get_name() or "", "windows": windows})
+  print(json.dumps(apps))
+
+
+def atspi_apps(address):
+  result = subprocess.run([sys.executable, os.path.abspath(__file__), "--atspi-dump", address], capture_output=True, text=True, timeout=30)
+  try:
+    return json.loads(result.stdout)
+  except ValueError:
+    return []
+
+
+def near(a, b, slack=2):
+  return abs(a[0] - b[0]) <= slack and abs(a[1] - b[1]) <= slack
+
+
+def atspi_tree(state, apps, strict):
+  """The window's nodes, or None when no app on the bus shows a matching window."""
+  space = Space(state)
+  gx, gy, gw, gh = state["geometry"]
+  surface = state.get("surface") or [gw, gh]
+  windows = [window for app in apps for window in app["windows"]]
+  if not windows:
+    return None
+
+  def matches(window):
+    return window["extents"][2:] and (near(window["extents"][2:], (gw, gh)) or near(window["extents"][2:], surface))
+
+  # Without the app's pid every sandbox is a candidate, so only the title counts.
+  main = next((w for w in windows if w["name"] == state.get("title") and matches(w)), None) or next((w for w in windows if w["name"] == state.get("title")), None)
+  if not main and not strict:
+    main = next((w for w in windows if matches(w)), None)
+  if not main:
+    return None
+
+  # Coordinates are relative to the app's own surface. Toolkits that report the
+  # window at the surface's size include the shadow around it; the geometry's
+  # corner sits inside that.
+  fx, fy, fw, fh = main["extents"]
+  offset = (gx, gy) if near((fw, fh), surface) and not near((fw, fh), (gw, gh)) else (fx, fy)
+  nodes = []
+  flatten(main, offset, space, nodes, 0)
+
+  # Menus and other popups are windows of their own, placed where the broker
+  # says a popup of their size is.
+  for popup in state.get("popups", []):
+    position, size = popup["position"], popup["size"]
+    for window in windows:
+      if window is not main and window["role"] in POPUP_ROLES and near(window["extents"][2:], size):
+        flatten(window, (window["extents"][0] - position[0], window["extents"][1] - position[1]), space, nodes, 0)
+        break
+  return nodes
+
+
+def flatten(accessible, offset, space, nodes, depth, parent_name=None):
+  x, y, width, height = accessible["extents"]
+  named = (accessible["name"] and accessible["name"] != parent_name) or accessible["value"] not in (None, "")
+  shown = width > 0 and height > 0 and x > -1000000 and y > -1000000
+  if shown and (named or accessible["role"] in ACTIONABLE or depth == 0):
+    box = space.box(x - offset[0], y - offset[1], width, height)
+    nodes.append(node(accessible["role"], accessible["name"], accessible["value"], accessible["states"], box, depth))
+    depth += 1
+  for child in accessible["children"]:
+    flatten(child, offset, space, nodes, depth, accessible["name"] or parent_name)
+
+
+# Chrome DevTools protocol ---------------------------------------------------------
+
+
+class WebSocket:
+  """Just enough of RFC 6455 for one DevTools connection."""
+
+  def __init__(self, url, timeout=10):
+    parts = urllib.parse.urlsplit(url)
+    self.sock = socket.create_connection((parts.hostname, parts.port or 80), timeout)
+    key = base64.b64encode(os.urandom(16)).decode()
+    self.sock.sendall(f"GET {parts.path or '/'} HTTP/1.1\r\nHost: {parts.netloc}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
+    self.buffer = b""
+    while b"\r\n\r\n" not in self.buffer:
+      self.buffer += self.recv()
+    head, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+    if b" 101 " not in head.split(b"\r\n")[0] + b" ":
+      raise ConnectionError(head.split(b"\r\n")[0].decode(errors="replace"))
+
+  def recv(self):
+    chunk = self.sock.recv(65536)
+    if not chunk:
+      raise ConnectionError("DevTools hung up")
+    return chunk
+
+  def read(self, count):
+    while len(self.buffer) < count:
+      self.buffer += self.recv()
+    data, self.buffer = self.buffer[:count], self.buffer[count:]
+    return data
+
+  def send(self, text):
+    data, mask = text.encode(), os.urandom(4)
+    length = len(data)
+    header = bytes([0x81]) + (bytes([0x80 | length]) if length < 126 else bytes([0xFE]) + struct.pack(">H", length) if length < 65536 else bytes([0xFF]) + struct.pack(">Q", length))
+    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
+    self.sock.sendall(header + mask + masked)
+
+  def receive(self):
+    message = b""
+    while True:
+      first, second = self.read(2)
+      length = second & 0x7F
+      if length == 126:
+        length = struct.unpack(">H", self.read(2))[0]
+      elif length == 127:
+        length = struct.unpack(">Q", self.read(8))[0]
+      mask = self.read(4) if second & 0x80 else None
+      payload = self.read(length)
+      if mask:
+        payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+      opcode = first & 0x0F
+      if opcode == 8:
+        raise ConnectionError("DevTools closed the connection")
+      if opcode in (0, 1, 2):
+        message += payload
+        if first & 0x80:
+          return message.decode(errors="replace")
+
+
+class DevTools:
+  def __init__(self, url):
+    self.socket = WebSocket(url)
+    self.next_id = 0
+
+  def send(self, method, params=None):
+    self.next_id += 1
+    self.socket.send(json.dumps({"id": self.next_id, "method": method, "params": params or {}}))
+    return self.next_id
+
+  def collect(self, ids):
+    """Answers to the requests in ids, which may all be in flight at once."""
+    waiting, answers = set(ids), {}
+    while waiting:
+      message = json.loads(self.socket.receive())
+      if message.get("id") in waiting:
+        waiting.discard(message["id"])
+        answers[message["id"]] = message
+    return answers
+
+  def call(self, method, params=None):
+    request = self.send(method, params)
+    answer = self.collect([request])[request]
+    if "error" in answer:
+      raise RuntimeError(f"{method}: {answer['error'].get('message')}")
+    return answer["result"]
+
+
+def cdp_target(port, title, strict):
+  with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5) as response:
+    targets = [t for t in json.load(response) if t.get("type") == "page" and t.get("webSocketDebuggerUrl") and not t.get("url", "").startswith("devtools://")]
+  if not targets:
+    return None
+  # A browser window is titled after its active tab.
+  for target in targets:
+    if target.get("title") and title and (title == target["title"] or title.startswith(target["title"] + " - ")):
+      return target
+  return None if strict else targets[0]
+
+
+def cdp_tree(state, port, strict):
+  target = cdp_target(port, state.get("title", ""), strict)
+  if not target:
+    return None
+  devtools = DevTools(target["webSocketDebuggerUrl"])
+  space = Space(state)
+  gx, gy, gw, gh = state["geometry"]
+  metrics = json.loads(devtools.call("Runtime.evaluate", {"expression": "JSON.stringify([innerWidth, innerHeight, devicePixelRatio])", "returnByValue": True})["result"]["value"])
+  inner_width, inner_height, ratio = metrics
+
+  # CSS pixels to logical ones, and where the page sits in the window: browser
+  # chrome goes above it, an Electron app's page fills the window.
+  zoom = ratio / space.scale if space.scale else 1
+  top = max(0, gh - inner_height * zoom)
+  left = max(0, (gw - inner_width * zoom) / 2)
+
+  tree = devtools.call("Accessibility.getFullAXTree")["nodes"]
+  by_id = {n["nodeId"]: n for n in tree}
+
+  # Document order, from the root down.
+  ordered, seen = [], set()
+  stack = [n for n in reversed(tree) if not n.get("parentId") or n["parentId"] not in by_id]
+  while stack:
+    item = stack.pop()
+    if item["nodeId"] in seen:
+      continue
+    seen.add(item["nodeId"])
+    ordered.append(item)
+    stack += [by_id[child] for child in reversed(item.get("childIds", [])) if child in by_id]
+
+  wanted = []
+  for item in ordered:
+    role = (item.get("role") or {}).get("value", "")
+    name = (item.get("name") or {}).get("value", "") or ""
+    value = (item.get("value") or {}).get("value")
+    if item.get("ignored") or role in ("InlineTextBox", "none", "LineBreak") or not item.get("backendDOMNodeId"):
+      continue
+    if role == "StaticText" and (by_id.get(item.get("parentId")) or {}).get("name", {}).get("value") == name:
+      continue  # repeats its parent's name
+    if name or value not in (None, "") or role.lower() in ACTIONABLE or role == "RootWebArea":
+      wanted.append(item)
+  requests = {devtools.send("DOM.getBoxModel", {"backendNodeId": item["backendDOMNodeId"]}): item for item in wanted[:MAX_NODES]}
+  answers = devtools.collect(requests)
+
+  nodes = []
+  for request, item in requests.items():
+    model = answers[request].get("result", {}).get("model")
+    if not model:
+      continue
+    quad = model["border"]
+    xs, ys = quad[0::2], quad[1::2]
+    x, y, width, height = min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)
+    if width <= 0 or height <= 0 or x + width <= 0 or y + height <= 0 or x >= inner_width or y >= inner_height:
+      continue  # scrolled out of view
+    properties = {p["name"]: (p.get("value") or {}).get("value") for p in item.get("properties", [])}
+    flags = [name for name in STATES if properties.get(name) in (True, "true", "mixed")]
+    if properties.get("expanded") is False:
+      flags.append("collapsed")
+    if properties.get("disabled"):
+      flags.append("disabled")
+    role = item["role"]["value"]
+    box = space.box(left + x * zoom, top + y * zoom, width * zoom, height * zoom)
+    value = (item.get("value") or {}).get("value")
+    nodes.append({**node(role, (item.get("name") or {}).get("value", "") or "", value if role != "textbox" or not properties.get("protected") else None, flags, box, 0), "id": item["nodeId"]})
+
+  # Indent by listed ancestors only, like the AT-SPI listing.
+  listed = {item["id"] for item in nodes}
+  for item in nodes:
+    level, parent = 0, by_id.get(by_id[item.pop("id")].get("parentId"))
+    while parent:
+      level += parent["nodeId"] in listed
+      parent = by_id.get(parent.get("parentId"))
+    item["depth"] = level
+  return nodes
+
+
+# Finding one control ---------------------------------------------------------------
+
+
+def find(nodes, query):
+  role = None
+  roles = {n["role"].lower() for n in nodes}
+  if ":" in query:
+    prefix, rest = query.split(":", 1)
+    if prefix.strip().lower() in roles or any(r.split()[-1] == prefix.strip().lower() for r in roles if r):
+      role, query = prefix.strip().lower(), rest.strip()
+
+  candidates = [n for n in nodes if not role or n["role"].lower() == role or n["role"].lower().split()[-1:] == [role]]
+  if role and not query:
+    return candidates
+  for test in (lambda name: name == query, lambda name: name.lower() == query.lower(), lambda name: query.lower() in name.lower()):
+    found = [n for n in candidates if n["name"] and test(n["name"])]
+    # A control nested in one of the same name and place (a menu button's
+    # toggle) is one target: click the innermost.
+    if found and all(abs(n["x"] - found[0]["x"]) <= 4 and abs(n["y"] - found[0]["y"]) <= 4 for n in found):
+      return [max(found, key=lambda n: n["depth"])]
+    if found:
+      return found
+  return []
+
+
+def describe(item):
+  value = f" = {json.dumps(item['value'])}" if item["value"] not in (None, "") else ""
+  states = f" [{', '.join(item['states'])}]" if item["states"] else ""
+  return f"{item['role']} {json.dumps(item['name'])}{value} @{item['x']},{item['y']}{states}"
+
+
+def main(args):
+  if len(args) >= 2 and args[0] == "--atspi-dump":
+    atspi_dump(args[1])
+    return
+
+  as_json, query, positional = False, None, []
+  while args:
+    arg = args.pop(0)
+    if arg == "--json":
+      as_json = True
+    elif arg == "--find" and args:
+      query = args.pop(0)
+    else:
+      positional.append(arg)
+  if len(positional) != 1 or not positional[0].isdigit():
+    fail("Usage: omarchy agent seat ui <window> [--json] [--find <name> | --find <role>:<name>]")
+  window = int(positional[0])
+
+  state = window_state(window)
+  if not state.get("drawn"):
+    fail(f"Window {window} has not drawn anything yet", 2)
+
+  directory = sandbox_of(state["pid"]) if state.get("pid") else None
+  candidates = [directory] if directory else sorted(glob.glob(os.path.join(SANDBOXES, "*.d")))
+  nodes, source = None, None
+  for candidate in candidates:
+    port = cdp_port(candidate)
+    if port:
+      try:
+        nodes, source = cdp_tree(state, port, not directory), "cdp"
+      except (OSError, ValueError, RuntimeError, ConnectionError, KeyError) as error:
+        print(f"DevTools on port {port} did not answer: {error}", file=sys.stderr)
+    if not nodes and bus_address(candidate):
+      nodes, source = atspi_tree(state, atspi_apps(bus_address(candidate)), not directory), "atspi"
+    if nodes:
+      break
+
+  if not nodes or len(nodes) < 2:
+    fail(f"Window {window} has no accessibility tree to read (an app without one, like Wine, a game or a canvas, or Electron without --cdp). Use omarchy agent seat screenshot {window}.", 2)
+
+  if query is not None:
+    found = find(nodes, query)
+    if len(found) != 1:
+      fail(f"No control matches {query!r} in window {window}" if not found else f"{len(found)} controls match {query!r} in window {window}:\n" + "\n".join("  " + describe(n) for n in found))
+    nodes = found
+
+  if as_json:
+    print(json.dumps(nodes[0] if query is not None else {"window": window, "source": source, "size": [round(v * state["scale"]) for v in state["geometry"][2:]], "nodes": nodes}))
+  else:
+    for item in nodes:
+      print("  " * (0 if query is not None else item["depth"]) + describe(item))
+
+
+if __name__ == "__main__":
+  main(sys.argv[1:])
