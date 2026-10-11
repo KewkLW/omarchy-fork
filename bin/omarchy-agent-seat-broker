@@ -435,6 +435,10 @@ class Client:
     self.user_keyboard = None  # where the user's seat has keyboard focus in this app
     self.user_pointer = None  # (surface, x, y) of the user's pointer in this app
     self.last_actor = None  # "user" or "agent": whose input this app saw last
+    # Recent serials of the user's input to this app. Only these can set the
+    # clipboard or start a grab: Hyprland's serials are sequential, so one
+    # seen by any other app is easy to guess.
+    self.user_serials = collections.deque(maxlen=256)
 
   # Plumbing
 
@@ -525,10 +529,10 @@ class Client:
     return self.user_keyboard is not None and self.last_actor == "user"
 
   def request_wl_data_device_set_selection(self, _, args):
-    return args[1] in self.broker.user_serials
+    return args[1] in self.user_serials
 
   def request_wl_data_device_start_drag(self, _, args):
-    return args[3] in self.broker.user_serials
+    return args[3] in self.user_serials
 
   def request_wl_seat_get_pointer(self, _, args):
     self.pointers[args[0]] = None
@@ -548,19 +552,19 @@ class Client:
   # work without a grab).
 
   def request_wl_pointer_set_cursor(self, _, args):
-    return args[0] in self.broker.user_serials
+    return args[0] in self.user_serials
 
   def request_xdg_popup_grab(self, _, args):
-    return args[1] in self.broker.user_serials
+    return args[1] in self.user_serials
 
   def request_xdg_toplevel_move(self, _, args):
-    return args[1] in self.broker.user_serials
+    return args[1] in self.user_serials
 
   def request_xdg_toplevel_resize(self, _, args):
-    return args[1] in self.broker.user_serials
+    return args[1] in self.user_serials
 
   def request_xdg_toplevel_show_window_menu(self, _, args):
-    return args[1] in self.broker.user_serials
+    return args[1] in self.user_serials
 
   def request_xdg_toplevel_set_app_id(self, toplevel, args):
     window = self.toplevels[toplevel]
@@ -741,7 +745,7 @@ class Client:
     return True
 
   def event_wl_keyboard_enter(self, keyboard, args):
-    self.broker.user_serials.append(args[0])
+    self.user_serials.append(args[0])
     self.user_keyboard = args[1]
     self.last_actor = "user"
     self.focus_keyboard(keyboard, args[1], args[0])
@@ -755,7 +759,7 @@ class Client:
     return True
 
   def event_wl_keyboard_key(self, keyboard, args):
-    self.broker.user_serials.append(args[0])
+    self.user_serials.append(args[0])
     self.last_actor = "user"
     if self.user_keyboard:
       self.focus_keyboard(keyboard, self.user_keyboard)
@@ -765,7 +769,7 @@ class Client:
     return self.event_wl_keyboard_key(keyboard, args)
 
   def event_wl_pointer_enter(self, pointer, args):
-    self.broker.user_serials.append(args[0])
+    self.user_serials.append(args[0])
     self.user_pointer = (args[1], args[2], args[3])
     self.focus_pointer(pointer, *self.user_pointer, args[0])
     return False
@@ -784,7 +788,7 @@ class Client:
     return True
 
   def event_wl_pointer_button(self, _, args):
-    self.broker.user_serials.append(args[0])
+    self.user_serials.append(args[0])
     self.last_actor = "user"
     return True
 
@@ -957,7 +961,6 @@ class Broker:
     self.windows = {}
     self.next_window = 1
     self.serial = 0x40000000  # kept apart from Hyprland's serials
-    self.user_serials = collections.deque(maxlen=256)  # recent serials from the user's seat
     self.stopping = False
     self.paused = []  # (when to resume, listener, selector data) of listeners out of descriptors
     self.captures = {}  # window -> (left, top, scale) of its last screenshot

@@ -270,6 +270,16 @@ elif step == "syncflood":
         print("blocked", flush=True)
     time.sleep(0.5)
 
+elif step == "thief":
+    # Set the clipboard with serials of the user's input to another app.
+    bind("wl_seat", 7, 4)
+    bind("wl_data_device_manager", 3, 5)
+    conn.send(message(5, 1, struct.pack("<II", 6, 4)))  # data device
+    conn.send(message(5, 0, struct.pack("<I", 7)))  # data source
+    for serial in (900, 901, 902):
+        conn.send(message(6, 1, struct.pack("<II", 7, serial)))
+    roundtrip(8)
+
 elif step == "seat":
     bind("wl_seat", 7, 4)
     for object_id, opcode, body in roundtrip(5):
@@ -625,6 +635,10 @@ read -r -t 5 pasted <&"${APP[0]}"
 (( $(grep -c "^receive$" "$test_dir/compositor.log") == 1 )) || fail "the agent's paste never reaches Hyprland"
 (( $(grep -c "^set_selection" "$test_dir/compositor.log") == 1 )) || fail "the agent can't set the user's clipboard" "$(cat "$test_dir/compositor.log")"
 pass "the agent can't read or set the user's clipboard"
+
+python3 "$test_dir/app.py" "$socket" thief
+(( $(grep -c "^set_selection" "$test_dir/compositor.log") == 1 )) || fail "an app can't set the clipboard with serials of the user's input to another app" "$(cat "$test_dir/compositor.log")"
+pass "an app can't set the clipboard with serials of the user's input to another app"
 
 run_broker omarchy-agent-seat-type 1 "é" 2>/dev/null && fail "untypeable text is refused"
 run_broker omarchy-agent-seat-type 1 --key hyper+x 2>/dev/null && fail "unknown modifiers are refused"
