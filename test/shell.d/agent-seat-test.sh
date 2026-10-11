@@ -295,6 +295,199 @@ elif step == "window":
             paste_and_copy(pending.pop(0))
 EOF
 
+# An agent app that draws: a window with a subsurface and a popup in shared
+# memory, or one large window whose pool keeps shrinking and growing under the
+# broker. It prints the agent pointer's events and takes commands on stdin.
+cat >"$test_dir/draw.py" <<'EOF'
+import array, os, select, socket, struct, sys, threading
+sys.path.insert(0, os.path.dirname(__file__))
+from wire import Connection, message, string, read_string
+
+SEAT, COMPOSITOR, SHM, WM, SUBCOMPOSITOR, POINTER, POOL = 4, 5, 6, 7, 8, 9, 10
+ROOT, CHILD, POPUP_SURFACE, XDG, TOPLEVEL, SUBSURFACE, REGION, POSITIONER, POPUP_XDG, POPUP = 20, 21, 22, 23, 24, 25, 26, 27, 28, 29
+RED, GREEN, BLUE = b"\x00\x00\xff\xff", b"\x00\xff\x00\xff", b"\xff\x00\x00\xff"  # XRGB8888, little endian
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(sys.argv[1])
+conn = Connection(sock)
+scene = sys.argv[2]
+callbacks = iter(range(1000, 1 << 30))
+reporting = False  # until the window is up: the user's pointer passing by is not the agent's
+
+def out(text):
+    print(text, flush=True)
+
+def fixed(body, offset):
+    return f"{struct.unpack_from('<i', body, offset)[0] / 256:g}"
+
+def report(object_id, opcode, body):
+    if object_id != POINTER or not reporting:
+        return
+    if opcode == 0:
+        out(f"enter {struct.unpack_from('<I', body, 4)[0]} {fixed(body, 8)} {fixed(body, 12)}")
+    elif opcode == 1:
+        out(f"leave {struct.unpack_from('<I', body, 4)[0]}")
+    elif opcode == 2:
+        out(f"motion {fixed(body, 4)} {fixed(body, 8)}")
+    elif opcode == 3:
+        out("button {2} {3}".format(*struct.unpack("<IIII", body)))
+    elif opcode == 4:
+        out(f"axis {struct.unpack_from('<I', body, 4)[0]} {fixed(body, 8)}")
+    elif opcode == 5:
+        out("frame")
+    elif opcode == 8:
+        out("discrete {} {}".format(*struct.unpack("<Ii", body)))
+
+def roundtrip():
+    callback = next(callbacks)
+    conn.send(message(1, 0, struct.pack("<I", callback)))
+    while (msg := conn.read()) is not None and msg[0] != callback:
+        report(*msg)
+
+def send_fd(data, fd):
+    conn.sock.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))])
+
+conn.send(message(1, 1, struct.pack("<I", 2)))
+globals_ = {}
+callback = next(callbacks)
+conn.send(message(1, 0, struct.pack("<I", callback)))
+while (msg := conn.read())[0] != callback:
+    if msg[0] == 2 and msg[1] == 0:
+        globals_[read_string(msg[2], 4)] = struct.unpack_from("<I", msg[2])[0]
+
+def bind(interface, version, new_id):
+    conn.send(message(2, 0, struct.pack("<I", globals_[interface]) + string(interface) + struct.pack("<II", version, new_id)))
+
+bind("wl_seat", 7, SEAT)
+bind("wl_compositor", 6, COMPOSITOR)
+bind("wl_shm", 1, SHM)
+bind("xdg_wm_base", 6, WM)
+bind("wl_subcompositor", 1, SUBCOMPOSITOR)
+conn.send(message(SEAT, 0, struct.pack("<I", POINTER)))
+roundtrip()
+
+def surface(surface_id, buffer_id, offset, width, height):
+    conn.send(message(POOL, 0, struct.pack("<IiiiiI", buffer_id, offset, width, height, width * 4, 1)))
+    conn.send(message(COMPOSITOR, 0, struct.pack("<I", surface_id)))
+    conn.send(message(surface_id, 1, struct.pack("<Iii", buffer_id, 0, 0)))
+
+def toplevel():
+    conn.send(message(WM, 2, struct.pack("<II", XDG, ROOT)))
+    conn.send(message(XDG, 1, struct.pack("<I", TOPLEVEL)))
+    conn.send(message(TOPLEVEL, 3, string(scene)))
+
+if scene == "scene":
+    # A red 40x30 window taking input on its left half, a green 10x10
+    # subsurface at (5, 5) and a blue 20x10 popup the compositor puts at (30, 25).
+    pixels = RED * 40 * 30 + GREEN * 10 * 10 + BLUE * 20 * 10
+    memory = os.memfd_create("draw")
+    os.write(memory, pixels)
+    send_fd(message(SHM, 0, struct.pack("<Ii", POOL, len(pixels))), memory)
+    surface(ROOT, 11, 0, 40, 30)
+    surface(CHILD, 12, 4800, 10, 10)
+    surface(POPUP_SURFACE, 13, 5200, 20, 10)
+    toplevel()
+    conn.send(message(SUBCOMPOSITOR, 1, struct.pack("<III", SUBSURFACE, CHILD, ROOT)))
+    conn.send(message(SUBSURFACE, 1, struct.pack("<ii", 5, 5)))
+    conn.send(message(COMPOSITOR, 1, struct.pack("<I", REGION)))
+    conn.send(message(REGION, 1, struct.pack("<iiii", 0, 0, 20, 30)))
+    conn.send(message(ROOT, 5, struct.pack("<I", REGION)))
+    conn.send(message(WM, 1, struct.pack("<I", POSITIONER)))
+    conn.send(message(WM, 2, struct.pack("<II", POPUP_XDG, POPUP_SURFACE)))
+    conn.send(message(POPUP_XDG, 2, struct.pack("<III", POPUP, XDG, POSITIONER)))
+    for surface_id in (CHILD, POPUP_SURFACE, ROOT):
+        conn.send(message(surface_id, 6))
+else:
+    # A large window whose pool keeps shrinking and growing again.
+    width, height = 2000, 1500
+    memory = os.memfd_create("draw")
+    os.ftruncate(memory, width * height * 4)
+    send_fd(message(SHM, 0, struct.pack("<Ii", POOL, width * height * 4)), memory)
+    surface(ROOT, 11, 0, width, height)
+    toplevel()
+    conn.send(message(ROOT, 6))
+
+    def flicker():
+        while True:
+            os.ftruncate(memory, 4096)
+            os.ftruncate(memory, width * height * 4)
+
+    threading.Thread(target=flicker, daemon=True).start()
+
+roundtrip()
+reporting = True
+out("ready")
+
+while True:
+    ready = select.select([sys.stdin, conn.sock], [], [])[0]
+    if conn.sock in ready:
+        msg = conn.read()
+        if msg is None:
+            out("disconnected")
+            break
+        report(*msg)
+        while len(conn.buffer) >= 8 and len(conn.buffer) >= struct.unpack_from("<II", conn.buffer)[1] >> 16:
+            report(*conn.read())
+    if sys.stdin in ready:
+        command = sys.stdin.readline().strip()
+        if command in ("", "quit"):
+            break
+        roundtrip()
+        out("done")
+EOF
+
+# Reads pixels of a PNG the broker wrote: its size, then each x,y as rrggbb.
+cat >"$test_dir/pixels.py" <<'EOF'
+import struct, sys, zlib
+
+data = open(sys.argv[1], "rb").read()
+offset, idat = 8, b""
+while offset < len(data):
+    length, kind = struct.unpack_from(">I4s", data, offset)
+    if kind == b"IHDR":
+        width, height = struct.unpack_from(">II", data, offset + 8)
+    elif kind == b"IDAT":
+        idat += data[offset + 8 : offset + 8 + length]
+    offset += 12 + length
+rows = zlib.decompress(idat)
+print(f"{width}x{height}", end="")
+for point in sys.argv[2:]:
+    x, y = map(int, point.split(","))
+    start = y * (width * 3 + 1) + 1 + x * 3
+    print(" " + rows[start : start + 3].hex(), end="")
+print()
+EOF
+
+# Starts draw.py with a scene; commands go to fd draw_in, its output comes
+# from fd draw_out.
+start_draw() {
+  rm -f "$test_dir/draw.in" "$test_dir/draw.out"
+  mkfifo "$test_dir/draw.in" "$test_dir/draw.out"
+  exec {draw_in}<>"$test_dir/draw.in" {draw_out}<>"$test_dir/draw.out"
+  python3 "$test_dir/draw.py" "$socket" "$1" <"$test_dir/draw.in" >"$test_dir/draw.out" 2>>"$test_dir/draw.err" &
+  draw_pid=$!
+  local line
+  read -r -t 5 line <&"$draw_out"
+  [[ $line == "ready" ]] || fail "a drawing agent app maps its window" "$line $(cat "$test_dir/draw.err")"
+}
+
+stop_draw() {
+  echo quit >&"$draw_in"
+  wait "$draw_pid" 2>/dev/null
+  exec {draw_in}>&- {draw_out}>&-
+}
+
+draw_command() {
+  local line
+  echo "$1" >&"$draw_in"
+  while read -r -t 5 line <&"$draw_out" && [[ $line != "done" ]]; do :; done
+  [[ $line == "done" ]] || fail "the drawing app runs $1" "$line"
+}
+
+window_of() {
+  run_broker omarchy-agent-seat-windows | jq -r --arg app "$1" '[.[] | select(.app_id == $app)][-1].window'
+}
+
 run_broker() {
   XDG_RUNTIME_DIR="$test_dir/runtime" WAYLAND_DISPLAY=compositor PATH="$test_dir/bin:$ROOT/bin:$PATH" "$@"
 }
@@ -408,6 +601,16 @@ sleep 0.2
 kill -0 "$broker" 2>/dev/null || fail "an app hanging up with an event in flight leaves the broker running" "$(cat "$test_dir/broker.log")"
 [[ $(python3 "$test_dir/app.py" "$socket" globals) == *wl_seat* ]] || fail "the broker still serves apps after one hangs up mid-event"
 pass "an app hanging up with an event in flight leaves the broker running"
+
+start_draw flicker
+window=$(window_of flicker)
+for _ in {1..5}; do
+  shot=$(run_broker omarchy-agent-seat-screenshot "$window" 2>&1)
+  kill -0 "$broker" 2>/dev/null || fail "an app shrinking its pool under a screenshot leaves the broker running" "$(tail -5 "$test_dir/broker.log")"
+  [[ $(python3 "$test_dir/pixels.py" "$shot") == "2000x1500" ]] || fail "a window whose pool shrinks still gets a screenshot" "$shot"
+done
+stop_draw
+pass "an app shrinking its pool under a screenshot leaves the broker running"
 
 sandbox_marker="agent-seat-test-$$"
 run_broker omarchy-agent-seat-run --no-wait /usr/bin/bash -c '/usr/bin/sleep 300 & /usr/bin/sleep 300' "$sandbox_marker" || fail "a headless sandbox starts"

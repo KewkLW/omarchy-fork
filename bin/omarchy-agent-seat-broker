@@ -849,11 +849,17 @@ class Client:
       rows = min(round(gh * buffer_scale), buffer_height - sy, height - dy)
       if columns <= 0 or rows <= 0 or dx < 0 or dy < 0:
         continue
-      with mmap.mmap(pool.fd, pool.size, prot=mmap.PROT_READ) as memory:
-        for row in range(rows):
-          source = offset + (sy + row) * stride + sx * 4
-          target = ((dy + row) * width + dx) * 4
-          canvas[target : target + columns * 4] = memory[source : source + columns * 4]
+      # Read rather than map: the app can shrink its pool at any moment, and
+      # touching a mapping past the end of the file kills the broker with
+      # SIGBUS. Whatever is missing stays black.
+      end = min(pool.size, os.fstat(pool.fd).st_size)
+      for row in range(rows):
+        source = offset + (sy + row) * stride + sx * 4
+        if not 0 <= source < end:
+          continue
+        pixels = os.pread(pool.fd, min(columns * 4, end - source), source)
+        target = ((dy + row) * width + dx) * 4
+        canvas[target : target + len(pixels)] = pixels
 
     return canvas, width, height, (left, top, scale)
 
