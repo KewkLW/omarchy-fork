@@ -17,13 +17,8 @@ import sys
 
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy")
 POLICY_PATH = os.path.join(RUNTIME_DIR, "agent-drive.json")
-DEFAULT_POLICY = {
-  "agent_workspaces": [9, 10],
-  "extra_workspaces": [],
-  "always_allow_classes": [],
-  "never_allow_classes": [r"^1[Pp]assword$", r"^Bitwarden$"],
-  "tag": "agent-drive",
-}
+# What each list in the policy holds. default/hypr/agent-workspaces.lua writes them all.
+POLICY_LISTS = {"agent_workspaces": int, "extra_workspaces": int, "always_allow_classes": str, "never_allow_classes": str}
 
 # What callers may write before "+" in a key combo, as Keymap modifier names.
 MODIFIERS = {"ctrl": "ctrl", "control": "ctrl", "shift": "shift", "alt": "alt", "super": "super", "meta": "super", "altgr": "altgr"}
@@ -35,11 +30,24 @@ def run(*args, check=True, capture=True):
 
 
 def policy():
+  """The user's drive policy. Without a complete one nothing is allowed, so a
+  missing or broken file can never drop the user's never_allow_classes."""
   try:
     with open(POLICY_PATH, encoding="utf-8") as file:
-      return {**DEFAULT_POLICY, **json.load(file)}
-  except (OSError, ValueError):
-    return DEFAULT_POLICY.copy()
+      settings = json.load(file)
+  except FileNotFoundError:
+    raise PermissionError(f"no drive policy at {POLICY_PATH}; Hyprland writes it when its config loads, and nothing is allowed without it") from None
+  except (OSError, ValueError) as error:
+    raise PermissionError(f"cannot read the drive policy {POLICY_PATH} ({error}); nothing is allowed") from None
+  if not isinstance(settings, dict):
+    raise PermissionError(f"the drive policy {POLICY_PATH} is not an object; nothing is allowed")
+  for key, kind in POLICY_LISTS.items():
+    values = settings.get(key)
+    if not isinstance(values, list) or any(type(value) is not kind for value in values):
+      raise PermissionError(f"the drive policy {POLICY_PATH} has no valid {key}; nothing is allowed")
+  if not isinstance(settings.get("tag"), str) or not settings["tag"]:
+    raise PermissionError(f"the drive policy {POLICY_PATH} has no tag; nothing is allowed")
+  return settings
 
 
 def clients():
@@ -75,6 +83,19 @@ def has_tag(window, tag):
   return any(value.rstrip("*") == tag for value in window.get("tags", []))
 
 
+def refuse_if_focused(address):
+  """Keys never go to the window the user is typing in."""
+  result = run("hyprctl", "activewindow", "-j", check=False)
+  try:
+    active = json.loads(result.stdout or "{}")
+  except ValueError:
+    active = None
+  if result.returncode or not isinstance(active, dict):
+    raise PermissionError("cannot tell which window has the user's keyboard, so no keys were sent")
+  if (active.get("address") or "").lower() == address.lower():
+    raise PermissionError(f"window {address} has the user's keyboard focus; ask the user to switch away from it first")
+
+
 def dispatch(expression):
   result = run("hyprctl", "dispatch", expression, check=False)
   if result.returncode or result.stdout.strip() != "ok":
@@ -98,13 +119,15 @@ def ask(window):
   return result.stdout.strip() if result.returncode == 0 else "Deny"
 
 
-def authorize(window):
+def authorize(window, typing):
   settings = policy()
   app_class = window.get("class", "")
   workspace = window.get("workspace", {}).get("id")
   tag = settings["tag"]
   if matches(settings["never_allow_classes"], app_class):
     raise PermissionError(f"drive policy never allows class {app_class!r}")
+  if typing:
+    refuse_if_focused(window["address"])
   if has_tag(window, tag):
     return tag, False
   automatic = workspace in settings["agent_workspaces"] or workspace in settings["extra_workspaces"] or matches(settings["always_allow_classes"], app_class)
@@ -310,7 +333,7 @@ def main():
     list_windows()
     return
   window = window_at(args.address)
-  tag, remove_after = authorize(window)
+  tag, remove_after = authorize(window, args.command in ("type", "key"))
   try:
     if args.command == "screenshot":
       capture_window(window, args.output)
