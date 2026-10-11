@@ -726,6 +726,11 @@ pass "an app shrinking its pool under a screenshot leaves the broker running"
 start_draw scene
 window=$(window_of scene)
 
+shot=$(run_broker omarchy-agent-seat-screenshot "$window") || fail "a window with a subsurface and a popup gets a screenshot"
+colors=$(python3 "$test_dir/pixels.py" "$shot" 1,1 6,6 35,27 45,2 2,32)
+[[ $colors == "50x35 ff0000 00ff00 0000ff 000000 000000" ]] || fail "a screenshot composes the window, its subsurface and its popup" "$colors"
+pass "a screenshot composes the window, its subsurface and its popup"
+
 pointer() {
   run_broker omarchy-agent-seat-pointer "$window" "$@"
 }
@@ -886,8 +891,12 @@ pass "sharing a missing path is refused"
 [[ $(run_broker omarchy-agent-seat-status) == "Agent seat: stopped" ]] || fail "status reports a stopped seat"
 pass "stop ends the broker"
 
+# Starts a broker, with at most the given number of open files.
 start_broker() {
-  run_broker omarchy-agent-seat-broker serve 2>>"$test_dir/broker.log" &
+  (
+    ulimit -n "${1:-1024}"
+    run_broker omarchy-agent-seat-broker serve
+  ) 2>>"$test_dir/broker.log" &
   broker_pid=$!
   for _ in {1..50}; do run_broker omarchy-agent-seat-status >/dev/null && break; sleep 0.1; done
   broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
@@ -905,5 +914,37 @@ start_broker
 [[ $(python3 "$test_dir/app.py" "$socket" globals) == *wl_seat* ]] || fail "a broker starts over the sockets of one that died"
 [[ ! -e $gpu_socket ]] || fail "a broker removes the GPU sockets of one that died"
 pass "a broker starts over the sockets of one that died"
+run_broker omarchy-agent-seat-stop >/dev/null
+wait "$broker_pid" 2>/dev/null
+
+# A broker out of file descriptors waits for some to free instead of spinning.
+start_broker 40
+ticks=$(python3 - "$test_dir/runtime/omarchy/agent-seat/control" "$broker" <<'EOF'
+import socket, sys, time
+def cpu():
+    fields = open(f"/proc/{sys.argv[2]}/stat").read().rsplit(")", 1)[1].split()
+    return int(fields[11]) + int(fields[12])
+held = []
+for _ in range(45):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(0.5)
+    try:
+        sock.connect(sys.argv[1])
+        sock.sendall(b"{")
+    except OSError:
+        pass  # the queue is full
+    held.append(sock)
+    time.sleep(0.01)  # time to accept, so the broker runs out rather than its queue
+time.sleep(0.5)
+before = cpu()
+time.sleep(1)
+print(cpu() - before)
+EOF
+)
+(( ticks < 30 )) || fail "a broker out of file descriptors does not spin" "$ticks ticks of CPU in a second"
+grep -q "out of file descriptors" "$test_dir/broker.log" || fail "a broker out of file descriptors says so"
+for _ in {1..50}; do run_broker omarchy-agent-seat-status >/dev/null && break; sleep 0.1; done
+run_broker omarchy-agent-seat-status >/dev/null || fail "a broker out of file descriptors recovers once they free"
+pass "a broker out of file descriptors waits instead of spinning, then recovers"
 run_broker omarchy-agent-seat-stop >/dev/null
 wait "$broker_pid" 2>/dev/null
