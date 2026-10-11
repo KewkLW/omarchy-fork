@@ -795,9 +795,11 @@ sock.sendall(b"{\"command\": ")
 print("connected", flush=True)
 time.sleep(3)
 ' "$test_dir/runtime/omarchy/agent-seat/control")
+stalled_pid=$!
 read -r -t 5 line <&"$stalled"
 timeout 1 bash -c "XDG_RUNTIME_DIR='$test_dir/runtime' PATH='$test_dir/bin:$ROOT/bin:$PATH' omarchy-agent-seat-status" >/dev/null || fail "a caller that never finishes its request does not hold up the broker"
 exec {stalled}<&-
+kill "$stalled_pid" 2>/dev/null
 oversized=$(python3 -c '
 import socket, sys
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

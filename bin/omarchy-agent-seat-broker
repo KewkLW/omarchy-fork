@@ -408,7 +408,7 @@ class Pool:
 
 def screenshot_path(path, caller):
   """Where a caller may have a screenshot written: the seat's runtime directory, or under its working directory."""
-  if not os.path.isabs(path) or not path.endswith(".png"):
+  if not os.path.isabs(path) or not path.lower().endswith(".png"):
     raise ValueError("a screenshot needs an absolute path ending in .png")
   folder = os.path.realpath(os.path.dirname(path))
   roots = [os.path.realpath(RUNTIME_DIR)]
@@ -714,7 +714,7 @@ class Client:
 
   def request_wl_surface_destroy(self, surface, _):
     self.unparent(surface)
-    for child in self.surfaces[surface]["children"]:
+    for child in self.surfaces.get(surface, {}).get("children", []):
       if child in self.surfaces:
         self.surfaces[child]["parent"] = None
     return True
