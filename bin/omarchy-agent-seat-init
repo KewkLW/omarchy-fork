@@ -15,7 +15,7 @@
 bus=${DBUS_SESSION_BUS_ADDRESS#unix:path=}
 
 if [[ $bus != "$DBUS_SESSION_BUS_ADDRESS" && -d ${bus%/*} ]] && command -v dbus-daemon >/dev/null; then
-  config="$XDG_RUNTIME_DIR/bus.conf"
+  config="${bus%/*}/bus.conf"
   cat >"$config" <<EOF
 <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>

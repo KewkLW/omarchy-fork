@@ -2,6 +2,9 @@
 
 source "$(dirname "$0")/base-test.sh"
 
+# The seat commands find their sandbox supervisor and init under $OMARCHY_PATH.
+export OMARCHY_PATH="$ROOT"
+
 require_command python3
 require_command jq
 require_command bwrap
@@ -252,5 +255,5 @@ pass "the DevTools route reports values and focus"
 seat omarchy-agent-seat-stop >/dev/null
 for _ in {1..50}; do kill -0 "$broker_pid" 2>/dev/null || break; sleep 0.1; done
 compgen -G "$runtime/omarchy/agent-seat/sandboxes/*.d" >/dev/null && fail "stop removes the private buses" "$(ls -la "$runtime/omarchy/agent-seat/sandboxes")"
-pgrep -f "dbus-daemon --config-file=$runtime/bus.conf" >/dev/null && fail "stop ends the private bus daemons"
+pgrep -f "dbus-daemon --config-file=$runtime/agent-bus/bus.conf" >/dev/null && fail "stop ends the private bus daemons"
 pass "stop ends the private buses with their sandboxes"

@@ -1,8 +1,8 @@
 # The Agent Seat
 
-Use the agent seat whenever a task needs a graphical app: clicking through a web page, filling a form, checking how a UI renders, reading what is on screen. Never drive the user's desktop with `ydotool`, `wtype`, `hyprctl dispatch` or `grim` on their session; those move the user's cursor, type into whatever the user has focused, and capture their private windows.
+Use the agent seat whenever a task needs a graphical app: clicking through a web page, filling a form, checking how a UI renders, reading what is on screen. Never drive the user's desktop with `ydotool`, `wtype`, raw `hyprctl` or `grim` on their session; those move the user's cursor, type into whatever the user has focused, and capture their private windows. When a task needs a window the user already has open outside the seat, use `omarchy agent desktop ...` as [`agent-desktop.md`](agent-desktop.md) describes, never raw `hyprctl`.
 
-Apps started on the agent seat are real windows on the seat's own workspace (10 unless the user moved it), outlined in orange. You drive them with your own pointer and keyboard, which reach nothing else, while the user keeps working. The user can also use these windows with their own mouse and keyboard at the same time. The apps are sandboxed: their own home and their own private session bus, no access to the user's windows, screen, keyring, portals or files. The user's clipboard reaches an app only when the user pastes into it themselves; your own paste gets nothing, and your copies never reach the user's clipboard.
+Apps started on the agent seat are real windows on the seat's own workspace (10 unless the user moved it), outlined in orange. You drive them with your own pointer and keyboard, which reach nothing else, while the user keeps working. The user can also use these windows with their own mouse and keyboard at the same time. The apps are sandboxed: their own home and their own private session bus, no access to the user's windows, screen, keyring, portals or files. An app can read the user's clipboard only while the user's keyboard is in it and the user acted last, so your own paste gets nothing and your copies never reach the user's clipboard; but a page you opened can read what the user copied as soon as they click or type into its window. The apps share the host's network, so they reach the internet and every service listening on the user's localhost.
 
 ## Workflow
 
@@ -29,7 +29,7 @@ omarchy agent seat screenshot "$window"                          # prints a PNG 
 - Screenshots include menus and popups, even ones that open outside the window, and work while the seat's workspace is hidden. Coordinates follow the last screenshot, so take a fresh one, or run `ui` again, after anything that opens or moves a popup.
 - `type` takes text and `--key` combos in any order: `--key ctrl+l`, `--key enter`, `--key esc`, `--key tab`, `--key ctrl+shift+t`. Text is limited to what the user's keyboard layout can type. Click the field first (`click-ui 1 text:`) so the keys land in it.
 - `omarchy agent seat windows` lists every seat window as JSON: window, app_id, title, size, popups.
-- Each app gets a fresh profile, so websites start logged out. Apps under `~/.local/opt` and similar are fine: `omarchy agent seat run ~/.local/bin/chatgpt`.
+- Each app gets a fresh profile, so websites start logged out. Apps under `~/.local/opt` and similar are fine: `omarchy agent seat run ~/.local/bin/chatgpt`. A program outside `/usr` gets only its own file, plus its directory when that is an app bundle (with `lib`, `resources`, `resources.pak` or `AppRun` beside it). A wrapper script that runs something elsewhere needs that place shared with `--share-ro`.
 
 ## When you need the user
 
@@ -43,11 +43,12 @@ Screenshots of a GPU app come from Hyprland rather than the app's own buffers, s
 
 ## Your files
 
-The sandbox sees none of the user's files unless you share them: `--share <path>` read-write, `--share-ro <path>` read-only, repeatable, each at the same path inside. `omarchy agent seat run --gpu --share ~/Projects/game ~/Projects/game/Editor`. The seat asks nothing about this itself; sharing is part of your command, so your own permission rules decide it, the same as for files you touch directly. Share only what the app needs.
+The sandbox sees none of the user's files unless you share them: `--share <path>` read-write, `--share-ro <path>` read-only, repeatable, each at the same path inside. `omarchy agent seat run --gpu --share ~/Projects/game ~/Projects/game/Editor`. The seat asks nothing about this itself; sharing is part of your command, so your own permission rules decide it, the same as for files you touch directly. Share only what the app needs. The seat refuses shares that would undo the sandbox: `/`, the user's home or `/tmp` as a whole, `$XDG_RUNTIME_DIR` and `/run/user`, `/proc`, `/dev`, any directory holding one of those, and anything inside `~/.config`, `~/.ssh`, `~/.gnupg` or `~/.local/share/keyrings`.
 
 ## Limits
 
 - No clipboard of your own, file pickers or audio inside the sandbox, and no GPU without `--gpu` and the user's yes.
 - `ui` is only as good as the app's accessibility: GTK and Qt name most controls; custom-drawn widgets, icon-only buttons without labels and canvases show up unnamed or not at all. GTK 4 popover contents can sit a few pixels off; their controls still click. A tree can also be stale for a moment after a click, so wait briefly before reading it back.
+- The network is the host's: a page in an agent app can reach the user's local services (databases, dev servers, browser debugging ports). Don't open a debugging port in an agent app unless the task needs it, since everything on the machine can reach it too; `--cdp` opens one, so use it for pages you need to read, not by habit.
 - Without `--share`, the sandbox cannot see the user's files. Anything the app downloads lands under `~/.local/share/omarchy/agent-seat/home`.
 - `omarchy agent seat stop` closes every app on the seat; `omarchy agent seat status` shows whether it is running.

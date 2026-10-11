@@ -3,16 +3,35 @@
 source "$(dirname "${BASH_SOURCE[0]}")/base-test.sh"
 
 require_command lua
+require_command jq
+
+# The module writes the agent drive policy under $XDG_RUNTIME_DIR; keep the
+# real session's policy out of reach.
+policy_runtime=$(mktemp -d)
+trap 'rm -rf "$policy_runtime"' EXIT
+policy="$policy_runtime/omarchy/agent-drive.json"
 
 # Runs the placement module against a fake Hyprland: two monitors, DP-2 on the
 # right and listed first, as Hyprland lists them. Prints the workspace each
 # named rule sends its windows to, after the Lua given on stdin.
 placements() {
-  OMARCHY_PATH="$ROOT" lua - <<LUA
+  OMARCHY_PATH="$ROOT" XDG_RUNTIME_DIR="$policy_runtime" lua - <<LUA
 package.path = os.getenv("OMARCHY_PATH") .. "/?.lua;" .. package.path
 
 local rules, handlers, moves = {}, {}, {}
 viewing = 2
+
+-- Every policy the module writes, in order.
+written = {}
+local rename = os.rename
+os.rename = function(from, to)
+  local file = io.open(from, "rb")
+  if file then
+    table.insert(written, file:read("a"))
+    file:close()
+  end
+  return rename(from, to)
+end
 local monitors = {
   { name = "DP-2", x = 2560, y = 0 },
   { name = "DP-3", x = 0, y = 0 },
@@ -99,7 +118,14 @@ local agent_workspaces = require("default.hypr.agent-workspaces")
 agent_workspaces.place("room", "room", { class = "room" })
 agent_workspaces.place("seat", "seat", { class = "seat" }, true)
 
+-- Hyprland announces the reload once the whole config has run.
+function finish_load()
+  handlers["config.reloaded"]()
+end
+
 $(cat)
+
+finish_load()
 LUA
 }
 
@@ -132,7 +158,7 @@ test_dir=$(mktemp -d)
 spawned=()
 cleanup() {
   ((${#spawned[@]})) && kill "${spawned[@]}" 2>/dev/null
-  rm -rf "$test_dir"
+  rm -rf "$test_dir" "$policy_runtime"
 }
 trap cleanup EXIT
 
@@ -173,3 +199,59 @@ pass "routing spawned windows can be turned off"
 output=$(placements <<<'open(os.getenv("MARKED"), true) mapped(os.getenv("MARKED"), 9) open(os.getenv("PLAIN"), true) mapped(os.getenv("PLAIN"), 2)')
 [[ $output == $'9 silent\nback to 2\nstays\nno return' ]] || fail "the view goes back to where you were after an AI's window opens" "$output"
 pass "the view goes back to where you were after an AI's window opens, and yours are left alone"
+
+rm -rf "$policy_runtime/omarchy"
+placements <<<'agent_workspaces.set({ seat = "8", drive = { extra_workspaces = { "7", 3, "special" }, always_allow_classes = { "^Tab\there \"quoted\" \\d$" } } })' >/dev/null
+[[ -f $policy ]] || fail "the drive policy is written where its directory was missing"
+output=$(jq -c . "$policy") || fail "the drive policy is valid JSON" "$(cat "$policy")"
+[[ $output == '{"agent_workspaces":[9,8],"extra_workspaces":[7,3],"always_allow_classes":["^Tab\there \"quoted\" \\d$"],"never_allow_classes":["^1[Pp]assword$","^Bitwarden$"],"tag":"agent-drive"}' ]] ||
+  fail "the drive policy holds integer workspaces and escaped patterns" "$output"
+pass "the drive policy is valid JSON with integer workspaces and escaped patterns"
+
+placements <<<'show("x")' >/dev/null
+inode=$(stat -c %i "$policy")
+output=$(placements <<<'
+local path = os.getenv("XDG_RUNTIME_DIR") .. "/omarchy/agent-drive.json"
+local function current()
+  local file = io.open(path, "rb")
+  local data = file:read("a")
+  file:close()
+  return data
+end
+finish_load()
+focus("DP-2") focus("DP-3")
+print(current() == current() and "same")
+local file = io.open(path, "wb") file:write("left alone") file:close()
+focus("DP-2")
+print(current())
+agent_workspaces.set({ seat = 8 })
+print(current():match("%[9, 8%]") and "rewritten" or current())')
+[[ $(stat -c %i "$policy") != "$inode" ]] || fail "a changed policy is written"
+[[ $output == $'same\nleft alone\nrewritten' ]] || fail "the drive policy is written only when it changes" "$output"
+pass "the drive policy is written only when it changes"
+
+placements <<<'show("x")' >/dev/null
+inode=$(stat -c %i "$policy")
+placements <<<'focus("DP-2") show("x")' >/dev/null
+[[ $(stat -c %i "$policy") == "$inode" ]] || fail "a reload with the same policy leaves the file alone"
+pass "a reload with the same policy leaves the file alone"
+
+# A reload runs Omarchy's defaults, then the user's set(), so the policy must
+# not pass through the defaults on the way.
+rm -rf "$policy_runtime/omarchy"
+custom='agent_workspaces.set({ drive = { never_allow_classes = { "^Custom$" } } })'
+placements <<<"$custom" >/dev/null
+for session in first reload; do
+  output=$(placements <<<"
+focus('DP-2')
+$custom
+finish_load()
+focus('DP-3')
+for _, policy in ipairs(written) do
+  print(policy:find('Bitwarden', 1, true) and 'default' or 'custom')
+end")
+  [[ $output != *default* ]] || fail "a reload never writes the default never_allow_classes ($session)" "$output"
+  grep -q '"\^Custom\$"' "$policy" && ! grep -q 'Bitwarden' "$policy" ||
+    fail "the policy keeps the user's never_allow_classes across a reload ($session)" "$(cat "$policy")"
+done
+pass "a reload never writes the default never_allow_classes over the user's"

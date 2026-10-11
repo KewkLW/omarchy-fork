@@ -23,3 +23,7 @@ require("default.hypr.apps")
 
 -- Apply default opacity after apps have had a chance to opt out.
 o.window({ tag = "default-opacity" }, { opacity = "0.985 0.96" })
+
+-- Agent seat windows last, so no app rule above can pin them, strip their
+-- outline or move them off the seat's workspace.
+require("default.hypr.agent-seat")

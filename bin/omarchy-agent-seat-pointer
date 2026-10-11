@@ -18,34 +18,43 @@ window=$1
 action=$2
 shift 2
 
+# jq refuses a coordinate that is not a number, so each arm falls back to usage.
 case $action in
-move)
-  args=$(jq -n --argjson x "$1" --argjson y "$2" '{x: $x, y: $y}')
-  ;;
-click)
-  x=$1 y=$2 button=left double=false
-  shift 2
-  while (($# > 0)); do
-    case $1 in
-    --button) button=$2 && shift ;;
-    --double) double=true ;;
-    *) usage ;;
-    esac
-    shift
-  done
-  args=$(jq -n --argjson x "$x" --argjson y "$y" --arg button "$button" --argjson double "$double" '{x: $x, y: $y, button: $button, double: $double}')
-  ;;
-drag)
-  (($# == 4)) || usage
-  args=$(jq -n --argjson x1 "$1" --argjson y1 "$2" --argjson x2 "$3" --argjson y2 "$4" '{x1: $x1, y1: $y1, x2: $x2, y2: $y2}')
-  ;;
-scroll)
-  (($# >= 3)) || usage
-  args=$(jq -n --argjson x "$1" --argjson y "$2" --argjson dy "$3" --argjson dx "${4:-0}" '{x: $x, y: $y, dy: $dy, dx: $dx}')
-  ;;
-*)
-  usage
-  ;;
-esac || usage
+  move)
+    args=$(jq -n --argjson x "$1" --argjson y "$2" '{x: $x, y: $y}') || usage
+    ;;
+  click)
+    x=$1 y=$2 button=left double=false
+    shift 2
+    while (($# > 0)); do
+      case $1 in
+        --button)
+          (($# >= 2)) || usage
+          button=$2
+          shift 2
+          ;;
+        --double)
+          double=true
+          shift
+          ;;
+        *)
+          usage
+          ;;
+      esac
+    done
+    args=$(jq -n --argjson x "$x" --argjson y "$y" --arg button "$button" --argjson double "$double" '{x: $x, y: $y, button: $button, double: $double}') || usage
+    ;;
+  drag)
+    (($# == 4)) || usage
+    args=$(jq -n --argjson x1 "$1" --argjson y1 "$2" --argjson x2 "$3" --argjson y2 "$4" '{x1: $x1, y1: $y1, x2: $x2, y2: $y2}') || usage
+    ;;
+  scroll)
+    (($# >= 3)) || usage
+    args=$(jq -n --argjson x "$1" --argjson y "$2" --argjson dy "$3" --argjson dx "${4:-0}" '{x: $x, y: $y, dy: $dy, dx: $dx}') || usage
+    ;;
+  *)
+    usage
+    ;;
+esac
 
 omarchy-agent-seat-broker call "$(jq -cn --arg command "$action" --argjson window "$window" --argjson args "$args" '{command: $command, args: ($args + {window: $window})}')" >/dev/null

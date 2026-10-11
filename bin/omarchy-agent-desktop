@@ -4,9 +4,20 @@
 # omarchy:args=list | screenshot <address> [output] | type <address> <text> | key <address> <combo> | close <address>
 # omarchy:examples=omarchy agent desktop list | omarchy agent desktop screenshot 0x1234 | omarchy agent desktop type 0x1234 "hello" | omarchy agent desktop key 0x1234 ctrl+l
 
+# Lets an agent act on one of the user's own windows without moving the user's
+# focus or pointer: window screenshots, keys sent straight to the window, and
+# close. There is no pointer input; Hyprland can only click by moving the
+# user's cursor.
+#
+# Every command goes through the drive policy default/hypr/agent-workspaces.lua
+# writes to $XDG_RUNTIME_DIR/omarchy/agent-drive.json. That policy is a guard
+# rail for an agent that follows it, not a sandbox: the file, the agent-drive
+# tag and the window's workspace can all be changed by anything running as the
+# user, the agent included.
+
 import argparse
-import importlib.machinery
-import importlib.util
+import ctypes
+import ctypes.util
 import json
 import os
 import re
@@ -17,17 +28,14 @@ import sys
 
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy")
 POLICY_PATH = os.path.join(RUNTIME_DIR, "agent-drive.json")
-DEFAULT_POLICY = {
-  "agent_workspaces": [9, 10],
-  "extra_workspaces": [],
-  "always_allow_classes": [],
-  "never_allow_classes": [r"^1[Pp]assword$", r"^Bitwarden$"],
-  "tag": "agent-drive",
-}
+# What each list in the policy holds. default/hypr/agent-workspaces.lua writes them all.
+POLICY_LISTS = {"agent_workspaces": int, "extra_workspaces": int, "always_allow_classes": str, "never_allow_classes": str}
 
 # What callers may write before "+" in a key combo, as Keymap modifier names.
 MODIFIERS = {"ctrl": "ctrl", "control": "ctrl", "shift": "shift", "alt": "alt", "super": "super", "meta": "super", "altgr": "altgr"}
 BATCH_SIZE = 200  # keys per hyprctl call, to keep each command line modest
+ALLOW_ONCE = "Allow once"
+ALLOW_UNTIL_CLOSED = "Allow until the window closes"
 
 
 def run(*args, check=True, capture=True):
@@ -35,11 +43,24 @@ def run(*args, check=True, capture=True):
 
 
 def policy():
+  """The user's drive policy. Without a complete one nothing is allowed, so a
+  missing or broken file can never drop the user's never_allow_classes."""
   try:
     with open(POLICY_PATH, encoding="utf-8") as file:
-      return {**DEFAULT_POLICY, **json.load(file)}
-  except (OSError, ValueError):
-    return DEFAULT_POLICY.copy()
+      settings = json.load(file)
+  except FileNotFoundError:
+    raise PermissionError(f"no drive policy at {POLICY_PATH}; Hyprland writes it when its config loads, and nothing is allowed without it") from None
+  except (OSError, ValueError) as error:
+    raise PermissionError(f"cannot read the drive policy {POLICY_PATH} ({error}); nothing is allowed") from None
+  if not isinstance(settings, dict):
+    raise PermissionError(f"the drive policy {POLICY_PATH} is not an object; nothing is allowed")
+  for key, kind in POLICY_LISTS.items():
+    values = settings.get(key)
+    if not isinstance(values, list) or any(type(value) is not kind for value in values):
+      raise PermissionError(f"the drive policy {POLICY_PATH} has no valid {key}; nothing is allowed")
+  if not isinstance(settings.get("tag"), str) or not settings["tag"]:
+    raise PermissionError(f"the drive policy {POLICY_PATH} has no tag; nothing is allowed")
+  return settings
 
 
 def clients():
@@ -75,6 +96,19 @@ def has_tag(window, tag):
   return any(value.rstrip("*") == tag for value in window.get("tags", []))
 
 
+def refuse_if_focused(address):
+  """Keys never go to the window the user is typing in."""
+  result = run("hyprctl", "activewindow", "-j", check=False)
+  try:
+    active = json.loads(result.stdout or "{}")
+  except ValueError:
+    active = None
+  if result.returncode or not isinstance(active, dict):
+    raise PermissionError("cannot tell which window has the user's keyboard, so no keys were sent")
+  if (active.get("address") or "").lower() == address.lower():
+    raise PermissionError(f"window {address} has the user's keyboard focus; ask the user to switch away from it first")
+
+
 def dispatch(expression):
   result = run("hyprctl", "dispatch", expression, check=False)
   if result.returncode or result.stdout.strip() != "ok":
@@ -85,36 +119,72 @@ def quote(value):
   return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def set_tag(address, tag, enabled):
-  operation = "+" if enabled else "-"
-  dispatch(f"hl.dsp.window.tag({{ window = {quote('address:' + address)}, tag = {quote(operation + tag)} }})")
+def tag_window(address, tag):
+  # Only the user's "until the window closes" answer is written down. The drive
+  # never removes a tag: one it finds was set by an earlier answer, not by it.
+  dispatch(f"hl.dsp.window.tag({{ window = {quote('address:' + address)}, tag = {quote('+' + tag)} }})")
 
 
 def ask(window):
   title = window.get("title") or "untitled"
   app_class = window.get("class") or "unknown"
   prompt = f"Let the agent drive {app_class}: {title}?"
-  result = run("omarchy-menu-select", prompt, "Allow once", "Allow until the window closes", "Deny", check=False)
+  result = run("omarchy-menu-select", prompt, ALLOW_ONCE, ALLOW_UNTIL_CLOSED, "Deny", check=False)
   return result.stdout.strip() if result.returncode == 0 else "Deny"
 
 
-def authorize(window):
-  settings = policy()
+def workspace_of(window):
+  return (window.get("workspace") or {}).get("id")
+
+
+def automatic(window, settings):
+  """Whether the policy allows the window without asking. Judged afresh on every
+  call and never written down, so a window that leaves the agent workspaces
+  stops being drivable."""
+  workspace = workspace_of(window)
+  return workspace in settings["agent_workspaces"] or workspace in settings["extra_workspaces"] or matches(settings["always_allow_classes"], window.get("class", ""))
+
+
+def authorize(window, settings, typing):
+  """Allows this command on the window or raises, and says on what grounds:
+  "policy", "tag" or "asked". "Allow once" lasts only as long as this process,
+  so nothing outside it can reuse or strand the grant."""
   app_class = window.get("class", "")
-  workspace = window.get("workspace", {}).get("id")
-  tag = settings["tag"]
   if matches(settings["never_allow_classes"], app_class):
     raise PermissionError(f"drive policy never allows class {app_class!r}")
-  if has_tag(window, tag):
-    return tag, False
-  automatic = workspace in settings["agent_workspaces"] or workspace in settings["extra_workspaces"] or matches(settings["always_allow_classes"], app_class)
-  choice = "Allow until the window closes" if automatic else ask(window)
-  if choice == "Deny":
+  if typing:
+    refuse_if_focused(window["address"])
+  if automatic(window, settings):
+    return "policy"
+  if has_tag(window, settings["tag"]):
+    return "tag"
+  choice = ask(window)
+  if choice not in (ALLOW_ONCE, ALLOW_UNTIL_CLOSED):
     raise PermissionError("the user did not allow this window")
-  if choice not in {"Allow once", "Allow until the window closes"}:
-    raise PermissionError("the window was not allowed")
-  set_tag(window["address"], tag, True)
-  return tag, choice == "Allow once"
+  # The user can take a while to answer; the answer is for the window they saw.
+  verify(window, settings, "asked", typing)
+  if choice == ALLOW_UNTIL_CLOSED:
+    tag_window(window["address"], settings["tag"])
+  return "asked"
+
+
+def verify(window, settings, grant, typing):
+  """Refuses unless the window is still the one that was allowed: same app at
+  the same address, on the same workspace, still tagged if the tag was the
+  grant, and for keys, still not the window the user is typing in. Runs right
+  before every action and every batch of keys."""
+  address = window["address"]
+  current = next((other for other in clients() if other.get("address", "").lower() == address.lower()), None)
+  if current is None:
+    raise PermissionError(f"window {address} closed; stopped")
+  if current.get("stableId") != window.get("stableId") or current.get("class") != window.get("class"):
+    raise PermissionError(f"window {address} is no longer the {window.get('class')} window that was allowed; stopped")
+  if workspace_of(current) != workspace_of(window):
+    raise PermissionError(f"window {address} moved to workspace {workspace_of(current)} after it was allowed; stopped")
+  if grant == "tag" and not has_tag(current, settings["tag"]):
+    raise PermissionError(f"window {address} is no longer tagged {settings['tag']}; stopped")
+  if typing:
+    refuse_if_focused(address)
 
 
 def broker_path():
@@ -124,15 +194,90 @@ def broker_path():
   return path
 
 
+class Keymap:
+  """An XKB keymap built from layout names, with the reverse lookup from characters to keys.
+
+  Keys are (evdev keycode, modifier mask) in this keymap's modifier indices,
+  taken from the layout group in use, so AltGr and other layouts type right.
+  The seat broker has the same lookup for its own keyboard; this copy keeps
+  the drive from loading the broker and its Wayland protocols on every call.
+  """
+
+  # Hyprland's modifier names for the real modifiers a level can need.
+  HYPRLAND_MODIFIERS = {"Shift": "SHIFT", "Control": "CTRL", "Mod1": "ALT", "Mod3": "MOD3", "Mod4": "SUPER", "Mod5": "MOD5"}
+
+  def __init__(self, names, layout=0):
+    xkb = ctypes.CDLL(ctypes.util.find_library("xkbcommon"))
+
+    class RuleNames(ctypes.Structure):
+      _fields_ = [(name, ctypes.c_char_p) for name in ("rules", "model", "layout", "variant", "options")]
+
+    xkb.xkb_context_new.restype = ctypes.c_void_p
+    xkb.xkb_keymap_new_from_names.restype = ctypes.c_void_p
+    xkb.xkb_keymap_new_from_names.argtypes = [ctypes.c_void_p, ctypes.POINTER(RuleNames), ctypes.c_int]
+    xkb.xkb_keymap_min_keycode.argtypes = xkb.xkb_keymap_max_keycode.argtypes = xkb.xkb_keymap_num_mods.argtypes = [ctypes.c_void_p]
+    xkb.xkb_keymap_num_layouts.argtypes = [ctypes.c_void_p]
+    xkb.xkb_keymap_num_levels_for_key.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+    xkb.xkb_keymap_key_get_syms_by_level.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.POINTER(ctypes.c_uint32))]
+    xkb.xkb_keymap_key_get_mods_for_level.restype = ctypes.c_size_t
+    xkb.xkb_keymap_key_get_mods_for_level.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint32), ctypes.c_size_t]
+    xkb.xkb_keymap_mod_get_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    xkb.xkb_keymap_mod_get_name.restype = ctypes.c_char_p
+    xkb.xkb_keymap_mod_get_name.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    xkb.xkb_keysym_from_name.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    xkb.xkb_utf32_to_keysym.argtypes = [ctypes.c_uint32]
+    self.xkb = xkb
+
+    context = xkb.xkb_context_new(0)
+    keymap = xkb.xkb_keymap_new_from_names(context, ctypes.byref(RuleNames(*(value.encode() if value else None for value in names))), 0)
+    keymap = keymap or xkb.xkb_keymap_new_from_names(context, ctypes.byref(RuleNames(b"evdev", b"pc105", b"us", b"", b"")), 0)
+    layout = layout if layout < xkb.xkb_keymap_num_layouts(keymap) else 0
+
+    self.mod_names = [xkb.xkb_keymap_mod_get_name(keymap, index).decode() for index in range(xkb.xkb_keymap_num_mods(keymap))]
+    self.modifiers = {name: 1 << xkb.xkb_keymap_mod_get_index(keymap, xkb_name) for name, xkb_name in (("shift", b"Shift"), ("ctrl", b"Control"), ("alt", b"Mod1"), ("super", b"Mod4"), ("altgr", b"Mod5"))}
+    # Levels reached through Caps Lock or Num Lock are skipped: their result
+    # depends on lock state the agent does not control.
+    locked = sum(1 << index for index, name in enumerate(self.mod_names) if name in ("Lock", "Mod2"))
+    self.keys, ranks = {}, {}
+    syms = ctypes.POINTER(ctypes.c_uint32)()
+    masks = (ctypes.c_uint32 * 8)()
+    for keycode in range(xkb.xkb_keymap_min_keycode(keymap), xkb.xkb_keymap_max_keycode(keymap) + 1):
+      for level in range(xkb.xkb_keymap_num_levels_for_key(keymap, keycode, layout)):
+        usable = [mask for mask in masks[: xkb.xkb_keymap_key_get_mods_for_level(keymap, keycode, layout, level, masks, 8)] if not mask & locked]
+        if not usable:
+          continue
+        mask = min(usable, key=lambda mask: bin(mask).count("1"))
+        rank = (bin(mask).count("1"), level)
+        for index in range(xkb.xkb_keymap_key_get_syms_by_level(keymap, keycode, layout, level, ctypes.byref(syms))):
+          # Prefer the fewest modifiers, then the lowest level (Shift before
+          # AltGr), then the lowest keycode.
+          if syms[index] not in ranks or rank < ranks[syms[index]]:
+            ranks[syms[index]] = rank
+            self.keys[syms[index]] = (keycode - 8, mask)
+
+  def for_char(self, char):
+    if char == "\n":
+      return self.for_name("Return")
+    return self.keys.get(self.xkb.xkb_utf32_to_keysym(ord(char)))
+
+  def for_name(self, name):
+    aliases = {"enter": "Return", "esc": "Escape", "pgup": "Prior", "pgdown": "Next", "pageup": "Prior", "pagedown": "Next", "del": "Delete", "bksp": "BackSpace", "backspace": "BackSpace", "space": "space", "tab": "Tab"}
+    return self.keys.get(self.xkb.xkb_keysym_from_name(aliases.get(name.lower(), name).encode(), 1))
+
+  def hyprland_modifiers(self, mask):
+    """Hyprland's names for a mask, or None if it needs one Hyprland lacks."""
+    names = [self.mod_names[index] for index in range(len(self.mod_names)) if mask >> index & 1]
+    if any(name not in self.HYPRLAND_MODIFIERS for name in names):
+      return None
+    return [self.HYPRLAND_MODIFIERS[name] for name in names]
+
+
 def keymap():
   """The user's keymap and layout, so characters land as they would from their keyboard."""
   keyboards = json.loads(run("hyprctl", "devices", "-j").stdout).get("keyboards", [])
   keyboard = next((keyboard for keyboard in keyboards if keyboard.get("main")), keyboards[0] if keyboards else {})
-  loader = importlib.machinery.SourceFileLoader("omarchy_agent_seat_broker", broker_path())
-  module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
-  loader.exec_module(module)
   names = (keyboard.get("rules") or "evdev", keyboard.get("model") or "pc105", keyboard.get("layout") or "us", keyboard.get("variant") or "", keyboard.get("options") or "")
-  return module.Keymap(names=names, layout=keyboard.get("active_layout_index") or 0)
+  return Keymap(names, layout=keyboard.get("active_layout_index") or 0)
 
 
 def shortcut(address, modifiers, keycode):
@@ -140,9 +285,10 @@ def shortcut(address, modifiers, keycode):
   return f"hl.dsp.send_shortcut({{ mods = {quote(' + '.join(modifiers))}, key = {quote(f'code:{keycode + 8}')}, window = {quote('address:' + address)} }})"
 
 
-def send(expressions):
-  """Send in batches. Hyprland answers ok even for keys it cannot deliver, so callers resolve every key first."""
+def send(expressions, check):
+  """Send in batches, calling check before each. Hyprland answers ok even for keys it cannot deliver, so callers resolve every key first."""
   for start in range(0, len(expressions), BATCH_SIZE):
+    check()
     result = run("hyprctl", "--batch", " ; ".join(f"dispatch {expression}" for expression in expressions[start : start + BATCH_SIZE]), check=False)
     replies = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if result.returncode or any(reply != "ok" for reply in replies):
@@ -157,16 +303,16 @@ def resolve(layout, key):
   return keycode, modifiers
 
 
-def type_text(address, text):
+def type_text(address, text, check):
   layout = keymap()
   missing = sorted({character for character in text if not layout.for_char(character)})
   if missing:
     raise ValueError("the keyboard layout cannot type " + ", ".join(f"{character!r} (U+{ord(character):04X})" for character in missing) + "; nothing was sent")
   keys = [resolve(layout, layout.for_char(character)) for character in text]
-  send([shortcut(address, modifiers, keycode) for keycode, modifiers in keys])
+  send([shortcut(address, modifiers, keycode) for keycode, modifiers in keys], check)
 
 
-def key_combo(address, combo):
+def key_combo(address, combo, check):
   *words, name = combo.split("+")
   if not name:
     raise ValueError("key combo is empty")
@@ -179,12 +325,27 @@ def key_combo(address, combo):
     raise ValueError(f"unknown key {name!r} in {combo!r}")
   mask = sum(layout.modifiers[MODIFIERS[word.lower()]] for word in words) | target[1]
   keycode, modifiers = resolve(layout, (target[0], mask))
-  send([shortcut(address, modifiers, keycode)])
+  send([shortcut(address, modifiers, keycode)], check)
+
+
+def screenshot_path(window, output):
+  """Where a screenshot may go: the runtime directory by default, or a path
+  under it or under the caller's current directory, whose directory must
+  already exist. Symlinks are resolved before the check."""
+  if not output:
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+    return os.path.join(RUNTIME_DIR, f"agent-desktop-{window['stableId']}.png")
+  path = os.path.realpath(output)
+  roots = {os.path.realpath(RUNTIME_DIR), os.path.realpath(os.getcwd())}
+  if not any(os.path.commonpath([path, root]) == root and path != root for root in roots):
+    raise PermissionError(f"screenshots go under {RUNTIME_DIR} or the current directory, not {output}")
+  if not os.path.isdir(os.path.dirname(path)):
+    raise ValueError(f"no directory for {output}")
+  return path
 
 
 def capture_window(window, output):
-  output = os.path.abspath(output or os.path.join(RUNTIME_DIR, f"agent-desktop-{window['stableId']}.png"))
-  os.makedirs(os.path.dirname(output), exist_ok=True)
+  output = screenshot_path(window, output)
   helper = broker_path()
   result = run(helper, "capture-identifier", window["stableId"], output, check=False)
   data = json.loads(result.stdout or "{}")
@@ -193,21 +354,18 @@ def capture_window(window, output):
   print(json.dumps({"path": output, **data}))
 
 
-def list_windows():
-  settings = policy()
+def list_windows(settings):
   rows = []
   for window in clients():
-    app_class = window.get("class", "")
-    workspace = window.get("workspace", {}).get("id")
-    if matches(settings["never_allow_classes"], app_class):
+    if matches(settings["never_allow_classes"], window.get("class", "")):
       access = "never"
+    elif automatic(window, settings):
+      access = "automatic"
     elif has_tag(window, settings["tag"]):
       access = "allowed"
-    elif workspace in settings["agent_workspaces"] or workspace in settings["extra_workspaces"] or matches(settings["always_allow_classes"], app_class):
-      access = "automatic"
     else:
       access = "ask"
-    rows.append({key: window.get(key) for key in ("address", "stableId", "class", "title")} | {"workspace": workspace, "access": access})
+    rows.append({key: window.get(key) for key in ("address", "stableId", "class", "title")} | {"workspace": workspace_of(window), "access": access})
   print(json.dumps(rows, indent=2))
 
 
@@ -231,26 +389,27 @@ def parser():
 
 def main():
   args = parser().parse_args()
+  settings = policy()
   if args.command == "list":
-    list_windows()
+    list_windows(settings)
     return
   window = window_at(args.address)
-  tag, remove_after = authorize(window)
-  try:
-    if args.command == "screenshot":
-      capture_window(window, args.output)
-    elif args.command == "type":
-      type_text(window["address"], args.text)
-    elif args.command == "key":
-      key_combo(window["address"], args.combo)
-    elif args.command == "close":
-      dispatch(f"hl.dsp.window.close({{ window = {quote('address:' + window['address'])} }})")
-  finally:
-    if remove_after and args.command != "close":
-      try:
-        set_tag(window["address"], tag, False)
-      except RuntimeError:
-        pass
+  typing = args.command in ("type", "key")
+  grant = authorize(window, settings, typing)
+
+  def check():
+    verify(window, settings, grant, typing)
+
+  if args.command == "screenshot":
+    check()
+    capture_window(window, args.output)
+  elif args.command == "type":
+    type_text(window["address"], args.text, check)
+  elif args.command == "key":
+    key_combo(window["address"], args.combo, check)
+  elif args.command == "close":
+    check()
+    dispatch(f"hl.dsp.window.close({{ window = {quote('address:' + window['address'])} }})")
 
 
 if __name__ == "__main__":
