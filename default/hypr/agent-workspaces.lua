@@ -165,6 +165,19 @@ local function write_drive_policy()
   end
 end
 
+-- The user's hyprland.lua calls set() after Omarchy's own rules have placed
+-- their windows, so writing the policy while the config is still running would
+-- hand agents the default policy for a moment on every reload. Until the config
+-- has finished loading, the file keeps whatever the last load wrote.
+local loaded = false
+
+local function finish_loading()
+  if not loaded then
+    loaded = true
+    write_drive_policy()
+  end
+end
+
 local function monitor_index(active)
   if M.settings.per_monitor == 0 or not active then
     return 0
@@ -215,7 +228,9 @@ local function apply()
       workspace = placement.silent and workspace .. " silent" or workspace,
     })
   end
-  write_drive_policy()
+  if loaded then
+    write_drive_policy()
+  end
 end
 
 local function spawned_by_agent(pid)
@@ -356,5 +371,10 @@ end)
 hl.on("monitor.focused", apply)
 hl.on("monitor.added", apply)
 hl.on("monitor.removed", apply)
+
+-- Hyprland fires config.reloaded once the whole config has run, on the first
+-- load as well as on every reload, into the fresh Lua state it just ran.
+hl.on("config.reloaded", finish_loading)
+hl.on("hyprland.start", finish_loading)
 
 return M

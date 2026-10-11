@@ -41,7 +41,7 @@ Screenshots run the seat broker's `capture-identifier` as a subprocess, which ca
 
 ### The policy
 
-`default/hypr/agent-workspaces.lua` writes `$XDG_RUNTIME_DIR/omarchy/agent-drive.json` whenever Hyprland loads its config: the agent workspaces, plus `extra_workspaces`, `always_allow_classes` and `never_allow_classes` from `set({ drive = { ... } })` in the user's `hyprland.lua`. Without a complete, readable file the drive refuses everything, so a missing file never drops the user's `never_allow_classes`.
+`default/hypr/agent-workspaces.lua` writes `$XDG_RUNTIME_DIR/omarchy/agent-drive.json` once Hyprland has run its whole config (on `config.reloaded`), so a reload never passes through the default policy before the user's `set()` runs, and afterwards only when the policy changes: the agent workspaces, plus `extra_workspaces`, `always_allow_classes` and `never_allow_classes` from `set({ drive = { ... } })` in the user's `hyprland.lua`. Without a complete, readable file the drive refuses everything, so a missing file never drops the user's `never_allow_classes`.
 
 For every command, in order:
 

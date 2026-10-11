@@ -20,6 +20,18 @@ package.path = os.getenv("OMARCHY_PATH") .. "/?.lua;" .. package.path
 
 local rules, handlers, moves = {}, {}, {}
 viewing = 2
+
+-- Every policy the module writes, in order.
+written = {}
+local rename = os.rename
+os.rename = function(from, to)
+  local file = io.open(from, "rb")
+  if file then
+    table.insert(written, file:read("a"))
+    file:close()
+  end
+  return rename(from, to)
+end
 local monitors = {
   { name = "DP-2", x = 2560, y = 0 },
   { name = "DP-3", x = 0, y = 0 },
@@ -106,7 +118,14 @@ local agent_workspaces = require("default.hypr.agent-workspaces")
 agent_workspaces.place("room", "room", { class = "room" })
 agent_workspaces.place("seat", "seat", { class = "seat" }, true)
 
+-- Hyprland announces the reload once the whole config has run.
+function finish_load()
+  handlers["config.reloaded"]()
+end
+
 $(cat)
+
+finish_load()
 LUA
 }
 
@@ -199,6 +218,7 @@ local function current()
   file:close()
   return data
 end
+finish_load()
 focus("DP-2") focus("DP-3")
 print(current() == current() and "same")
 local file = io.open(path, "wb") file:write("left alone") file:close()
@@ -215,3 +235,23 @@ inode=$(stat -c %i "$policy")
 placements <<<'focus("DP-2") show("x")' >/dev/null
 [[ $(stat -c %i "$policy") == "$inode" ]] || fail "a reload with the same policy leaves the file alone"
 pass "a reload with the same policy leaves the file alone"
+
+# A reload runs Omarchy's defaults, then the user's set(), so the policy must
+# not pass through the defaults on the way.
+rm -rf "$policy_runtime/omarchy"
+custom='agent_workspaces.set({ drive = { never_allow_classes = { "^Custom$" } } })'
+placements <<<"$custom" >/dev/null
+for session in first reload; do
+  output=$(placements <<<"
+focus('DP-2')
+$custom
+finish_load()
+focus('DP-3')
+for _, policy in ipairs(written) do
+  print(policy:find('Bitwarden', 1, true) and 'default' or 'custom')
+end")
+  [[ $output != *default* ]] || fail "a reload never writes the default never_allow_classes ($session)" "$output"
+  grep -q '"\^Custom\$"' "$policy" && ! grep -q 'Bitwarden' "$policy" ||
+    fail "the policy keeps the user's never_allow_classes across a reload ($session)" "$(cat "$policy")"
+done
+pass "a reload never writes the default never_allow_classes over the user's"
