@@ -255,6 +255,21 @@ elif step in ("fdflood", "poolflood"):
     except OSError:
         print("disconnected")
 
+elif step == "syncflood":
+    # Ask for replies as fast as possible and never read one.
+    import time
+    conn.sock.settimeout(0.5)
+    sent, callback = 0, 3
+    try:
+        while sent < 16 << 20:
+            syncs = b"".join(message(1, 0, struct.pack("<I", callback + i)) for i in range(1000))
+            conn.sock.sendall(syncs)
+            sent, callback = sent + len(syncs), callback + 1000
+        print("never blocked", flush=True)
+    except socket.timeout:
+        print("blocked", flush=True)
+    time.sleep(0.5)
+
 elif step == "seat":
     bind("wl_seat", 7, 4)
     for object_id, opcode, body in roundtrip(5):
@@ -645,6 +660,16 @@ sleep 0.2
 (( $(descriptors) <= before )) || fail "a dropped app leaves no descriptors behind" "$before -> $(descriptors)"
 [[ $(python3 "$test_dir/app.py" "$socket" globals) == *wl_seat* ]] || fail "the broker serves apps after a descriptor flood"
 pass "apps flooding the broker with descriptors are dropped without a leak"
+
+python3 "$test_dir/app.py" "$socket" syncflood >"$test_dir/flood.out" &
+flood_pid=$!
+for _ in {1..100}; do [[ -s $test_dir/flood.out ]] && break; sleep 0.1; done
+[[ $(<"$test_dir/flood.out") == "blocked" ]] || fail "an app that never reads is held back instead of buffered" "$(<"$test_dir/flood.out") $(tail -3 "$test_dir/broker.log")"
+rss=$(awk '/^VmRSS/ { print $2 }' "/proc/$broker/status")
+(( rss < 120000 )) || fail "an app that never reads does not grow the broker" "${rss} kB"
+run_broker omarchy-agent-seat-status >/dev/null || fail "the broker answers while an app floods it"
+wait "$flood_pid"
+pass "an app that never reads is held back instead of buffered"
 
 sandbox_marker="agent-seat-test-$$"
 run_broker omarchy-agent-seat-run --no-wait /usr/bin/bash -c '/usr/bin/sleep 300 & /usr/bin/sleep 300' "$sandbox_marker" || fail "a headless sandbox starts"
