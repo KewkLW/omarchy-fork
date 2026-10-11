@@ -66,24 +66,28 @@ class Connection:
         return object_id, word & 0xFFFF, body
 EOF
 
-# A fake Hyprland: advertises a seat, a compositor, xdg_wm_base, the data
-# device manager, a virtual pointer manager and GPU buffers, answers wl_display.sync,
-# plays a user pointer entering every surface it can, and logs what reaches it.
+# A fake Hyprland: advertises a seat, a compositor, shared memory, subsurfaces,
+# xdg_wm_base, the data device manager, a virtual pointer manager and GPU
+# buffers, answers wl_display.sync, plays a user pointer entering every surface
+# it can, and logs what reaches it. Each connection gets its own thread, so apps
+# can stay connected side by side.
 cat >"$test_dir/compositor.py" <<'EOF'
-import array, os, socket, struct, subprocess, sys
+import array, os, socket, struct, subprocess, sys, threading, time
 sys.path.insert(0, os.path.dirname(__file__))
 from wire import Connection, message, string, read_string
 
 path, log = sys.argv[1], open(sys.argv[2], "a", buffering=1)
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(path)
-server.listen(4)
+server.listen(64)
 
-GLOBALS = {1: ("wl_seat", 7), 2: ("wl_compositor", 6), 3: ("xdg_wm_base", 6), 4: ("wl_data_device_manager", 3), 5: ("zwlr_virtual_pointer_manager_v1", 2), 6: ("zwp_linux_dmabuf_v1", 5)}
+GLOBALS = {1: ("wl_seat", 7), 2: ("wl_compositor", 6), 3: ("xdg_wm_base", 6), 4: ("wl_data_device_manager", 3), 5: ("zwlr_virtual_pointer_manager_v1", 2), 6: ("zwp_linux_dmabuf_v1", 5), 7: ("wl_shm", 1), 8: ("wl_subcompositor", 1)}
+SLOW_SYNC = 999  # a sync with this callback is answered late, for tests that need an event in flight
+POPUP = (30, 25, 20, 10)  # where every popup opens, relative to its parent
 
-while True:
-    conn = Connection(server.accept()[0])
+def serve(conn):
     objects = {1: "wl_display"}
+    keyboard = surface = None
     while (msg := conn.read(timeout=None)) is not None:
         object_id, opcode, body = msg
         kind = objects.get(object_id, "?")
@@ -94,7 +98,8 @@ while True:
                 conn.send(message(registry, 0, struct.pack("<I", name) + string(interface) + struct.pack("<I", version)))
         elif kind == "wl_display" and opcode == 0:
             callback = struct.unpack("<I", body)[0]
-            log.write(f"sync {callback}\n")
+            if callback == SLOW_SYNC:
+                time.sleep(0.5)
             conn.send(message(callback, 0, struct.pack("<I", 0)) + message(1, 1, struct.pack("<I", callback)))
         elif kind == "wl_registry":
             name = struct.unpack_from("<I", body)[0]
@@ -120,14 +125,25 @@ while True:
         elif kind == "wl_compositor" and opcode == 0:
             surface = struct.unpack("<I", body)[0]
             objects[surface] = "wl_surface"
+        elif kind in ("wl_surface", "wl_subsurface") and opcode == 0:
+            conn.send(message(1, 1, struct.pack("<I", object_id)))  # destroyed: the id is free again
+        elif kind == "wl_shm" and opcode == 0:
+            objects[struct.unpack_from("<I", body)[0]] = "wl_shm_pool"
+            os.close(conn.fds.pop(0))
+        elif kind == "wl_subcompositor" and opcode == 1:
+            objects[struct.unpack_from("<I", body)[0]] = "wl_subsurface"
         elif kind == "xdg_wm_base" and opcode == 2:
             objects[struct.unpack_from("<I", body)[0]] = "xdg_surface"
         elif kind == "xdg_surface" and opcode == 1:
             objects[struct.unpack("<I", body)[0]] = "xdg_toplevel"
+        elif kind == "xdg_surface" and opcode == 2:
+            popup = struct.unpack_from("<I", body)[0]
+            objects[popup] = "xdg_popup"
+            conn.send(message(popup, 0, struct.pack("<iiii", *POPUP)))
         elif kind == "xdg_toplevel" and opcode == 3:
             app_id = read_string(body)
             log.write(f"app_id {app_id}\n")
-            if "." in app_id:
+            if "." in app_id and keyboard:
                 # The user clicks into the agent window and presses a key.
                 conn.send(message(keyboard, 1, struct.pack("<II", 900, surface) + struct.pack("<I", 0)))
                 conn.send(message(keyboard, 3, struct.pack("<IIII", 901, 0, 30, 1)) + message(keyboard, 3, struct.pack("<IIII", 902, 0, 30, 0)))
@@ -147,6 +163,19 @@ while True:
             os.close(fd)
         elif kind == "wl_data_device" and opcode == 1:
             log.write(f"set_selection {struct.unpack_from('<I', body, 4)[0]}\n")
+
+def run(sock):
+    conn = Connection(sock)
+    try:
+        serve(conn)
+    except OSError:
+        pass  # the broker dropped this app
+    for fd in conn.fds:
+        os.close(fd)
+    sock.close()
+
+while True:
+    threading.Thread(target=run, args=(server.accept()[0],), daemon=True).start()
 EOF
 
 # The agent app: connects through the broker and reports what it sees.
@@ -270,7 +299,7 @@ for _ in {1..50}; do [[ -S $socket ]] && break; sleep 0.1; done
 pass "control socket is private to the user"
 
 globals=$(python3 "$test_dir/app.py" "$socket" globals)
-[[ $globals == "wl_compositor wl_data_device_manager wl_seat xdg_wm_base" ]] || fail "only allowlisted globals are advertised" "$globals"
+[[ $globals == "wl_compositor wl_data_device_manager wl_seat wl_shm wl_subcompositor xdg_wm_base" ]] || fail "only allowlisted globals are advertised" "$globals"
 pass "only allowlisted globals are advertised"
 
 hidden=$(python3 "$test_dir/app.py" "$socket" hidden 2>&1)
@@ -304,9 +333,9 @@ gpu_socket=$(jq -r '.socket' <<<"$grant")
 [[ $(jq -r '.scope' <<<"$grant") == "once" && -S $gpu_socket ]] || fail "an allowed launch gets a socket of its own" "$grant"
 [[ $(stat -c %a "$gpu_socket") == "600" ]] || fail "the GPU socket is private to the user"
 globals=$(python3 "$test_dir/app.py" "$gpu_socket" globals)
-[[ $globals == "wl_compositor wl_data_device_manager wl_seat xdg_wm_base zwp_linux_dmabuf_v1" ]] || fail "an allowed app gets GPU buffers" "$globals"
+[[ $globals == "wl_compositor wl_data_device_manager wl_seat wl_shm wl_subcompositor xdg_wm_base zwp_linux_dmabuf_v1" ]] || fail "an allowed app gets GPU buffers" "$globals"
 globals=$(python3 "$test_dir/app.py" "$socket" globals)
-[[ $globals == "wl_compositor wl_data_device_manager wl_seat xdg_wm_base" ]] || fail "other apps still get no GPU buffers" "$globals"
+[[ $globals == "wl_compositor wl_data_device_manager wl_seat wl_shm wl_subcompositor xdg_wm_base" ]] || fail "other apps still get no GPU buffers" "$globals"
 pass "an allowed app gets GPU buffers on a socket of its own, other apps do not"
 
 gpu_request >/dev/null 2>&1
