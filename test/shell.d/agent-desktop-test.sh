@@ -285,3 +285,14 @@ for target in "$test_dir/elsewhere/notes.png" ../elsewhere/notes.png link/notes.
 done
 [[ -z $(ls -A "$test_dir/elsewhere") && ! -e $test_dir/cwd/new ]] || fail "a refused screenshot writes and creates nothing"
 pass "a screenshot is refused outside the runtime and current directories, through symlinks, or in a missing directory"
+
+# The seat broker --------------------------------------------------------------
+
+reset
+set_window foot 10
+drive type 0xa1 'Hi, {there}!' >/dev/null && drive key 0xa1 ctrl+shift+t >/dev/null || fail "keys resolve without the seat broker"
+[[ ! -s $state/broker.log ]] && ! grep -qE 'SourceFileLoader|import.*broker' "$ROOT/bin/omarchy-agent-desktop" ||
+  fail "the drive neither imports nor runs the seat broker for keys"
+grep -q 'mods = "SHIFT", key = "code:34"' "$state/hyprctl.log" && grep -q 'mods = "SHIFT + CTRL", key = "code:28"' "$state/hyprctl.log" ||
+  fail "keys resolve through the user's layout" "$(cat "$state/hyprctl.log")"
+pass "keys resolve through the user's layout without the seat broker"
