@@ -26,6 +26,7 @@ write_record() {
 
 cleanup() {
   [[ -e $record ]] && unlink "$record"
+  rm -rf -- "${record%/*}/$marker.d"
 }
 trap cleanup EXIT
 

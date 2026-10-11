@@ -69,16 +69,40 @@ local AGENTS = {
 -- which is how the workspace follows the monitor you're on.
 local placements = {}
 
-local function json_escape(value)
-  return '"' .. tostring(value):gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
+local function read(path)
+  local file = io.open(path, "rb")
+  if not file then
+    return nil
+  end
+  local data = file:read("a")
+  file:close()
+  return data
+end
+
+local JSON_ESCAPES = { ['"'] = '\\"', ["\\"] = "\\\\", ["\b"] = "\\b", ["\f"] = "\\f", ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" }
+
+local function json_string(value)
+  return '"' .. tostring(value):gsub('[%c"\\]', function(char)
+    return JSON_ESCAPES[char] or string.format("\\u%04x", char:byte())
+  end) .. '"'
+end
+
+-- Hyprland reports workspace ids as integers, so the policy holds integers;
+-- an entry that is no workspace number could never match and is left out.
+local function json_workspace(value)
+  local number = math.tointeger(tonumber(value))
+  return number and tostring(number)
 end
 
 local function json_array(values, encode)
   local items = {}
   for _, value in ipairs(values or {}) do
-    table.insert(items, encode(value))
+    local item = encode(value)
+    if item then
+      table.insert(items, item)
+    end
   end
-  return "[" .. table.concat(items, ",") .. "]"
+  return "[" .. table.concat(items, ", ") .. "]"
 end
 
 local function agent_workspaces()
@@ -92,29 +116,66 @@ local function agent_workspaces()
   return values
 end
 
+local function drive_policy()
+  local drive = M.settings.drive or {}
+  return table.concat({
+    "{",
+    '  "agent_workspaces": ' .. json_array(agent_workspaces(), json_workspace) .. ",",
+    '  "extra_workspaces": ' .. json_array(drive.extra_workspaces, json_workspace) .. ",",
+    '  "always_allow_classes": ' .. json_array(drive.always_allow_classes, json_string) .. ",",
+    '  "never_allow_classes": ' .. json_array(drive.never_allow_classes, json_string) .. ",",
+    '  "tag": "agent-drive"',
+    "}",
+    "",
+  }, "\n")
+end
+
+-- What the policy file holds, so focusing another monitor rewrites it only
+-- when the policy it gives actually changes.
+local written_policy
+
 local function write_drive_policy()
   local runtime = os.getenv("XDG_RUNTIME_DIR")
-  if not runtime then
+  if not runtime or runtime == "" then
     return
   end
   local directory = runtime .. "/omarchy"
-  os.execute("mkdir -p " .. string.format("%q", directory))
   local path = directory .. "/agent-drive.json"
+  local policy = drive_policy()
+  written_policy = written_policy or read(path)
+  if policy == written_policy then
+    return
+  end
+
   local temporary = path .. ".tmp"
   local file = io.open(temporary, "wb")
   if not file then
-    return
+    -- Plain Lua can't make a directory, so this one shell runs only when the
+    -- directory is missing, normally once per session.
+    os.execute("mkdir -p -- '" .. directory:gsub("'", "'\\''") .. "'")
+    file = io.open(temporary, "wb")
+    if not file then
+      return
+    end
   end
-  local drive = M.settings.drive or {}
-  file:write("{\n")
-  file:write('  "agent_workspaces": ', json_array(agent_workspaces(), tostring), ",\n")
-  file:write('  "extra_workspaces": ', json_array(drive.extra_workspaces, tostring), ",\n")
-  file:write('  "always_allow_classes": ', json_array(drive.always_allow_classes, json_escape), ",\n")
-  file:write('  "never_allow_classes": ', json_array(drive.never_allow_classes, json_escape), ",\n")
-  file:write('  "tag": "agent-drive"\n')
-  file:write("}\n")
+  file:write(policy)
   file:close()
-  os.rename(temporary, path)
+  if os.rename(temporary, path) then
+    written_policy = policy
+  end
+end
+
+-- The user's hyprland.lua calls set() after Omarchy's own rules have placed
+-- their windows, so writing the policy while the config is still running would
+-- hand agents the default policy for a moment on every reload. Until the config
+-- has finished loading, the file keeps whatever the last load wrote.
+local loaded = false
+
+local function finish_loading()
+  if not loaded then
+    loaded = true
+    write_drive_policy()
+  end
 end
 
 local function monitor_index(active)
@@ -167,17 +228,9 @@ local function apply()
       workspace = placement.silent and workspace .. " silent" or workspace,
     })
   end
-  write_drive_policy()
-end
-
-local function read(path)
-  local file = io.open(path, "rb")
-  if not file then
-    return nil
+  if loaded then
+    write_drive_policy()
   end
-  local data = file:read("a")
-  file:close()
-  return data
 end
 
 local function spawned_by_agent(pid)
@@ -318,5 +371,10 @@ end)
 hl.on("monitor.focused", apply)
 hl.on("monitor.added", apply)
 hl.on("monitor.removed", apply)
+
+-- Hyprland fires config.reloaded once the whole config has run, on the first
+-- load as well as on every reload, into the fresh Lua state it just ran.
+hl.on("config.reloaded", finish_loading)
+hl.on("hyprland.start", finish_loading)
 
 return M

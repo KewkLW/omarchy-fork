@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# omarchy:group=agent
+# omarchy:name=seat click-ui
+# omarchy:summary=Click a control in an agent seat window by its name
+# omarchy:args=<window> <name> | <window> <role>:<name> [--button left|right|middle] [--double]
+# omarchy:examples=omarchy agent seat click-ui 1 Save | omarchy agent seat click-ui 1 "push button:OK" | omarchy agent seat click-ui 1 link:Docs --double
+
+# Finds the control with omarchy agent seat ui (an exact name, then a
+# case-insensitive one, then a unique substring) and clicks its centre with the
+# agent's own pointer, the same click omarchy agent seat pointer makes, so focus
+# moves exactly as it would for a click by coordinates. Several matches list
+# the candidates and exit 1; narrow them with a role.
+
+if (($# < 2)); then
+  echo "Usage: omarchy agent seat click-ui <window> <name>|<role>:<name> [--button left|right|middle] [--double]" >&2
+  exit 1
+fi
+
+window=$1
+query=$2
+shift 2
+
+control=$(omarchy-agent-seat-ui "$window" --find "$query" --json) || exit
+read -r x y < <(jq -r '"\(.x) \(.y)"' <<<"$control")
+omarchy-agent-seat-pointer "$window" click "$x" "$y" "$@" || exit
+jq -r '"Clicked \(.role) \(.name | @json) at \(.x),\(.y)"' <<<"$control"

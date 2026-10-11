@@ -3,7 +3,7 @@
 # omarchy:summary=Stop the agent seat, closing every app on it
 
 runtime="$XDG_RUNTIME_DIR/omarchy/agent-seat"
-sandbox_supervisor=$(realpath -e "$(dirname "$0")/omarchy-agent-seat-sandbox")
+sandbox_supervisor=$(realpath -e "$OMARCHY_PATH/bin/omarchy-agent-seat-sandbox")
 
 process_start_time() {
   local stat fields
@@ -19,7 +19,7 @@ process_has_start() {
   local current
 
   current=$(process_start_time "$1") || return 1
-  [[ $current == $2 ]]
+  [[ $current == "$2" ]]
 }
 
 supervisor_matches() {
@@ -28,7 +28,7 @@ supervisor_matches() {
 
   process_has_start "$pid" "$start" || return 1
   mapfile -d '' -t command 2>/dev/null <"/proc/$pid/cmdline" || return 1
-  [[ ${command[0]:-} == "/bin/bash" && ${command[1]:-} == $sandbox_supervisor && ${command[2]:-} == $record && ${command[3]:-} == $marker ]]
+  [[ ${command[0]:-} == "/bin/bash" && ${command[1]:-} == "$sandbox_supervisor" && ${command[2]:-} == "$record" && ${command[3]:-} == "$marker" ]]
 }
 
 mkdir -p "$runtime/sandboxes"
@@ -82,6 +82,7 @@ for record in "$runtime"/sandboxes/sandbox.*; do
     fi
   fi
   unlink "$record" 2>/dev/null || true
+  [[ $marker =~ ^[[:alnum:]]+$ ]] && rm -rf -- "$runtime/sandboxes/$marker.d"
 done
 
 flock -u 9

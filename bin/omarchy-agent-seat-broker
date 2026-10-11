@@ -215,6 +215,11 @@ def encode_bytes(data):
   return struct.pack("<I", len(data)) + data + b"\0" * (-len(data) % 4)
 
 
+def peer(sock):
+  """The pid and uid of the process at the other end of a Unix socket."""
+  return struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[:2]
+
+
 def close_fds(signature, args):
   """Close the descriptors a decoded message carried, when it goes no further."""
   for (kind, _), value in zip(signature, args):
@@ -1121,6 +1126,7 @@ class Broker:
     except Exception:
       sock.close()
       raise
+    client.pid = peer(sock)[0]  # for omarchy agent seat ui
     if grant:
       grant.clients += 1
       grant.used = True
@@ -1186,7 +1192,7 @@ class Broker:
     conn = self.accept(listener)
     if not conn:
       return
-    caller, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+    caller, uid = peer(conn)
     if uid != os.getuid():
       conn.close()
       return
@@ -1461,6 +1467,46 @@ class Broker:
   def do_status(self):
     gpu_apps = sum(1 for client in self.clients if client.grant)
     return {"pid": os.getpid(), "apps": len(self.clients), "windows": len(self.windows), "gpu": "session" if self.gpu_session else "ask", "gpu_apps": gpu_apps}
+
+  def defer_state(self, conn, caller, window=None):
+    if window is not None:
+      self.window(window)  # an unknown window fails now, before asking Hyprland
+    try:
+      self.start_job(conn, ["hyprctl", "clients", "-j"], lambda output, _: self.state(self.hyprland_windows(output), window), HYPRCTL_SECONDS)
+    except OSError:
+      self.reply(conn, self.state({}, window))
+
+  def state(self, hyprland, window=None):
+    """Everything the seat knows about its windows: popups, focus, size, scale,
+    whether the app has drawn, and the app's pid. Origin is what pointer
+    coordinates are measured from: [left, top, scale] of the last screenshot."""
+    windows = []
+    for number, (client, toplevel) in sorted(self.windows.items()):
+      if window is not None and number != int(window):
+        continue
+      info = client.toplevels[toplevel]
+      xdg = client.xdg_surfaces.get(info["xdg"])
+      surface = xdg["surface"] if xdg else None
+      drawn = bool(surface in client.surfaces and client.surfaces[surface]["buffer"])
+      geometry = list(client.geometry(surface)) if drawn else None
+      scale = client.scale(toplevel) if drawn else None
+      popups = [{"position": [x, y], "size": list(client.size(s))} for s, x, y in client.layers(info["xdg"], 0, 0)[1:] if client.surfaces[s]["buffer"] and self.is_popup(client, s)] if xdg else []
+      windows.append({
+        "window": number, "app_id": info["app_id"], "title": info["title"], "pid": client.pid, "gpu": bool(client.grant),
+        "drawn": drawn, "size": [round(v) for v in geometry[2:]] if geometry else None, "geometry": geometry,
+        "surface": list(client.size(surface)) if drawn else None, "scale": scale,
+        "origin": list(self.captures.get(number, (0, 0, scale or 1))), "popups": popups,
+        "focus": {
+          "owner": client.last_actor,  # whose input the app saw last: "user", "agent" or null
+          "keyboard": any(focused == surface for focused in client.keyboards.values()),
+          "user_keyboard": client.user_keyboard is not None and client.user_keyboard == surface,
+          "user_pointer": bool(client.user_pointer and xdg and client.user_pointer[0] in [s for s, _, _ in client.layers(info["xdg"], 0, 0)]),
+        },
+        **hyprland.get(number, {}),
+      })
+    if window is not None and not windows:
+      raise ValueError(f"no agent window {window}")
+    return {"windows": windows}
 
   def adopt_keymap(self, text):
     if text != self.keymap.text:
