@@ -54,7 +54,7 @@ GPU buffers are hidden too, by default. Apps then draw into shared memory the br
 
 ### The clipboard is the user's
 
-An app reads the clipboard only while the user's keyboard is in it and the user acted last: the user can paste, but the agent's Ctrl+V gets nothing. An app sets the clipboard, or starts a drag, only from the user's own input serial, so the agent can't overwrite what the user copied. Primary selection and data-control stay hidden.
+An app reads the clipboard only while the user's keyboard is in it and the user acted last: the user can paste, but the agent's Ctrl+V gets nothing. The gate is the user's focus, not a paste: a hostile page can read the clipboard as soon as the user clicks or types into its window. An app sets the clipboard, or starts a drag, only from the user's own input serial, so the agent can't overwrite what the user copied. Primary selection and data-control stay hidden.
 
 ### Screenshots and coordinates
 
@@ -66,9 +66,10 @@ The broker compiles Hyprland's own keymap (sent to the user's seat) with libxkbc
 
 ### The sandbox
 
-`bin/omarchy-agent-seat-run` starts each app in bubblewrap: `--unshare-all --share-net --new-session --clearenv`, read-only `/usr`, `/etc` and `/sys`, its own `/proc`, a minimal `/dev` with no uinput and no GPU, a tmpfs `/tmp` (so no X11 sockets), and its own `$XDG_RUNTIME_DIR` holding only the broker socket as `wayland-0`. Its home is `~/.local/share/omarchy/agent-seat/home`, with the user's fonts, icons and fontconfig read-only. There is no D-Bus, so no keyring and no portals. Apps installed outside `/usr` get their own directory mounted read-only.
+`bin/omarchy-agent-seat-run` starts each app in bubblewrap: `--unshare-all --share-net --new-session --clearenv`, read-only `/usr`, `/etc` and `/sys`, its own `/proc`, a minimal `/dev` with no uinput and no GPU, a tmpfs `/tmp` (so no X11 sockets), and its own `$XDG_RUNTIME_DIR` holding only the broker socket as `wayland-0`. Its home is `~/.local/share/omarchy/agent-seat/home`, with the user's fonts, icons and fontconfig read-only. There is no D-Bus, so no keyring and no portals. A program outside `/usr` gets its own file read-only, and its directory only when that is an app bundle (`lib`, `resources`, `resources.pak` or `AppRun` beside the executable) holding nothing the shares below refuse, so `seat run ~/a.out` or `/tmp/x` doesn't bind all of `$HOME` or `/tmp`.
 
-- **Files** reach the sandbox only when the agent shares them: `--share <path>` read-write, `--share-ro <path>` read-only, each at the same path. The seat adds no prompt of its own; sharing is part of the agent's command, so the agent's own permission rules decide it.
+- **Files** reach the sandbox only when the agent shares them: `--share <path>` read-write, `--share-ro <path>` read-only, each at the same path. The seat adds no prompt of its own; sharing is part of the agent's command, so the agent's own permission rules decide it. Shares that would undo the sandbox are refused before anything starts: `/`, `$HOME` or `/tmp` as a whole, `$XDG_RUNTIME_DIR` and `/run/user` (Hyprland, D-Bus, the keyring), `/tmp/.X11-unix`, `/proc`, `/dev`, any directory holding one of those, and anything inside `~/.config`, `~/.ssh`, `~/.gnupg` or `~/.local/share/keyrings`.
+- **The network** is the host's (`--share-net`), so an agent app reaches the internet and every service listening on the host's localhost. `pasta` (package `passt`) could give it the internet without the host's loopback; it isn't in Omarchy's package set, so for now this is documented rather than closed.
 - **The GPU** is the exception that asks. `--gpu` pops a menu in the user's session, which agent input can't reach, offering Allow once, Allow for this session, or Deny. It fails closed if the menu can't show. An allowed app connects through a socket of its own that also offers GPU buffers, with the GPU devices bound in. Its screenshots then come from Hyprland's toplevel capture, which may miss outside-the-window menus.
 - **Stopping** (`omarchy agent seat stop`, or _Trigger > Agents > Stop Agent Seat_ in the menu while the seat runs) ends the broker and every process in every sandbox. Each sandbox keeps a lifecycle record with process start times, so a recycled pid is never killed.
 
@@ -88,11 +89,13 @@ The trust boundary is the sandbox plus the allowlist, and the seat is honest abo
 - **Agent input reaches only agent apps.** The control socket is `0600` and checks the peer's uid with `SO_PEERCRED`. Every action names an agent window, and the broker only delivers events to its own apps.
 - **Agent apps reach only what the allowlist allows.** No input injection, screen capture, window lists, overlays or clipboard snooping, and a guessed global disconnects them.
 - **The sandbox holds the rest back**: no user files unless shared, no keyring, no D-Bus, no GPU unless the user says so, and no other processes.
-- **What it doesn't cover:** the agent process itself runs as the user. The seat keeps the apps it drives in a box; it doesn't box the agent. That's the agent harness's job, through its own permission rules.
+- **What it doesn't cover:** the network. Agent apps share the host's, so a hostile page can reach local databases, dev servers and browser debugging ports, and a debugging port an agent app opens is reachable from the whole machine.
+- **Nor** the clipboard once the user takes over: an agent app reads it while the user's keyboard is in it and the user acted last, so a hostile page sees it as soon as the user clicks in.
+- **Nor** the agent process itself, which runs as the user. The seat keeps the apps it drives in a box; it doesn't box the agent. That's the agent harness's job, through its own permission rules.
 
 ### Tests
 
-`test/shell.d/agent-seat-test.sh` runs the broker against a fake compositor and fake apps speaking the wire format. It covers the private control socket, the allowlist and the disconnect on a hidden bind, the renamed seat and the user's keymap, window naming, the user's keys and the agent's reaching the same app with focus correct, the clipboard (the user pastes and copies, the agent can't read or set it), the GPU prompt (once, session, deny, failing closed) and its own socket, bad keys refused, file sharing, and stop ending every sandboxed process without touching a recycled pid.
+`test/shell.d/agent-seat-test.sh` runs the broker against a fake compositor and fake apps speaking the wire format. It covers the private control socket, the allowlist and the disconnect on a hidden bind, the renamed seat and the user's keymap, window naming, the user's keys and the agent's reaching the same app with focus correct, the clipboard (the user pastes and copies, the agent can't read or set it), the GPU prompt (once, session, deny, failing closed) and its own socket, bad keys refused, file sharing, and stop ending every sandboxed process without touching a recycled pid. `test/shell.d/agent-seat-sandbox-test.sh` launches a headless probe through the real launcher and checks from inside that the home, the user's runtime directory, X11, Hyprland, D-Bus and the keyring are out of reach, that private shares are refused and scratch shares work, that a program outside `/usr` gets only its file unless it is a bundle, and that launches find their windows one at a time. `test/shell.d/agent-seat-rules-test.sh` plays Hyprland's rule passes over the real rules for agent windows with hostile titles.
 
 ## Rollout
 
@@ -102,6 +105,6 @@ The trust boundary is the sandbox plus the allowlist, and the seat is honest abo
 
 ## Open questions
 
-- **Size.** The broker is about 1,450 lines of Python. The screenshot composer and the debug tracing could be split out or trimmed. Is that the right size for Omarchy to own?
+- **Size.** The broker is the bulk of the seat, in one Python file. The screenshot composer and the debug tracing could be split out or trimmed. Is that the right size for Omarchy to own?
 - **PIDs across the sandbox.** An app that writes its own pid into a shared file writes a pid from the sandbox's namespace. Unreal's hot-reload tripped on this. Sharing `/proc` would fix it but loosens the sandbox.
 - **Unicode typing.** Characters outside the user's layout are refused. An input-method fallback would type anything, but it means advertising one more protocol.

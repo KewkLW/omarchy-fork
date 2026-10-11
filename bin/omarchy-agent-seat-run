@@ -9,6 +9,10 @@
 # D-Bus (so no keyring and no portals), no /dev/uinput, no GPU and its own
 # home, so it can neither drive nor read the user's seat.
 #
+# It does share the host's network: besides the internet it reaches every
+# service listening on the host's localhost (databases, dev servers, browser
+# debugging ports), and a port it opens is reachable from the whole machine.
+#
 # --gpu asks the user first, in their own menu, to let this launch use the GPU
 # (once, or for the rest of the session). Only then does the app get the GPU
 # devices, and a broker socket of its own that also offers GPU buffers.
