@@ -38,6 +38,7 @@ cleanup() {
   done
   [[ -n ${launcher_pid:-} ]] && kill "$launcher_pid" 2>/dev/null
   [[ -n ${broker_pid:-} ]] && kill "$broker_pid" 2>/dev/null
+  [[ -n ${compositor_pid:-} ]] && kill "$compositor_pid" 2>/dev/null
   # A broker a launch started; the shim execs it, so its pid is the broker's.
   [[ -s $test_dir/slow-broker/pid ]] && kill "$(<"$test_dir/slow-broker/pid")" 2>/dev/null
   wait 2>/dev/null
@@ -49,8 +50,50 @@ trap cleanup EXIT
 printf '#!/bin/bash\necho "[]"\n' >"$test_dir/bin/hyprctl"
 chmod +x "$test_dir/bin/hyprctl"
 
+# A fake Hyprland for the broker to forward windows to: it advertises a
+# compositor and xdg_wm_base and answers wl_display.sync, nothing more.
+cat >"$test_dir/compositor.py" <<'EOF'
+import socket, struct, sys, threading
+
+def string(text):
+    data = text.encode() + b"\0"
+    return struct.pack("<I", len(data)) + data + b"\0" * (-len(data) % 4)
+
+def message(object_id, opcode, body=b""):
+    return struct.pack("<II", object_id, (8 + len(body)) << 16 | opcode) + body
+
+def serve(sock):
+    buffer = b""
+    try:
+        while data := sock.recv(65536):
+            buffer += data
+            while len(buffer) >= 8 and len(buffer) >= struct.unpack_from("<II", buffer)[1] >> 16:
+                object_id, word = struct.unpack_from("<II", buffer)
+                body, buffer = buffer[8 : word >> 16], buffer[word >> 16 :]
+                if object_id == 1 and word & 0xFFFF == 1:
+                    registry = struct.unpack("<I", body)[0]
+                    for name, interface, version in ((1, "wl_compositor", 4), (2, "xdg_wm_base", 2)):
+                        sock.sendall(message(registry, 0, struct.pack("<I", name) + string(interface) + struct.pack("<I", version)))
+                elif object_id == 1 and word & 0xFFFF == 0:
+                    callback = struct.unpack("<I", body)[0]
+                    sock.sendall(message(callback, 0, struct.pack("<I", 0)) + message(1, 1, struct.pack("<I", callback)))
+    except OSError:
+        pass  # the broker dropped this app
+    sock.close()
+
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(sys.argv[1])
+server.listen(16)
+while True:
+    threading.Thread(target=serve, args=(server.accept()[0],), daemon=True).start()
+EOF
+python3 "$test_dir/compositor.py" "$runtime/compositor" 2>"$test_dir/compositor.log" &
+compositor_pid=$!
+for _ in {1..50}; do [[ -S $runtime/compositor ]] && break; sleep 0.1; done
+[[ -S $runtime/compositor ]] || fail "the fake compositor starts" "$(cat "$test_dir/compositor.log")"
+
 # env execs the command, so a background launch's $! is the command itself.
-on_seat=(env HOME="$home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=no-compositor PATH="$test_dir/bin:$ROOT/bin:$PATH")
+on_seat=(env HOME="$home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=compositor PATH="$test_dir/bin:$ROOT/bin:$PATH")
 
 # A share that slipped through must not start a broker this test can't end,
 # so these launches find a broker that refuses to serve.
@@ -182,6 +225,102 @@ for _ in {1..50}; do kill -0 "$second_pid" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$second_pid" 2>/dev/null && fail "the second launch goes ahead once the first is done"
 wait "$second_pid" || fail "the second launch succeeds"
 pass "launches find their windows one at a time, and stop is not held up"
+
+# An app with one window: it connects, reports <name>-ready in a shared
+# directory, opens its window once <name>-go appears there, reports
+# <name>-mapped and stays until the broker hangs up. Self-contained, since the
+# sandbox gets only this file.
+cat >"$test_dir/toplevel" <<'EOF'
+#!/usr/bin/python3
+import os, socket, struct, sys, time
+
+name, shared = sys.argv[1:3]
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(os.environ["XDG_RUNTIME_DIR"] + "/wayland-0")
+buffer = b""
+
+def send(object_id, opcode, body=b""):
+    sock.sendall(struct.pack("<II", object_id, (8 + len(body)) << 16 | opcode) + body)
+
+def string(text):
+    data = text.encode() + b"\0"
+    return struct.pack("<I", len(data)) + data + b"\0" * (-len(data) % 4)
+
+def read():
+    global buffer
+    while len(buffer) < 8 or len(buffer) < struct.unpack_from("<II", buffer)[1] >> 16:
+        data = sock.recv(65536)
+        if not data:
+            sys.exit(0)
+        buffer += data
+    object_id, word = struct.unpack_from("<II", buffer)
+    body, buffer = buffer[8 : word >> 16], buffer[word >> 16 :]
+    return object_id, word & 0xFFFF, body
+
+def roundtrip(callback):
+    send(1, 0, struct.pack("<I", callback))
+    events = []
+    while (event := read())[0] != callback:
+        events.append(event)
+    return events
+
+def report(state):
+    open(f"{shared}/{name}-{state}", "w").close()
+
+send(1, 1, struct.pack("<I", 2))
+names = {}
+for object_id, opcode, body in roundtrip(3):
+    if object_id == 2 and opcode == 0:
+        length = struct.unpack_from("<I", body, 4)[0]
+        names[body[8 : 7 + length].decode()] = struct.unpack_from("<I", body)[0]
+for interface, new_id in (("wl_compositor", 4), ("xdg_wm_base", 5)):
+    send(2, 0, struct.pack("<I", names[interface]) + string(interface) + struct.pack("<II", 1, new_id))
+roundtrip(6)
+report("ready")
+
+while not os.path.exists(f"{shared}/{name}-go"):
+    time.sleep(0.02)
+send(4, 0, struct.pack("<I", 7))      # wl_compositor.create_surface
+send(5, 2, struct.pack("<II", 8, 7))  # xdg_wm_base.get_xdg_surface
+send(8, 1, struct.pack("<I", 9))      # xdg_surface.get_toplevel
+send(9, 3, string(name))              # xdg_toplevel.set_app_id
+send(7, 6)                            # wl_surface.commit
+roundtrip(10)
+report("mapped")
+
+while read():
+    pass
+EOF
+chmod +x "$test_dir/toplevel"
+
+# Waits for an app on the seat to report a state through the shared directory.
+reported() {
+  for _ in {1..100}; do
+    [[ -e $test_dir/out/$1 ]] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+# Another seat app's window (a dialog, say) that opens while a launch waits for
+# its own is not the launch's window.
+"${on_seat[@]}" omarchy-agent-seat-run --no-wait --share "$test_dir/out" "$test_dir/toplevel" first "$test_dir/out" ||
+  fail "a first windowed app starts" "$(cat "$seat/apps.log" 2>/dev/null)"
+reported first-ready || fail "the first windowed app connects" "$(cat "$seat/apps.log" 2>/dev/null)"
+# Its sandbox starts only after the launch has listed the windows before it.
+"${on_seat[@]}" omarchy-agent-seat-run --share "$test_dir/out" "$test_dir/toplevel" second "$test_dir/out" >"$test_dir/second-window" 2>&1 &
+second_pid=$!
+reported second-ready || fail "the second windowed app connects" "$(cat "$seat/apps.log" 2>/dev/null)"
+touch "$test_dir/out/first-go"
+reported first-mapped || fail "the first app opens its window" "$(cat "$seat/apps.log" 2>/dev/null)"
+# Give the waiting launch time to see the first app's window on its own.
+sleep 0.5
+touch "$test_dir/out/second-go"
+wait "$second_pid" || fail "the launch of the second app finds a window" "$(cat "$test_dir/second-window")"
+second_window=$(<"$test_dir/second-window")
+app=$("${on_seat[@]}" omarchy-agent-seat-windows | jq -r --arg window "$second_window" '.[] | select((.window | tostring) == $window) | .app_id')
+[[ $app == "second" ]] || fail "a launch returns its own app's window, not another app's" "window $second_window is ${app:-unknown}: $("${on_seat[@]}" omarchy-agent-seat-windows)"
+pass "a launch returns its own app's window, not one another app opens meanwhile"
 
 # Reports whether the sandbox's wayland-0 has a broker behind it.
 cat >"$test_dir/connect" <<'EOF_CONNECT'

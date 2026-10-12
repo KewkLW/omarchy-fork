@@ -141,17 +141,38 @@ runtime="$XDG_RUNTIME_DIR/omarchy/agent-seat"
 agent_home="$HOME/.local/share/omarchy/agent-seat/home"
 sandbox_supervisor=$(realpath -e "$OMARCHY_PATH/bin/omarchy-agent-seat-sandbox")
 
+# Each seat window with the pid of the app that opened it, as the broker sees
+# it: the host pid of the process inside the sandbox.
 windows() {
-  omarchy-agent-seat-broker call '{"command":"windows"}' 2>/dev/null | jq -r '.windows[].window'
+  omarchy-agent-seat-broker call '{"command":"state"}' 2>/dev/null | jq -r '.windows[] | "\(.window) \(.pid // 0)"'
+}
+
+# Whether a process runs in this launch's sandbox: the supervisor is among its
+# ancestors. bwrap's PID-namespace init stays a child of the outer bwrap, which
+# is the supervisor's child, and a sandboxed process that loses its parent is
+# reparented to that init, so every chain from inside ends at the supervisor.
+# The chain holds for apps that nest their own PID namespaces (Chromium's
+# sandbox) too, where comparing namespaces would not.
+in_sandbox() {
+  local pid=$1 status
+
+  while ((pid > 1)); do
+    ((pid == sandbox_pid)) && return 0
+    { status=$(<"/proc/$pid/status"); } 2>/dev/null || return 1
+    [[ $status =~ $'\n'PPid:[[:space:]]+([0-9]+) ]] || return 1
+    pid=${BASH_REMATCH[1]}
+  done
+  return 1
 }
 
 mkdir -p "$runtime/sandboxes"
 
-# The new window is the one missing from the list taken before the launch, so
-# launches take turns from that list until their window appears (or the wait
-# times out); otherwise two at once could each be handed the other's window.
-# A --no-wait launch takes its turn too, but its window may still appear while
-# a later launch waits. Stop never takes this lock.
+# The new window is one missing from the list taken before the launch whose
+# app runs in this launch's sandbox, so another app's window that opens
+# meanwhile (a dialog, say) is never handed back. Launches still take turns
+# from that list until their window appears (or the wait times out). A
+# --no-wait launch takes its turn too, but its window may still appear while a
+# later launch waits. Stop never takes this lock.
 exec 8>"$runtime/launch.lock"
 flock 8
 
@@ -241,7 +262,7 @@ fi
 setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 8>&- 9>&- &
 supervisor_pid=$!
 for _ in {1..50}; do
-  read -r _ _ _ tracked_bwrap _ <"$record" || true
+  read -r tracked_supervisor _ _ tracked_bwrap _ <"$record" || true
   (( ${tracked_bwrap:-0} != 0 )) && break
   kill -0 "$supervisor_pid" 2>/dev/null || break
   sleep 0.01
@@ -249,13 +270,19 @@ done
 flock -u 9
 exec 9>&-
 
+# The supervisor writes its own pid to the record; $! is the same process
+# unless setsid had to fork.
+sandbox_pid=${tracked_supervisor:-$supervisor_pid}
+[[ $sandbox_pid =~ ^[0-9]+$ ]] || sandbox_pid=$supervisor_pid
+
 if [[ $wait_for_window == "true" ]]; then
   for _ in {1..150}; do
-    window=$(comm -13 <(sort <<<"$before") <(windows | sort) | head -1)
-    if [[ -n $window ]]; then
-      echo "$window"
-      exit 0
-    fi
+    while read -r window pid; do
+      if in_sandbox "$pid"; then
+        echo "$window"
+        exit 0
+      fi
+    done < <(comm -13 <(sort <<<"$before") <(windows | sort) | sort -n)
     sleep 0.1
   done
 
