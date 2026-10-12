@@ -696,7 +696,7 @@ class Client:
     return True
 
   def request_wl_compositor_create_surface(self, _, args):
-    self.surfaces[args[0]] = {"buffer": None, "pending": None, "scale": 1, "viewport": None, "source": None, "input": None, "children": [], "parent": None, "position": (0, 0)}
+    self.surfaces[args[0]] = {"buffer": None, "pending": None, "scale": 1, "viewport": None, "source": None, "input": None, "stack": [args[0]], "parent": None, "position": (0, 0)}
     return True
 
   def request_wl_compositor_create_region(self, _, args):
@@ -785,11 +785,29 @@ class Client:
     self.surfaces[self.roles[viewport]]["source"] = tuple(args) if args[2] > 0 and args[3] > 0 else None
     return True
 
+  # A surface's stack is its subsurfaces and itself, bottom to top. A new
+  # subsurface goes on top, and can then move above or below any sibling or
+  # its parent.
+
   def request_wl_subcompositor_get_subsurface(self, _, args):
     self.roles[args[0]] = args[1]
-    self.surfaces[args[2]]["children"].append(args[1])
+    self.surfaces[args[2]]["stack"].append(args[1])
     self.surfaces[args[1]]["parent"] = args[2]
     return True
+
+  def request_wl_subsurface_place_above(self, subsurface, args):
+    self.restack(self.roles[subsurface], args[0], 1)
+    return True
+
+  def request_wl_subsurface_place_below(self, subsurface, args):
+    self.restack(self.roles[subsurface], args[0], 0)
+    return True
+
+  def restack(self, surface, sibling, above):
+    parent = self.surfaces.get(self.surfaces.get(surface, {}).get("parent"))
+    if parent and sibling != surface and sibling in parent["stack"] and surface in parent["stack"]:
+      parent["stack"].remove(surface)
+      parent["stack"].insert(parent["stack"].index(sibling) + above, surface)
 
   # A destroyed subsurface leaves its parent at once, before its id can come
   # back as an unrelated surface.
@@ -800,8 +818,8 @@ class Client:
 
   def request_wl_surface_destroy(self, surface, _):
     self.unparent(surface)
-    for child in self.surfaces.get(surface, {}).get("children", []):
-      if child in self.surfaces:
+    for child in self.surfaces.get(surface, {}).get("stack", []):
+      if child != surface and child in self.surfaces:
         self.surfaces[child]["parent"] = None
     return True
 
@@ -815,8 +833,8 @@ class Client:
     state = self.surfaces.get(surface)
     if not state:
       return
-    if state["parent"] in self.surfaces and surface in self.surfaces[state["parent"]]["children"]:
-      self.surfaces[state["parent"]]["children"].remove(surface)
+    if state["parent"] in self.surfaces and surface in self.surfaces[state["parent"]]["stack"]:
+      self.surfaces[state["parent"]]["stack"].remove(surface)
     state["parent"] = None
 
   def request_wl_subsurface_set_position(self, subsurface, args):
@@ -1004,11 +1022,12 @@ class Client:
     state = self.surfaces.get(surface)
     if not state:
       return
-    stack.append((surface, x, y))
-    for child in state["children"]:
-      if child in self.surfaces:
-        cx, cy = self.surfaces[child]["position"]
-        self.subtree(child, x + cx, y + cy, stack)
+    for member in state["stack"]:
+      if member == surface:
+        stack.append((surface, x, y))
+      elif member in self.surfaces:
+        cx, cy = self.surfaces[member]["position"]
+        self.subtree(member, x + cx, y + cy, stack)
 
   def size(self, surface):
     state = self.surfaces[surface]
@@ -1598,7 +1617,7 @@ class Broker:
       info = client.toplevels[toplevel]
       xdg = client.xdg_surfaces.get(info["xdg"])
       geometry = (xdg["geometry"] or (0, 0, *client.size(xdg["surface"]))) if xdg else None
-      popups = [[round(v) for v in (x, y, *client.size(surface))] for surface, x, y in client.layers(info["xdg"], 0, 0)[1:] if client.surfaces[surface]["buffer"] and self.is_popup(client, surface)] if xdg else []
+      popups = [[round(v) for v in (x, y, *client.size(surface))] for surface, x, y in client.layers(info["xdg"], 0, 0) if client.surfaces[surface]["buffer"] and self.is_popup(client, surface)] if xdg else []
       windows.append({"window": window, "app_id": info["app_id"], "title": info["title"], "pid": client.pid, "size": [round(v) for v in geometry[2:]] if geometry else None, "popups": popups, **hyprland.get(window, {})})
     return {"windows": windows}
 
@@ -1632,7 +1651,7 @@ class Broker:
       drawn = bool(surface in client.surfaces and client.surfaces[surface]["buffer"])
       geometry = list(client.geometry(surface)) if drawn else None
       scale = client.scale(toplevel) if drawn else None
-      popups = [{"position": [x, y], "size": list(client.size(s))} for s, x, y in client.layers(info["xdg"], 0, 0)[1:] if client.surfaces[s]["buffer"] and self.is_popup(client, s)] if xdg else []
+      popups = [{"position": [x, y], "size": list(client.size(s))} for s, x, y in client.layers(info["xdg"], 0, 0) if client.surfaces[s]["buffer"] and self.is_popup(client, s)] if xdg else []
       windows.append({
         "window": number, "app_id": info["app_id"], "title": info["title"], "pid": client.pid, "gpu": bool(client.grant),
         "drawn": drawn, "size": [round(v) for v in geometry[2:]] if geometry else None, "geometry": geometry,

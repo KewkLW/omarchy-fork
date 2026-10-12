@@ -825,6 +825,7 @@ class Seat:
         self.request(COMPOSITOR, "create_surface", surface)
         self.request(SUBCOMPOSITOR, "get_subsurface", role, surface, parent)
         self.request(role, "set_position", x, y)
+        return role
 
     def draw(self, surface, width, height, pixel, format=XRGB, scale=1):
         """Fill a surface with one 4-byte pixel, or with the pixels of a whole
@@ -959,6 +960,26 @@ def hole(seat, problems):
     check(problems, "a click on the subsurface around its hole", seat.client.hit(22, 7, 7), (23, 2, 2))
     check(problems, "a click in the subsurface's hole", seat.client.hit(22, 15, 15), (20, 15, 15))
 
+def stacking(seat, problems):
+    # A red 40x30 window with a green 20x20 subsurface at 5,5 and a blue one
+    # at 15,10 over it, then the blue one moved below the green one, then
+    # the green one below the window.
+    seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, RED)
+    green = seat.subsurface(23, 20, 5, 5)
+    seat.draw(23, 20, 20, GREEN)
+    blue = seat.subsurface(24, 20, 15, 10)
+    seat.draw(24, 20, 20, BLUE)
+    seat.request(20, "commit")
+    check(problems, "where they overlap, the newer subsurface", (seat.pixel(22, 20, 15), seat.client.hit(22, 20, 15)), ("0000ff", (24, 5, 5)))
+    seat.request(blue, "place_below", 23)
+    seat.request(20, "commit")
+    check(problems, "where they overlap, after the newer one moves below", (seat.pixel(22, 20, 15), seat.client.hit(22, 20, 15)), ("00ff00", (23, 15, 10)))
+    seat.request(green, "place_below", 20)
+    seat.request(20, "commit")
+    check(problems, "a subsurface moved below its window", (seat.pixel(22, 7, 7), seat.client.hit(22, 7, 7)), ("ff0000", (20, 7, 7)))
+    check(problems, "where they overlap, after the older one moves below the window", (seat.pixel(22, 20, 15), seat.client.hit(22, 20, 15)), ("0000ff", (24, 5, 5)))
+
 problems = []
 globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
 print("; ".join(problems) or "ok")
@@ -992,6 +1013,10 @@ pass "a screenshot draws only the part of a buffer a viewport shows"
 result=$(inproc hole)
 [[ $result == "ok" ]] || fail "a click in a hole cut out of a surface's input region falls through to the surface beneath" "$result"
 pass "a click in a hole cut out of a surface's input region falls through to the surface beneath"
+
+result=$(inproc stacking)
+[[ $result == "ok" ]] || fail "screenshots and clicks follow subsurfaces moved above or below each other and their window" "$result"
+pass "screenshots and clicks follow subsurfaces moved above or below each other and their window"
 
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 
