@@ -273,9 +273,11 @@ old_agent_home="$HOME/.local/share/omarchy/agent-seat/home"
 sandbox_supervisor=$(realpath -e "$OMARCHY_PATH/bin/omarchy-agent-seat-sandbox")
 
 # Each seat window with the pid of the app that opened it, as the broker sees
-# it: the host pid of the process inside the sandbox.
+# it: the host pid of the process inside the sandbox. The broker answers once
+# Hyprland lists its windows, which it allows five seconds; a broker that never
+# answers would otherwise hold the launch lock forever.
 windows() {
-  omarchy-agent-seat-broker call '{"command":"state"}' 2>/dev/null | jq -r '.windows[] | "\(.window) \(.pid // 0)"'
+  timeout 10 omarchy-agent-seat-broker call '{"command":"state"}' 2>/dev/null | jq -r '.windows[] | "\(.window) \(.pid // 0)"'
 }
 
 # Whether a process runs in this launch's sandbox: the supervisor is among its
@@ -336,8 +338,12 @@ if ! error=$(mkdir -p -- "$agent_home" 2>&1); then
   exit 1
 fi
 
+# Status is answered at once, never after Hyprland, so a slow Hyprland cannot
+# pass for a dead broker. A broker that holds its socket open but never answers
+# would hang the call, and the deadline below with it, so a call that takes
+# longer than three seconds counts as no answer.
 broker_answers() {
-  omarchy-agent-seat-broker call '{"command":"windows"}' >/dev/null 2>&1
+  timeout 3 omarchy-agent-seat-broker call '{"command":"status"}' >/dev/null 2>&1
 }
 
 # A broker that died leaves its sockets behind, so the seat is ready only once
@@ -440,7 +446,9 @@ sandbox_pid=${tracked_supervisor:-$supervisor_pid}
 [[ $sandbox_pid =~ ^[0-9]+$ ]] || sandbox_pid=$supervisor_pid
 
 if [[ $wait_for_window == "true" ]]; then
-  for _ in {1..150}; do
+  # Counted in time, not rounds: each round asks the broker, which may be slow.
+  deadline=$((SECONDS + 15))
+  while ((SECONDS < deadline)); do
     while read -r window pid; do
       if in_sandbox "$pid"; then
         echo "$window"

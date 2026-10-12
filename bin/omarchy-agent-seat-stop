@@ -22,6 +22,14 @@ process_has_start() {
   [[ $current == "$2" ]]
 }
 
+process_is_zombie() {
+  local stat
+
+  { stat=$(<"/proc/$1/stat"); } 2>/dev/null || return 1
+  stat=${stat##*) }
+  [[ ${stat:0:1} == "Z" ]]
+}
+
 supervisor_matches() {
   local pid="$1" start="$2" record="$3" marker="$4"
   local -a command
@@ -31,18 +39,69 @@ supervisor_matches() {
   [[ ${command[0]:-} == "/bin/bash" && ${command[1]:-} == "$sandbox_supervisor" && ${command[2]:-} == "$record" && ${command[3]:-} == "$marker" ]]
 }
 
+# The processes listening on a Unix socket bound at a path: the socket's
+# inode from /proc/net/unix, then every descriptor open on it. Found by the
+# socket rather than by name, so a broker serving another runtime directory
+# is never touched.
+socket_listeners() {
+  local flags inode path
+
+  # Flags 00010000 marks a listening socket; accepted connections show the
+  # bound path too.
+  while read -r _ _ _ flags _ _ inode path; do
+    [[ $flags == "00010000" && $path == "$1" ]] || continue
+    find /proc/[0-9]*/fd -lname "socket:\[$inode\]" 2>/dev/null | cut -d/ -f3
+  done </proc/net/unix | sort -u
+}
+
 mkdir -p "$runtime/sandboxes"
 exec 9>"$runtime/sandboxes.lock"
 flock 9
 
-omarchy-agent-seat-broker call '{"command":"stop"}' >/dev/null 2>&1 || true
-
-# The broker replies just before it drops clients. Its control socket is
-# removed only after that work, so wait for it before ending the sandboxes.
-for _ in {1..50}; do
-  [[ ! -S $runtime/control ]] && break
-  sleep 0.01
-done
+# The broker answers stop at once. One that holds its socket open but never
+# answers would hang this call with the lock held, so the sandboxes would never
+# be ended and every later launch would wait on the lock: after three seconds
+# it counts as hung and is killed, found by its control socket.
+code=0
+timeout 3 omarchy-agent-seat-broker call '{"command":"stop"}' >/dev/null 2>&1 || code=$?
+if ((code == 124)); then
+  broker_pids=() broker_starts=()
+  while read -r pid; do
+    broker_start=$(process_start_time "$pid") || continue
+    broker_pids+=("$pid")
+    broker_starts+=("$broker_start")
+  done < <(socket_listeners "$runtime/control")
+  for ((index = 0; index < ${#broker_pids[@]}; index++)); do
+    process_has_start "${broker_pids[index]}" "${broker_starts[index]}" && kill -KILL "${broker_pids[index]}" 2>/dev/null
+  done
+  # A killed broker stays a zombie until its parent reaps it, which may be
+  # never if that parent is the caller; dead is enough here.
+  for _ in {1..100}; do
+    broker_alive=false
+    for ((index = 0; index < ${#broker_pids[@]}; index++)); do
+      process_has_start "${broker_pids[index]}" "${broker_starts[index]}" && ! process_is_zombie "${broker_pids[index]}" && broker_alive=true
+    done
+    [[ $broker_alive == "false" ]] && break
+    sleep 0.01
+  done
+  if [[ $broker_alive == "true" ]]; then
+    echo "The agent seat broker did not answer and could not be ended" >&2
+    stop_failed=true
+  elif ((${#broker_pids[@]} == 0)); then
+    echo "The agent seat broker did not answer, and nothing listens on its socket any more" >&2
+  else
+    # A killed broker leaves its sockets behind; the next launch starts a new
+    # one over them.
+    echo "The agent seat broker did not answer, so it was ended" >&2
+  fi
+else
+  # The broker replies just before it drops clients. Its control socket is
+  # removed only after that work, so wait for it before ending the sandboxes.
+  for _ in {1..50}; do
+    [[ ! -S $runtime/control ]] && break
+    sleep 0.01
+  done
+fi
 
 shopt -s nullglob
 for record in "$runtime"/sandboxes/sandbox.*; do

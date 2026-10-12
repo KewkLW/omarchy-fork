@@ -45,6 +45,7 @@ cleanup() {
   done
   [[ -n ${launcher_pid:-} ]] && kill "$launcher_pid" 2>/dev/null
   [[ -n ${swapper_pid:-} ]] && kill "$swapper_pid" 2>/dev/null
+  [[ -n ${silent_pid:-} ]] && kill "$silent_pid" 2>/dev/null
   [[ -n ${broker_pid:-} ]] && kill "$broker_pid" 2>/dev/null
   [[ -n ${compositor_pid:-} ]] && kill "$compositor_pid" 2>/dev/null
   # A broker a launch started; the shim execs it, so its pid is the broker's.
@@ -632,3 +633,34 @@ for _ in {1..50}; do [[ -s $test_dir/out/restarted ]] && break; sleep 0.1; done
 "${on_seat[@]}" omarchy-agent-seat-stop >/dev/null || fail "stop ends the restarted broker"
 rm -f "$test_dir/slow-broker/pid"
 pass "a launch over a dead broker's sockets starts a new broker and reaches it"
+
+# A broker that accepts the connection and never answers is no broker to
+# launch on: the launch gives up within its deadline instead of waiting on
+# it forever. The shim's serve starts nothing, so nothing replaces it.
+mkdir -p "$test_dir/silent-broker"
+printf '#!/bin/bash\n[[ $1 == "serve" ]] && exit 1\nexec "%s/bin/omarchy-agent-seat-broker" "$@"\n' "$ROOT" >"$test_dir/silent-broker/omarchy-agent-seat-broker"
+chmod +x "$test_dir/silent-broker/omarchy-agent-seat-broker"
+rm -f "$seat/control"
+python3 -c '
+import socket, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.bind(sys.argv[1])
+sock.listen()
+conns = []
+while True:
+  conns.append(sock.accept()[0])
+' "$seat/control" &
+silent_pid=$!
+for _ in {1..50}; do [[ -S $seat/control ]] && break; sleep 0.1; done
+[[ -S $seat/control ]] || fail "the silent broker listens on the control socket"
+start=$SECONDS
+code=0
+output=$(timeout 30 "${on_seat[@]}" PATH="$test_dir/silent-broker:$test_dir/bin:$ROOT/bin:$PATH" omarchy-agent-seat-run --no-wait /usr/bin/true 2>&1) || code=$?
+((code != 124)) || fail "a launch gives up on a broker that never answers"
+((code != 0)) || fail "a launch fails when the broker never answers" "$output"
+[[ $output == "The agent seat broker did not start within 10 seconds"* ]] || fail "a launch on a silent broker says the broker did not start" "$output"
+((SECONDS - start <= 20)) || fail "a launch gives up on a silent broker near its deadline" "$((SECONDS - start)) seconds"
+kill "$silent_pid" 2>/dev/null
+wait "$silent_pid" 2>/dev/null
+silent_pid=
+pass "a launch gives up on a broker that never answers"

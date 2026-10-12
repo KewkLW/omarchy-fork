@@ -474,11 +474,19 @@ NODES = [
 ]
 BOXES = {1: [0, 0, 800, 600], 2: [10, 20, 100, 40], 3: [200, 20, 300, 40], 4: [20, 25, 80, 30], 5: [10, 5000, 100, 20], 6: [700, 100, 200, 20], 7: [10, 599, 100, 20]}
 
-def describe(backend, depth):
-    role = next(n["role"]["value"] for n in NODES if n["backendDOMNodeId"] == backend)
+# A page may add controls of its own under the root, with their boxes.
+def tree(page):
+    extra = page.get("nodes", [])
+    return [{**NODES[0], "childIds": NODES[0]["childIds"] + [n["nodeId"] for n in extra]}, *NODES[1:], *extra]
+
+def boxes(page):
+    return {**BOXES, **{int(b): box for b, box in page.get("boxes", {}).items()}}
+
+def describe(nodes, backend, depth):
+    role = next(n["role"]["value"] for n in nodes if n["backendDOMNodeId"] == backend)
     tag = {"link": "a", "button": "button", "textbox": "input", "StaticText": "span"}.get(role, "div")
-    children = [n["backendDOMNodeId"] for n in NODES if n.get("parentId") == str(backend)]
-    return {"backendNodeId": backend, "nodeType": 1, "nodeName": tag.upper(), "localName": tag, "attributes": ["id", f"n{backend}"], **({"children": [describe(child, depth - 1) for child in children]} if depth else {})}
+    children = [n["backendDOMNodeId"] for n in nodes if n.get("parentId") == str(backend)]
+    return {"backendNodeId": backend, "nodeType": 1, "nodeName": tag.upper(), "localName": tag, "attributes": ["id", f"n{backend}"], **({"children": [describe(nodes, child, depth - 1) for child in children]} if depth else {})}
 
 def frame(sock, text):
     data = text.encode()
@@ -553,9 +561,9 @@ def serve(conn):
                 width, height = window
                 result = {"windowId": width, "bounds": {"left": 0, "top": 0, "width": width, "height": height}}
             elif method == "Accessibility.getFullAXTree":
-                result = {"nodes": NODES}
+                result = {"nodes": tree(page)}
             elif method == "DOM.getBoxModel":
-                x, y, w, h = BOXES[params["backendNodeId"]]
+                x, y, w, h = boxes(page)[params["backendNodeId"]]
                 result = {"model": {"border": [x, y, x + w, y, x + w, y + h, x, y + h]}}
             elif method == "DOM.resolveNode":
                 result = {"object": {"type": "object", "objectId": f"node-{params['backendNodeId']}"}}
@@ -565,10 +573,10 @@ def serve(conn):
             elif method == "DOM.getNodeForLocation":
                 # The innermost node there, unless the page puts another on top.
                 x, y = params["x"], params["y"]
-                under = [b for b, (bx, by, bw, bh) in BOXES.items() if bx <= x < bx + bw and by <= y < by + bh]
-                result = {"backendNodeId": page.get("cover") or min(under, key=lambda b: BOXES[b][2] * BOXES[b][3])}
+                under = [b for b, (bx, by, bw, bh) in boxes(page).items() if bx <= x < bx + bw and by <= y < by + bh]
+                result = {"backendNodeId": page.get("cover") or min(under, key=lambda b: boxes(page)[b][2] * boxes(page)[b][3])}
             elif method == "DOM.describeNode":
-                result = {"node": describe(params["backendNodeId"], params.get("depth", 1))}
+                result = {"node": describe(tree(page), params["backendNodeId"], params.get("depth", 1))}
             else:
                 result = {}
             frame(conn, json.dumps({"id": message["id"], "result": result}))
@@ -805,6 +813,37 @@ clicked=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-click-u
 listed=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-ui 3 --find Send 2>&1)
 grep -q "^Window 3: another element, <a#n5>, is on top of it at its centre" <<<"$listed" && grep -q '^button "Send" @90,210$' <<<"$listed" || fail "ui --find says another element covers a control" "$listed"
 pass "click-ui refuses a control another element covers, and ui --find says so"
+
+# An overflow container a transform scales to twice its size shows twice its
+# client width: a button in the second half of it shows, and ui places it
+# there. Headless Chromium runs ui's own clip on such a page.
+if command -v chromium >/dev/null; then
+  mkdir -p "$test_dir/scaled"
+  scaled=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" "$test_dir/scaled" <<'EOF'
+import importlib.machinery, importlib.util, re, subprocess, sys
+loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("seat_ui", loader)
+ui = importlib.util.module_from_spec(spec)
+loader.exec_module(ui)
+with open(f"{sys.argv[2]}/page.html", "w") as page:
+  page.write(f"""<!doctype html><body style="margin: 0">
+<div style="position: absolute; left: 10px; top: 10px; width: 100px; height: 50px; overflow: hidden; transform: scale(2); transform-origin: 0 0">
+<button id="zoomed" style="position: absolute; left: 60px; top: 5px; width: 30px; height: 20px">Zoomed</button></div>
+<pre id="clip"></pre><script>document.getElementById("clip").textContent = JSON.stringify(({ui.CLIP}).call(document.getElementById("zoomed")));</script>""")
+dom = subprocess.run(["timeout", "30", "chromium", "--headless", "--disable-gpu", "--no-first-run", f"--user-data-dir={sys.argv[2]}/profile", "--dump-dom", f"file://{sys.argv[2]}/page.html"], capture_output=True, text=True).stdout
+print((re.search(r'<pre id="clip">([^<]*)</pre>', dom) or [None, ""])[1])
+EOF
+  )
+  # The button shows at 130,20 to 190,60, the container at 10,10 to 210,110.
+  [[ $scaled == "[130,20,10,10,210,110]" ]] || fail "ui's clip scales an overflow container's client size by its transform" "$scaled"
+  zoomed='{"nodeId": "8", "parentId": "1", "ignored": false, "role": {"value": "button"}, "name": {"value": "Zoomed"}, "childIds": [], "backendDOMNodeId": 8}'
+  place '[{"id": "1", "title": "Fake page", "visible": true, "window": [800, 600], "inner": [800, 500], "nodes": ['"$zoomed"'], "boxes": {"8": [130, 20, 60, 40]}, "clips": {"8": '"$scaled"'}}]'
+  found=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-ui 3 --find Zoomed 2>&1)
+  grep -q '^  button "Zoomed" @240,210$' <<<"$listed" && [[ $found == 'button "Zoomed" @240,210' ]] || fail "ui lists and finds a control in the scaled-up part of an overflow container" "$scaled / $listed / $found"
+  pass "ui lists and finds a control in the part of an overflow container a transform scales up"
+else
+  skip "no Chromium; skipping the clip of a scaled overflow container"
+fi
 
 # click-ui hands --page to ui and the rest to the pointer.
 mkdir -p "$test_dir/stubs"

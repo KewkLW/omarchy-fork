@@ -21,6 +21,7 @@ real_seat_dirs() {
 real_seat_before=$(real_seat_dirs)
 
 cleanup() {
+  [[ -n ${silent_pid:-} ]] && kill "$silent_pid" 2>/dev/null
   HOME="$test_dir/home" XDG_RUNTIME_DIR="$test_dir/runtime" PATH="$test_dir/bin:$ROOT/bin:$PATH" "$ROOT/bin/omarchy-agent-seat-stop" >/dev/null 2>&1 || true
   # The broker runs under a subshell of run_broker, so end it by parent too.
   [[ -n ${broker_pid:-} ]] && pkill -P "$broker_pid" 2>/dev/null && kill "$broker_pid" 2>/dev/null
@@ -1953,5 +1954,53 @@ run_broker omarchy-agent-seat-status >/dev/null || fail "a broker out of file de
 pass "a broker out of file descriptors waits instead of spinning, then recovers"
 run_broker omarchy-agent-seat-stop >/dev/null
 wait "$broker_pid" 2>/dev/null
+
+# A broker that accepts the connection and never answers must not hold stop
+# up: stop gives up on it, ends whatever listens on the control socket and
+# still clears the sandboxes' records.
+seat="$test_dir/runtime/omarchy/agent-seat"
+rm -f "$seat/control"
+python3 -c '
+import socket, sys
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.bind(sys.argv[1])
+sock.listen()
+conns = []
+while True:
+  conns.append(sock.accept()[0])
+' "$seat/control" &
+silent_pid=$!
+for _ in {1..50}; do [[ -S $seat/control ]] && break; sleep 0.1; done
+[[ -S $seat/control ]] || fail "the silent broker listens on the control socket"
+/usr/bin/true &
+gone_pid=$!
+wait "$gone_pid"
+mkdir -p "$seat/sandboxes/gonemarker.d"
+printf '%s 1 gonemarker 0 0\n' "$gone_pid" >"$seat/sandboxes/sandbox.gone"
+/usr/bin/sleep 300 &
+unrelated_pid=$!
+unrelated_stat=$(<"/proc/$unrelated_pid/stat")
+unrelated_stat=${unrelated_stat##*) }
+read -ra unrelated_fields <<<"$unrelated_stat"
+printf '%s %s stale-marker 0 0\n' "$unrelated_pid" "${unrelated_fields[19]}" >"$seat/sandboxes/sandbox.stale"
+
+start=$SECONDS
+code=0
+output=$(run_broker timeout 30 omarchy-agent-seat-stop 2>&1) || code=$?
+((code != 124)) || fail "stop gives up on a broker that never answers" "$output"
+((code == 0)) || fail "stop succeeds when the broker never answers" "$output"
+((SECONDS - start <= 8)) || fail "stop gives up on a silent broker within a few seconds" "$((SECONDS - start)) seconds"
+[[ $output == *"Agent seat: stopped"* ]] || fail "stop reports the seat stopped when the broker never answers" "$output"
+for _ in {1..50}; do kill -0 "$silent_pid" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$silent_pid" 2>/dev/null && fail "stop ends a broker that never answers"
+wait "$silent_pid" 2>/dev/null
+silent_pid=
+[[ ! -e $seat/sandboxes/sandbox.gone && ! -e $seat/sandboxes/gonemarker.d ]] || fail "stop clears a sandbox's record when the broker never answers"
+[[ ! -e $seat/sandboxes/sandbox.stale ]] || fail "stop clears every record when the broker never answers"
+kill -0 "$unrelated_pid" 2>/dev/null || fail "a stale lifecycle record does not kill an unrelated process when the broker never answers"
+kill "$unrelated_pid"
+wait "$unrelated_pid" 2>/dev/null || true
+[[ $(run_broker omarchy-agent-seat-status) == "Agent seat: stopped" ]] || fail "status reports the seat stopped once stop ended a silent broker"
+pass "stop ends a broker that never answers and still clears the sandboxes"
 
 [[ $(real_seat_dirs) == "$real_seat_before" ]] || fail "the suite leaves the user's own seat home and state alone" "$(diff <(echo "$real_seat_before") <(real_seat_dirs))"

@@ -749,10 +749,13 @@ CLIP = """function () {
     if (node === root.documentElement || node === root.body) continue;
     const clipsX = style.overflowX !== "visible", clipsY = style.overflowY !== "visible";
     if (!clipsX && !clipsY) continue;
+    // Its box as shown, which a transform may scale, and its client sizes and
+    // borders in layout pixels, scaled to match.
     const rect = node.getBoundingClientRect();
-    const x = rect.left + node.clientLeft, y = rect.top + node.clientTop;
-    if (clipsX) { left = Math.max(left, x); right = Math.min(right, x + node.clientWidth); }
-    if (clipsY) { top = Math.max(top, y); bottom = Math.min(bottom, y + node.clientHeight); }
+    const sx = node.offsetWidth ? rect.width / node.offsetWidth : 1, sy = node.offsetHeight ? rect.height / node.offsetHeight : 1;
+    const x = rect.left + node.clientLeft * sx, y = rect.top + node.clientTop * sy;
+    if (clipsX) { left = Math.max(left, x); right = Math.min(right, x + node.clientWidth * sx); }
+    if (clipsY) { top = Math.max(top, y); bottom = Math.min(bottom, y + node.clientHeight * sy); }
   }
   return [own.left, own.top, left, top, right, bottom];
 }"""
