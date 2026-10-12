@@ -375,9 +375,12 @@ class WebSocket:
 
 
 class DevTools:
-  def __init__(self, url):
-    self.socket = WebSocket(url)
+  def __init__(self, url, timeout=10):
+    self.socket = WebSocket(url, timeout)
     self.next_id = 0
+
+  def close(self):
+    self.socket.sock.close()
 
   def send(self, method, params=None):
     self.next_id += 1
@@ -402,22 +405,72 @@ class DevTools:
     return answer["result"]
 
 
-def cdp_target(port, title, strict):
+class Ambiguous(Exception):
+  """Several pages could be the window, and nothing tells them apart."""
+
+
+def titled(window_title, page_title):
+  """Whether a window shows a page: a browser window is titled after its active tab."""
+  return bool(page_title and window_title and (window_title == page_title or window_title.startswith(page_title + " - ")))
+
+
+def shown_title(target):
+  """A page's title when it is the tab its window shows, else None.
+
+  A browser can show several windows of many tabs, any of them titled alike,
+  so a page's title alone does not place it in a window.
+  """
+  try:
+    devtools = DevTools(target["webSocketDebuggerUrl"], timeout=3)  # a frozen background tab never answers
+    try:
+      shown, title = json.loads(devtools.call("Runtime.evaluate", {"expression": "JSON.stringify([document.visibilityState, document.title])", "returnByValue": True})["result"]["value"])
+    finally:
+      devtools.close()
+  except (OSError, ValueError, RuntimeError, ConnectionError, KeyError, TypeError):
+    return None
+  return title if shown == "visible" else None
+
+
+def window_sizes(port, targets):
+  """The logical size of the browser window each target is in, where DevTools says."""
+  sizes = {}
+  try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=5) as response:
+      devtools = DevTools(json.load(response)["webSocketDebuggerUrl"])
+    try:
+      for target in targets:
+        bounds = devtools.call("Browser.getWindowForTarget", {"targetId": target["id"]})["bounds"]
+        sizes[target["id"]] = (bounds["width"], bounds["height"])
+    finally:
+      devtools.close()
+  except (OSError, ValueError, RuntimeError, ConnectionError, KeyError, TypeError):
+    pass
+  return sizes
+
+
+def cdp_target(port, title, size=None):
+  """The page the window titled title (of logical size size) shows, None when it shows none.
+
+  Raises Ambiguous when several shown pages fit the window equally well.
+  """
   with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5) as response:
     targets = [t for t in json.load(response) if t.get("type") == "page" and t.get("webSocketDebuggerUrl") and not t.get("url", "").startswith("devtools://")]
-  if not targets:
-    return None
-  # A browser window is titled after its active tab. DevTools reports titles
-  # HTML-escaped ("&amp;" for "&"), the window title is plain text.
-  for target in targets:
-    name = html.unescape(target.get("title") or "")
-    if name and title and (title == name or title.startswith(name + " - ")):
-      return target
-  return None if strict else targets[0]
+  # DevTools reports titles HTML-escaped ("Fun &amp; games"), the window has
+  # them plain; the page's own title, read below, is plain too.
+  candidates = [t for t in targets if titled(title, html.unescape(t.get("title") or ""))]
+  # Only the active tab of each window is visible.
+  candidates = [t for t in candidates if titled(title, shown_title(t))]
+  if len(candidates) > 1 and size:
+    sizes = window_sizes(port, candidates)
+    fitting = [t for t in candidates if t["id"] in sizes and near(sizes[t["id"]], size)]
+    candidates = fitting or candidates
+  if len(candidates) > 1:
+    raise Ambiguous(f"{len(candidates)} pages are shown in windows titled {title!r}, and DevTools cannot tell which is this one:\n" + "\n".join(f"  {html.unescape(t.get('title') or '')!r} {t.get('url', '')}" for t in candidates))
+  return candidates[0] if candidates else None
 
 
-def cdp_tree(state, port, strict):
-  target = cdp_target(port, state.get("title", ""), strict)
+def cdp_tree(state, port):
+  target = cdp_target(port, state.get("title", ""), state["geometry"][2:])
   if not target:
     return None
   devtools = DevTools(target["webSocketDebuggerUrl"])
@@ -553,7 +606,9 @@ def main(args):
     port = cdp_port(candidate)
     if port:
       try:
-        nodes, source = cdp_tree(state, port, not directory), "cdp"
+        nodes, source = cdp_tree(state, port), "cdp"
+      except Ambiguous as error:
+        fail(f"{error}\nClose the others, or use omarchy agent seat screenshot {window}.")
       except (OSError, ValueError, RuntimeError, ConnectionError, KeyError) as error:
         print(f"DevTools on port {port} did not answer: {error}", file=sys.stderr)
     if not nodes and bus_address(candidate):

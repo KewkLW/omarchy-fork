@@ -187,7 +187,7 @@ fi
 # The DevTools route, against a fake DevTools endpoint ------------------------------------
 
 cat >"$test_dir/cdp.py" <<'EOF'
-import base64, hashlib, json, socket, struct, sys
+import base64, hashlib, html, json, socket, struct, sys
 
 server = socket.socket()
 server.bind(("127.0.0.1", 0))
@@ -224,15 +224,20 @@ while True:
         request += conn.recv(65536)
     head, rest = request.split(b"\r\n\r\n", 1)
     lines = head.decode().split("\r\n")
-    if lines[0].startswith("GET /json/list"):
-        # DevTools reports titles HTML-escaped.
-        body = json.dumps([
-            {"type": "page", "title": "Fake page", "url": "https://example.org", "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/1"},
-            {"type": "page", "title": "Q&amp;A &lt;draft&gt; &quot;one&quot; &#39;two&#39;", "url": "https://example.org/qa", "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/2"},
-        ]).encode()
+    # The pages, each in a browser window of some size and shown or not, are
+    # the test's to change between requests.
+    with open(sys.argv[2]) as pages_file:
+        PAGES = json.load(pages_file)
+    if lines[0].startswith("GET /json/list") or lines[0].startswith("GET /json/version"):
+        if lines[0].startswith("GET /json/list"):
+            body = [{"type": "page", "id": page["id"], "title": page["title"], "url": f"https://example.com/{page['id']}", "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/{page['id']}"} for page in PAGES]
+        else:
+            body = {"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/fake"}
+        body = json.dumps(body).encode()
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
         conn.close()
         continue
+    page = next((page for page in PAGES if lines[0].split()[1] == f"/devtools/page/{page['id']}"), None)
     key = next(line.split(":", 1)[1].strip() for line in lines if line.lower().startswith("sec-websocket-key"))
     accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
     conn.sendall(f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n".encode())
@@ -251,8 +256,14 @@ while True:
             payload, buffer = read(conn, buffer, length)
             message = json.loads(bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
             method, params = message["method"], message.get("params", {})
-            if method == "Runtime.evaluate":
+            if method == "Runtime.evaluate" and "visibilityState" in params["expression"]:
+                # The page's own title is plain.
+                result = {"result": {"type": "string", "value": json.dumps(["visible" if page["visible"] else "hidden", html.unescape(page["title"])])}}
+            elif method == "Runtime.evaluate":
                 result = {"result": {"type": "string", "value": json.dumps([800, 600, float(sys.argv[1])])}}
+            elif method == "Browser.getWindowForTarget":
+                width, height = next(page["window"] for page in PAGES if page["id"] == params["targetId"])
+                result = {"windowId": width, "bounds": {"left": 0, "top": 0, "width": width, "height": height}}
             elif method == "Accessibility.getFullAXTree":
                 result = {"nodes": NODES}
             elif method == "DOM.getBoxModel":
@@ -265,7 +276,15 @@ while True:
         conn.close()
 EOF
 
-coproc CDP { exec python3 "$test_dir/cdp.py" 1.5 2>/dev/null; }
+# DevTools escapes titles as HTML; the window's title is plain.
+cat >"$test_dir/pages.json" <<'EOF'
+[
+  {"id": "2", "title": "Fun &amp; games", "visible": true, "window": [800, 600]},
+  {"id": "1", "title": "Fake page", "visible": true, "window": [800, 600]}
+]
+EOF
+
+coproc CDP { exec python3 "$test_dir/cdp.py" 1.5 "$test_dir/pages.json" 2>/dev/null; }
 cdp_pid=$CDP_PID
 read -r -t 5 cdp_port <&"${CDP[0]}" || fail "the fake DevTools endpoint starts"
 
@@ -278,8 +297,9 @@ spec = importlib.util.spec_from_loader("seat_ui", loader)
 ui = importlib.util.module_from_spec(spec)
 loader.exec_module(ui)
 state = {"title": "Fake page - Chromium", "geometry": [0, 0, 800, 600], "origin": [0, 0, 1.5], "scale": 1.5}
-nodes = ui.cdp_tree(state, int(sys.argv[2]), False)
-print(json.dumps({"nodes": nodes, "send": ui.find(nodes, "send"), "box": ui.find(nodes, "textbox:"), "listing": [ui.describe(n) for n in nodes]}))
+nodes = ui.cdp_tree(state, int(sys.argv[2]))
+escaped = ui.cdp_target(int(sys.argv[2]), "Fun & games - Chromium") or {}
+print(json.dumps({"nodes": nodes, "send": ui.find(nodes, "send"), "box": ui.find(nodes, "textbox:"), "listing": [ui.describe(n) for n in nodes], "escaped": escaped.get("webSocketDebuggerUrl", "")}))
 EOF
 ) || fail "ui reads a page over DevTools" "$cdp"
 
@@ -290,21 +310,43 @@ pass "the DevTools route positions controls in screenshot pixels"
 [[ $(jq -r '.box[0].value' <<<"$cdp") == "hi" && $(jq -r '.box[0].states[0]' <<<"$cdp") == "focused" ]] || fail "the DevTools route reports values and focus" "$cdp"
 jq -r '.listing[]' <<<"$cdp" | grep -qx 'textbox "Message" = "hi" @525,60 \[focused\]' || fail "the DevTools route lists controls for people" "$cdp"
 pass "the DevTools route reports values and focus"
+[[ $(jq -r '.escaped' <<<"$cdp") == */devtools/page/2 ]] || fail "the DevTools route finds a tab whose title DevTools escapes" "$cdp"
+pass "the DevTools route finds a tab whose title DevTools escapes"
 
-escaped=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" "$cdp_port" <<'EOF'
-import importlib.machinery, importlib.util, sys
+# Tabs and windows alike can share a title: a page is the window's only when it
+# is the tab the window shows, in a window of the window's size, and never just
+# the first page DevTools lists.
+twins=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" "$cdp_port" "$test_dir/pages.json" <<'EOF'
+import importlib.machinery, importlib.util, json, sys
 loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
 spec = importlib.util.spec_from_loader("seat_ui", loader)
 ui = importlib.util.module_from_spec(spec)
 loader.exec_module(ui)
-title = "Q&A <draft> \"one\" 'two' - Chromium"
-for strict in (True, False):
-  target = ui.cdp_target(int(sys.argv[2]), title, strict)
-  print(target and target["url"])
+
+def pick(pages, size):
+  with open(sys.argv[3], "w") as pages_file:
+    json.dump(pages, pages_file)
+  try:
+    return (ui.cdp_target(int(sys.argv[2]), "Twin - Chromium", size) or {}).get("webSocketDebuggerUrl", "none")
+  except Exception as error:
+    return f"refused: {error}"
+
+print(json.dumps({
+  "tabs": pick([{"id": "3", "title": "Twin", "visible": False, "window": [800, 600]}, {"id": "4", "title": "Twin", "visible": True, "window": [800, 600]}], [800, 600]),
+  "windows": pick([{"id": "3", "title": "Twin", "visible": True, "window": [800, 600]}, {"id": "4", "title": "Twin", "visible": True, "window": [800, 600]}], [800, 600]),
+  "sized": pick([{"id": "3", "title": "Twin", "visible": True, "window": [400, 600]}, {"id": "4", "title": "Twin", "visible": True, "window": [800, 600]}], [800, 600]),
+  "hidden": pick([{"id": "3", "title": "Other", "visible": True, "window": [800, 600]}, {"id": "4", "title": "Twin", "visible": False, "window": [800, 600]}], [800, 600]),
+}))
 EOF
-)
-[[ $escaped == $'https://example.org/qa\nhttps://example.org/qa' ]] || fail "a tab whose DevTools title is HTML-escaped matches its window" "$escaped"
-pass "a tab whose DevTools title is HTML-escaped matches its window"
+) || fail "ui picks between pages of the same title" "$twins"
+
+[[ $(jq -r '.tabs' <<<"$twins") == */devtools/page/4 ]] || fail "the DevTools route reads the shown tab of several with the window's title" "$twins"
+[[ $(jq -r '.sized' <<<"$twins") == */devtools/page/4 ]] || fail "the DevTools route tells shown pages apart by their window's size" "$twins"
+[[ $(jq -r '.hidden' <<<"$twins") == "none" ]] || fail "the DevTools route reads no page when none with the window's title is shown" "$twins"
+pass "the DevTools route reads the page the window shows, among others of the same title"
+[[ $(jq -r '.windows' <<<"$twins") == "refused: 2 pages are shown in windows titled 'Twin - Chromium'"* ]] || fail "the DevTools route refuses to guess between windows showing the same title" "$twins"
+jq -r '.windows' <<<"$twins" | grep -q "https://example.com/3" || fail "a refusal lists the pages it could not tell apart" "$twins"
+pass "the DevTools route refuses to guess between windows showing the same title, and lists them"
 
 # Stopping ----------------------------------------------------------------------------
 
