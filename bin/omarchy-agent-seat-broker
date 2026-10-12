@@ -1329,8 +1329,11 @@ class Client:
     return stack
 
   def subtree(self, surface, x, y, stack):
+    """A surface and its subsurfaces, bottom to top, with their origins. One
+    without a buffer is unmapped, and so is everything under it: nothing to
+    see or click there, whatever size a viewport gives it."""
     state = self.surfaces.get(surface)
-    if not state:
+    if not state or state["buffer"] is None:
       return
     for member in state["stack"]:
       if member == surface:

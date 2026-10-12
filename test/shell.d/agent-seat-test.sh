@@ -1126,6 +1126,21 @@ def double_buffered(seat, problems):
     seat.request(20, "commit")
     check(problems, "a subsurface moved below another once its window commits", (seat.pixel(22, 21, 11), seat.client.hit(22, 21, 11)), ("00ff00", (23, 1, 1)))
 
+def unmapped(seat, problems):
+    # A red 40x30 window under a subsurface that a viewport makes 40x30 but
+    # that has never had a buffer, and a green subsurface of it at 5,5.
+    seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, RED)
+    seat.subsurface(23, 20, 0, 0)
+    seat.request(VIEWPORTER, "get_viewport", 24, 23)
+    seat.request(24, "set_destination", 40, 30)
+    seat.subsurface(25, 23, 5, 5)
+    seat.draw(25, 10, 10, GREEN)
+    seat.request(23, "commit")
+    seat.request(20, "commit")
+    check(problems, "a click on a subsurface without a buffer, and on one under it", (seat.client.hit(22, 2, 2), seat.client.hit(22, 6, 6)), ((20, 2, 2), (20, 6, 6)))
+    check(problems, "the colours of a window whose subsurface has no buffer", seat.colours(22), ["ff0000"])
+
 def limits(seat, problems):
     # A window one pixel wider than a screenshot can hold, one exactly as
     # wide, and a 400x400 buffer shown 10x10 through a viewport, which would
@@ -1202,6 +1217,10 @@ pass "a synchronized subsurface's frame shows only once its window commits"
 result=$(inproc double_buffered)
 [[ $result == "ok" ]] || fail "a subsurface's position and stacking change only when its window commits" "$result"
 pass "a subsurface's position and stacking change only when its window commits"
+
+result=$(inproc unmapped)
+[[ $result == "ok" ]] || fail "a subsurface without a buffer, and what is under it, takes no clicks" "$result"
+pass "a subsurface without a buffer, and what is under it, takes no clicks"
 
 result=$(inproc limits)
 [[ $result == "ok" ]] || fail "a screenshot is at most 4096 pixels a side and 4 pixels per surface unit" "$result"
