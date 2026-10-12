@@ -1028,6 +1028,42 @@ def modifiers(seat, problems):
     check(problems, "the user's key reaches the app", [name for name, _ in events][-1:], ["key"])
     check(problems, "the app's modifiers when the user's key arrives", [tuple(args[1:]) for name, args in events if name == "modifiers"][-1:], [held])
 
+def held_keys(seat, problems):
+    # The user holds the up arrow in the app, the agent types in its other
+    # window, and the user presses another key; then the user lets go of the
+    # arrow, the agent types again and the user presses a key.
+    up = struct.pack("<I", 103)
+    seat.request(SEAT, "get_keyboard", KEYBOARD)
+    seat.window(20, 21, 22)
+    other = seat.window(30, 31, 32)
+
+    def keyboard_events():
+        return [(name, args) for object_id, name, args in seat.queued("events") if object_id == KEYBOARD]
+
+    def enters(events):
+        return [(args[1], args[2]) for name, args in events if name == "enter"]
+
+    seat.event(KEYBOARD, "enter", 900, 20, up)
+    check(problems, "the app's enter when the user's keyboard enters", enters(keyboard_events()), [(20, up)])
+    seat.broker.do_type(other, "x")
+    events = keyboard_events()
+    check(problems, "the app's enter when the agent types", enters(events), [(30, b"")])
+    check(problems, "the agent's keys reach the app", [args[2:] for name, args in events if name == "key"][-2:], [[45, 1], [45, 0]])
+    seat.event(KEYBOARD, "key", 901, 0, 46, 1)
+    check(problems, "the app's enter when the user's key comes back", enters(keyboard_events()), [(20, up)])
+    seat.event(KEYBOARD, "key", 902, 0, 103, 0)
+    seat.event(KEYBOARD, "key", 903, 0, 46, 0)
+    seat.broker.do_type(other, "x")
+    keyboard_events()
+    seat.event(KEYBOARD, "key", 904, 0, 46, 1)
+    check(problems, "the app's enter after the user let go of the arrow", enters(keyboard_events()), [(20, b"")])
+    # The user's keyboard enters the agent's window with the arrow held.
+    seat.event(KEYBOARD, "leave", 905, 20)
+    seat.broker.do_type(other, "x")
+    keyboard_events()
+    seat.event(KEYBOARD, "enter", 906, 30, up)
+    check(problems, "the app's enter when the user's keyboard enters the agent's window", enters(keyboard_events()), [(30, up)])
+
 def user_click(seat, problems):
     # The user's pointer rests in the app, the agent clicks elsewhere in the
     # same surface, and the user clicks without moving.
@@ -1150,6 +1186,68 @@ def hole(seat, problems):
     seat.request(20, "commit")
     check(problems, "a click on the subsurface around its hole", seat.client.hit(22, 7, 7), (23, 2, 2))
     check(problems, "a click in the subsurface's hole", seat.client.hit(22, 15, 15), (20, 15, 15))
+
+def region_flood(seat, problems):
+    # The window and hole of the hole test, whose app then adds the
+    # subsurface's whole square and cuts the hole out again 100,000 times
+    # over in that one region, which leaves it as it was: kept as requests,
+    # that would cost the broker tens of MiB.
+    import random
+    def peak():
+        with open("/proc/self/status") as status:
+            return next(int(line.split()[1]) for line in status if line.startswith("VmHWM:"))
+    hole(seat, problems)
+    before = peak()
+    for i in range(100_000):
+        seat.request(24, "add", 0, 0, 20, 20)
+        seat.request(24, "subtract", 5, 5, 10, 10)
+        if i % 1000 == 0:  # as if passed on to Hyprland, which keeps the region itself
+            seat.queued("requests")
+    seat.request(23, "set_input_region", 24)
+    seat.request(23, "commit")
+    seat.request(20, "commit")
+    check(problems, "the cost in memory of the same region set 100,000 times (KiB)", peak() - before < 4 * 1024, True)
+    check(problems, "a click around the hole, then in it, after that", (seat.client.hit(22, 7, 7), seat.client.hit(22, 15, 15)), ((23, 2, 2), (20, 15, 15)))
+
+    # Rectangles that don't touch can't merge, so their count is capped in
+    # a region and across the app's regions, and an app past either is dropped.
+    def refused(region, *rectangle):
+        try:
+            seat.request(region, "add", *rectangle)
+        except ValueError as error:
+            return "rectangles" in str(error)
+        return False
+    seat.request(COMPOSITOR, "create_region", 25)
+    check(problems, "1024 separate rectangles in one region", [refused(25, 2 * i, 0, 1, 1) for i in range(1024)], [False] * 1024)
+    check(problems, "one more in that region", refused(25, 3000, 0, 1, 1), True)
+    for region, count in ((26, 1024), (27, 1024), (28, 1020)):  # with the hole's 4, the app's 4096
+        seat.request(COMPOSITOR, "create_region", region)
+        for i in range(count):
+            seat.request(region, "add", 2 * i, 0, 1, 1)
+    check(problems, "one more in the app's regions", refused(28, 3000, 0, 1, 1), True)
+    for region in (25, 26, 27, 28):  # as when Hyprland frees their ids
+        seat.client.forget(region)
+    seat.request(COMPOSITOR, "create_region", 25)
+    check(problems, "a rectangle once those regions are gone", refused(25, 0, 0, 1, 1), False)
+
+    # Kept as rectangles, a region still covers what the requests that made
+    # it say: each point by the last rectangle added or cut out over it.
+    shuffle = random.Random(9)
+    for trial in range(200):
+        seat.request(COMPOSITOR, "create_region", 30)
+        requests = [(shuffle.choice(("add", "subtract")), *(shuffle.randrange(-2, 12) for _ in range(4))) for _ in range(12)]
+        for request in requests:
+            seat.request(30, *request)
+        for x in range(-2, 24):
+            for y in range(-2, 24):
+                inside = False
+                for op, rx, ry, rw, rh in requests:
+                    if rx <= x < rx + rw and ry <= y < ry + rh:
+                        inside = op == "add"
+                if seat.client.accepts_input(seat.client.regions[30], x, y) != inside:
+                    problems.append(f"a region made by {requests} at {x},{y}: got {not inside}, want {inside}")
+                    return
+        seat.client.forget(30)
 
 def stacking(seat, problems):
     # A red 40x30 window with a green 20x20 subsurface at 5,5 and a blue one
@@ -1405,6 +1503,10 @@ result=$(inproc modifiers)
 [[ $result == "ok" ]] || fail "a modifier the user holds through the agent's typing still applies to the user's next key" "$result"
 pass "a modifier the user holds through the agent's typing still applies to the user's next key"
 
+result=$(inproc held_keys)
+[[ $result == "ok" ]] || fail "a key the user holds is still down in the app after the agent types elsewhere" "$result"
+pass "a key the user holds is still down in the app after the agent types elsewhere"
+
 result=$(inproc user_click)
 [[ $result == "ok" ]] || fail "the user's click lands under the user's pointer after the agent pointed elsewhere in the surface" "$result"
 pass "the user's click lands under the user's pointer after the agent pointed elsewhere in the surface"
@@ -1432,6 +1534,10 @@ pass "a screenshot draws only the part of a buffer a viewport shows"
 result=$(inproc hole)
 [[ $result == "ok" ]] || fail "a click in a hole cut out of a surface's input region falls through to the surface beneath" "$result"
 pass "a click in a hole cut out of a surface's input region falls through to the surface beneath"
+
+result=$(inproc region_flood)
+[[ $result == "ok" ]] || fail "an app setting a region over and over does not grow the broker, and too many rectangles drop it" "$result"
+pass "an app setting a region over and over does not grow the broker, and too many rectangles drop it"
 
 result=$(inproc stacking)
 [[ $result == "ok" ]] || fail "screenshots and clicks follow subsurfaces moved above or below each other and their window" "$result"
