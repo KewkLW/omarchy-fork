@@ -1014,20 +1014,30 @@ class Client:
         continue
       sx, sy = round(gx * buffer_scale), round(gy * buffer_scale)
       dx, dy = round((x - left) * scale), round((y - top) * scale)
-      columns = min(round(gw * buffer_scale), buffer_width - sx, width - dx)
-      rows = min(round(gh * buffer_scale), buffer_height - sy, height - dy)
-      if columns <= 0 or rows <= 0 or dx < 0 or dy < 0:
+      if dx < 0 or dy < 0:
         continue
+      # Each screenshot pixel the layer covers comes from the nearest pixel of
+      # its own buffer, which can have another scale than the window's: a
+      # scale 1 popup over a scale 2 window is drawn twice as large.
+      ratio = buffer_scale / scale
+      columns = [column for column in (sx + int((i + 0.5) * ratio) for i in range(min(round(gw * scale), width - dx))) if column < buffer_width]
+      rows = [row for row in (sy + int((i + 0.5) * ratio) for i in range(min(round(gh * scale), height - dy))) if row < buffer_height]
+      if not columns or not rows:
+        continue
+      first, span = columns[0], columns[-1] + 1 - columns[0]
       # Read rather than map: the app can shrink its pool at any moment, and
       # touching a mapping past the end of the file kills the broker with
       # SIGBUS. Whatever is missing stays black. Translucent layers blend over
       # what is under them; XRGB8888 has no alpha and covers it.
       end = min(pool.size, os.fstat(pool.fd).st_size)
-      for row in range(rows):
-        source = offset + (sy + row) * stride + sx * 4
+      for row, source_row in enumerate(rows):
+        source = offset + source_row * stride + first * 4
         if not 0 <= source < end:
           continue
-        pixels = os.pread(pool.fd, min(columns * 4, end - source), source)
+        pixels = os.pread(pool.fd, min(span * 4, end - source), source)
+        if span != len(columns):
+          read = len(pixels) // 4
+          pixels = b"".join(pixels[(column - first) * 4 : (column - first + 1) * 4] for column in columns if column - first < read)
         target = ((dy + row) * width + dx) * 4
         if format == 0:
           blend(canvas, target, pixels)

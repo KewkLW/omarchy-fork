@@ -869,6 +869,22 @@ def translucent(seat, problems):
     check(problems, "a translucent subsurface over red", seat.pixel(22, 6, 6), "7f8000")
     check(problems, "the window beside it", seat.pixel(22, 1, 1), "ff0000")
 
+def scales(seat, problems):
+    # A scale 2 window, 40x30 logical, with a scale 1 popup of 20x10 at 10,10.
+    seat.window(20, 21, 22)
+    seat.draw(20, 80, 60, RED, scale=2)
+    seat.popup(23, 24, 25, 21, 10, 10)
+    seat.draw(23, 20, 10, BLUE)
+    check(problems, "a scale 2 window's screenshot", seat.size(22), "80x60")
+    check(problems, "a scale 1 popup over a scale 2 window", [seat.pixel(22, x, y) for x, y in ((20, 20), (59, 39), (60, 40), (19, 19))], ["0000ff", "0000ff", "ff0000", "ff0000"])
+    # And the reverse: a scale 1 window with a scale 2 popup of 20x10 logical.
+    seat.window(30, 31, 32)
+    seat.draw(30, 40, 30, RED)
+    seat.popup(33, 34, 35, 31, 10, 10)
+    seat.draw(33, 40, 20, BLUE, scale=2)
+    check(problems, "a scale 1 window's screenshot", seat.size(32), "40x30")
+    check(problems, "a scale 2 popup over a scale 1 window", [seat.pixel(32, x, y) for x, y in ((10, 10), (29, 19), (30, 20), (35, 25))], ["0000ff", "0000ff", "ff0000", "ff0000"])
+
 problems = []
 globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
 print("; ".join(problems) or "ok")
@@ -890,6 +906,10 @@ pass "a modifier the user holds through the agent's typing still applies to the 
 result=$(inproc translucent)
 [[ $result == "ok" ]] || fail "a screenshot blends a translucent layer over what is under it" "$result"
 pass "a screenshot blends a translucent layer over what is under it"
+
+result=$(inproc scales)
+[[ $result == "ok" ]] || fail "a screenshot draws a popup of another scale at the window's scale" "$result"
+pass "a screenshot draws a popup of another scale at the window's scale"
 
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 
