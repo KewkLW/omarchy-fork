@@ -155,14 +155,29 @@ def sandbox_of(pid):
 
 
 def bus_address(directory):
-  path = os.path.join(directory, "bus", "bus")
+  """The address of a sandbox's private bus and a descriptor of its socket, or (None, None).
+
+  The sandbox can write where its socket is, and swap it for a link to any
+  socket on the host, the user's own buses included, between a check of the
+  path and a connect to it. So the socket is opened once, following no link,
+  checked to be a socket of the user's, and connected to through that
+  descriptor (/proc/self/fd/N), which no later link can redirect. The caller
+  keeps the descriptor open and passes it on to the AT-SPI reader.
+  """
+  descriptors = []
   try:
-    # The directory is the sandbox's to write in: never follow a link out of it.
-    if not stat.S_ISSOCK(os.lstat(path).st_mode):
-      return None
+    descriptors.append(os.open(directory, os.O_PATH | os.O_DIRECTORY))
+    descriptors.append(os.open("bus", os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=descriptors[-1]))
+    descriptors.append(os.open("bus", os.O_PATH | os.O_NOFOLLOW, dir_fd=descriptors[-1]))
+    status = os.fstat(descriptors[-1])
   except OSError:
-    return None
-  return f"unix:path={path}"
+    status = None
+  socket_fd = descriptors.pop() if status and stat.S_ISSOCK(status.st_mode) and status.st_uid == os.getuid() else None
+  for descriptor in descriptors:
+    os.close(descriptor)
+  if socket_fd is None:
+    return None, None
+  return f"unix:path=/proc/self/fd/{socket_fd}", socket_fd
 
 
 def cdp_port(directory):
@@ -275,9 +290,11 @@ def atspi_dump(address):
   print(json.dumps(apps))
 
 
-def atspi_apps(address):
+def atspi_apps(address, descriptor=None):
+  """The apps on a bus, read by a process of their own that inherits descriptor,
+  the bus socket's, when the address names it."""
   try:
-    result = subprocess.run([sys.executable, os.path.abspath(__file__), "--atspi-dump", address], capture_output=True, text=True, timeout=30)
+    result = subprocess.run([sys.executable, os.path.abspath(__file__), "--atspi-dump", address], capture_output=True, text=True, timeout=30, pass_fds=() if descriptor is None else (descriptor,))
   except subprocess.TimeoutExpired:
     return []  # an app that stops answering has no tree to read
   if result.returncode == ATSPI_MISSING:
@@ -825,11 +842,14 @@ def main(args):
         fail(str(error))
       except (OSError, ValueError, RuntimeError, ConnectionError, KeyError) as error:
         print(f"DevTools on port {port} did not answer: {error}", file=sys.stderr)
-    if not nodes and bus_address(candidate):
+    address, descriptor = (None, None) if nodes else bus_address(candidate)
+    if address:
       try:
-        nodes, source = atspi_tree(state, atspi_apps(bus_address(candidate)), not directory, page), "atspi"
+        nodes, source = atspi_tree(state, atspi_apps(address, descriptor), not directory, page), "atspi"
       except Ambiguous as error:
         fail(str(error))
+      finally:
+        os.close(descriptor)
     if nodes:
       found.append((nodes, source))
 

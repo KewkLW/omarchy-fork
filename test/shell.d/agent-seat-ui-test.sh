@@ -151,6 +151,63 @@ pass "ui refuses to guess between windows alike, and numbers them"
 [[ $(jq -r '.outside' <<<"$twins") == "refused: --page 3: there are only 2 windows titled 'Twin'"* ]] || fail "a --page number outside the windows alike refuses" "$twins"
 pass "--page picks one of the windows alike by its number"
 
+# The sandbox can write where its bus socket is, and swap it for a link to any
+# socket on the host, the user's own buses included. ui reads only a socket
+# that is no link, and connects through the descriptor it checked, so a link
+# swapped in after the check leads nowhere else.
+bus=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" "$test_dir/bus-check" <<'EOF'
+import importlib.machinery, importlib.util, json, os, socket, sys
+loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("seat_ui", loader)
+ui = importlib.util.module_from_spec(spec)
+loader.exec_module(ui)
+
+root = sys.argv[2]
+def listener(path):
+  os.makedirs(os.path.dirname(path), exist_ok=True)
+  server = socket.socket(socket.AF_UNIX)
+  server.bind(path)
+  server.listen(1)
+  server.settimeout(0.5)
+  return server
+
+def address(directory):
+  found = ui.bus_address(directory)
+  return found[0] if isinstance(found, tuple) else found
+
+def reached(path, servers):
+  client = socket.socket(socket.AF_UNIX)
+  client.connect(path)
+  for name, server in servers.items():
+    try:
+      server.accept()[0].close()
+      return name
+    except socket.timeout:
+      pass
+  return "nothing"
+
+user_bus = listener(f"{root}/user/bus")
+os.makedirs(f"{root}/linked/bus")
+os.symlink(f"{root}/user/bus", f"{root}/linked/bus/bus")
+os.makedirs(f"{root}/linked-dir")
+os.symlink(f"{root}/user", f"{root}/linked-dir/bus")
+
+sandbox_bus = listener(f"{root}/sandbox/bus/bus")
+found = address(f"{root}/sandbox")
+os.rename(f"{root}/sandbox/bus/bus", f"{root}/sandbox/bus/old")
+os.symlink(f"{root}/user/bus", f"{root}/sandbox/bus/bus")
+print(json.dumps({
+  "linked": address(f"{root}/linked"),
+  "linked_dir": address(f"{root}/linked-dir"),
+  "swapped": reached(found.removeprefix("unix:path="), {"sandbox": sandbox_bus, "user": user_bus}) if found else "no address",
+}))
+EOF
+) || fail "ui opens a fake sandbox's bus" "$bus"
+
+[[ $(jq -r '.linked' <<<"$bus") == "null" && $(jq -r '.linked_dir' <<<"$bus") == "null" ]] || fail "ui refuses a bus socket that is a link, or in a directory that is one" "$bus"
+[[ $(jq -r '.swapped' <<<"$bus") == "sandbox" ]] || fail "ui reaches the bus it checked after the socket is swapped for a link" "$bus"
+pass "ui refuses a bus socket behind a link, and reaches the one it checked when a link replaces it later"
+
 if ! bwrap_works; then
   skip "bubblewrap cannot create a sandbox here; skipping the agent seat UI"
   exit 0
