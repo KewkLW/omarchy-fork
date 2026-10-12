@@ -1584,11 +1584,15 @@ class Broker:
     for pointer in client.pointers:
       client.send_event(pointer, "button", self.next_serial(), self.now(), BUTTONS[button], 1)
     self.pointer_frame(client)
-    for step in range(1, steps + 1):
-      self.move(window, x1 + (x2 - x1) * step / steps, y1 + (y2 - y1) * step / steps)
-    for pointer in client.pointers:
-      client.send_event(pointer, "button", self.next_serial(), self.now(), BUTTONS[button], 0)
-    self.pointer_frame(client)
+    # A step can leave every surface's input region; the button still comes
+    # up where the pointer last was, never stuck down in the app.
+    try:
+      for step in range(1, steps + 1):
+        self.move(window, x1 + (x2 - x1) * step / steps, y1 + (y2 - y1) * step / steps)
+    finally:
+      for pointer in client.pointers:
+        client.send_event(pointer, "button", self.next_serial(), self.now(), BUTTONS[button], 0)
+      self.pointer_frame(client)
 
   def do_scroll(self, window, x, y, dy=0, dx=0):
     client = self.move(window, *self.to_logical(window, x, y))

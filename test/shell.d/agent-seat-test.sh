@@ -915,6 +915,12 @@ pass "the agent scrolls"
 pointer move 30 10 2>/dev/null && fail "the agent pointer can't point outside a surface's input region"
 pass "the agent pointer can't point outside a surface's input region"
 
+# The eighth of twelve steps leaves the window's input region.
+pointer drag 2 2 30 10 2>/dev/null && fail "a drag that leaves the input region fails"
+events=$(pointer_events 10)
+[[ $events == *"button 272 1;frame;"*";button 272 0;frame" ]] || fail "a drag that leaves the input region still releases the button" "$events"
+pass "a drag that leaves the input region still releases the button"
+
 draw_command geometry
 shot=$(run_broker omarchy-agent-seat-screenshot "$window") || fail "a window declaring a huge geometry still gets a screenshot"
 [[ $(python3 "$test_dir/pixels.py" "$shot") == "50x35" ]] || fail "a screenshot is only as large as what the window draws" "$(python3 "$test_dir/pixels.py" "$shot")"
