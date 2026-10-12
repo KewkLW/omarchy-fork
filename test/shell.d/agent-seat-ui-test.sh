@@ -87,6 +87,28 @@ pass "ui places a window's controls and its menu above it in the screenshot's pi
 [[ $(jq -c '.attached' <<<"$popups") == '{"Popup Test":[412,200],"Choose":[412,370],"Pick One":[127,345],"Pick Two":[127,399]}' ]] || fail "ui places the items of a menu listed under its button in the menu" "$popups"
 pass "ui places the items of a menu listed under its button in the menu"
 
+# A control scrolled partly out of the 400x200 window, at scale 2, is clicked on
+# the part that shows; one showing only 2 pixels is left out.
+partial=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" <<'EOF'
+import importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("seat_ui", loader)
+ui = importlib.util.module_from_spec(spec)
+loader.exec_module(ui)
+
+def widget(role, name, extents, children=()):
+  return {"role": role, "name": name, "value": None, "states": [], "extents": extents, "children": list(children)}
+
+controls = [widget("push button", "Half right", [300, 50, 200, 40]), widget("push button", "Half below", [10, 190, 80, 40]), widget("push button", "Sliver", [398, 100, 50, 20])]
+apps = [{"name": "test", "windows": [widget("frame", "Scroll Test", [0, 0, 400, 200], controls)]}]
+state = {"title": "Scroll Test", "geometry": [0, 0, 400, 200], "surface": [400, 200], "scale": 2, "origin": [0, 0, 2], "popups": []}
+print(json.dumps({item["name"]: [item["x"], item["y"]] for item in ui.atspi_tree(state, apps, True)}))
+EOF
+) || fail "ui reads a fake tree with controls scrolled partly away" "$partial"
+
+[[ $(jq -c '.' <<<"$partial") == '{"Scroll Test":[400,200],"Half right":[700,140],"Half below":[100,390]}' ]] || fail "ui places a control scrolled partly away on the part that shows, and leaves out a sliver" "$partial"
+pass "ui places a control scrolled partly away on the part that shows, and leaves out a sliver"
+
 if ! bwrap_works; then
   skip "bubblewrap cannot create a sandbox here; skipping the agent seat UI"
   exit 0
@@ -323,13 +345,15 @@ port = server.getsockname()[1]
 print(port, flush=True)
 
 NODES = [
-  {"nodeId": "1", "ignored": False, "role": {"value": "RootWebArea"}, "name": {"value": "Fake page"}, "childIds": ["2", "3", "5"], "backendDOMNodeId": 1},
+  {"nodeId": "1", "ignored": False, "role": {"value": "RootWebArea"}, "name": {"value": "Fake page"}, "childIds": ["2", "3", "5", "6", "7"], "backendDOMNodeId": 1},
   {"nodeId": "2", "parentId": "1", "ignored": False, "role": {"value": "button"}, "name": {"value": "Send"}, "childIds": ["4"], "backendDOMNodeId": 2},
   {"nodeId": "4", "parentId": "2", "ignored": False, "role": {"value": "StaticText"}, "name": {"value": "Send"}, "childIds": [], "backendDOMNodeId": 4},
   {"nodeId": "3", "parentId": "1", "ignored": False, "role": {"value": "textbox"}, "name": {"value": "Message"}, "value": {"value": "hi"}, "properties": [{"name": "focused", "value": {"value": True}}], "childIds": [], "backendDOMNodeId": 3},
   {"nodeId": "5", "parentId": "1", "ignored": False, "role": {"value": "link"}, "name": {"value": "Far away"}, "childIds": [], "backendDOMNodeId": 5},
+  {"nodeId": "6", "parentId": "1", "ignored": False, "role": {"value": "link"}, "name": {"value": "Half shown"}, "childIds": [], "backendDOMNodeId": 6},
+  {"nodeId": "7", "parentId": "1", "ignored": False, "role": {"value": "link"}, "name": {"value": "Sliver"}, "childIds": [], "backendDOMNodeId": 7},
 ]
-BOXES = {1: [0, 0, 800, 600], 2: [10, 20, 100, 40], 3: [200, 20, 300, 40], 4: [20, 25, 80, 30], 5: [10, 5000, 100, 20]}
+BOXES = {1: [0, 0, 800, 600], 2: [10, 20, 100, 40], 3: [200, 20, 300, 40], 4: [20, 25, 80, 30], 5: [10, 5000, 100, 20], 6: [700, 100, 200, 20], 7: [10, 599, 100, 20]}
 
 def frame(sock, text):
     data = text.encode()
@@ -426,12 +450,15 @@ loader.exec_module(ui)
 state = {"title": "Fake page - Chromium", "geometry": [0, 0, 800, 600], "origin": [0, 0, 1.5], "scale": 1.5}
 nodes = ui.cdp_tree(state, int(sys.argv[2]))
 escaped = ui.cdp_target(int(sys.argv[2]), "Fun & games - Chromium") or {}
-print(json.dumps({"nodes": nodes, "send": ui.find(nodes, "send"), "box": ui.find(nodes, "textbox:"), "listing": [ui.describe(n) for n in nodes], "escaped": escaped.get("webSocketDebuggerUrl", "")}))
+print(json.dumps({"nodes": nodes, "send": ui.find(nodes, "send"), "box": ui.find(nodes, "textbox:"), "half": ui.find(nodes, "Half shown"), "listing": [ui.describe(n) for n in nodes], "escaped": escaped.get("webSocketDebuggerUrl", "")}))
 EOF
 ) || fail "ui reads a page over DevTools" "$cdp"
 
-[[ $(jq -r '.nodes | map(.role) | join(" ")' <<<"$cdp") == "RootWebArea button textbox" ]] || fail "the DevTools route lists the page's controls, skipping repeated text and what is scrolled away" "$cdp"
+[[ $(jq -r '.nodes | map(.name) | join(", ")' <<<"$cdp") == "Fake page, Send, Message, Half shown" ]] || fail "the DevTools route lists the page's controls, skipping repeated text and what is scrolled away" "$cdp"
 pass "the DevTools route lists the page's controls, skipping repeated text and what is scrolled away"
+# Half of the link lies right of the 800 CSS pixel wide page.
+[[ $(jq -c '.half[0] | [.x, .y]' <<<"$cdp") == "[1125,165]" ]] || fail "the DevTools route places a control scrolled partly away on the part that shows" "$cdp"
+pass "the DevTools route places a control scrolled partly away on the part that shows"
 [[ $(jq -c '.send[0] | [.x, .y, .box]' <<<"$cdp") == "[90,60,[15,30,150,60]]" ]] || fail "the DevTools route positions controls in screenshot pixels" "$cdp"
 pass "the DevTools route positions controls in screenshot pixels"
 [[ $(jq -r '.box[0].value' <<<"$cdp") == "hi" && $(jq -r '.box[0].states[0]' <<<"$cdp") == "focused" ]] || fail "the DevTools route reports values and focus" "$cdp"

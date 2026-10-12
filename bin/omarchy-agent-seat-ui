@@ -38,6 +38,8 @@ import urllib.request
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy", "agent-seat")
 SANDBOXES = os.path.join(RUNTIME_DIR, "sandboxes")
 MAX_NODES = 5000
+# Logical pixels of a control that must show for it to be listed.
+MIN_SHOWN = 4
 
 # Roles worth listing even without a name: what an agent can act on.
 ACTIONABLE = {
@@ -174,17 +176,22 @@ class Space:
     # The screenshot starts above or left of the window when a popup does.
     self.window = self.box(0, 0, *state["geometry"][2:])
 
-  @staticmethod
-  def visible(box, bounds):
-    """Whether a box overlaps bounds, both in screenshot pixels; trees report what is scrolled away too."""
-    return box[0] < bounds[0] + bounds[2] and box[1] < bounds[1] + bounds[3] and box[0] + box[2] > bounds[0] and box[1] + box[3] > bounds[1]
+  def shown(self, box, bounds):
+    """The part of a box inside bounds, both in screenshot pixels, or None when
+    too little of it shows to click: trees report what is scrolled away too."""
+    left, top = max(box[0], bounds[0]), max(box[1], bounds[1])
+    right, bottom = min(box[0] + box[2], bounds[0] + bounds[2]), min(box[1] + box[3], bounds[1] + bounds[3])
+    least = MIN_SHOWN * self.scale
+    return [left, top, right - left, bottom - top] if right - left >= least and bottom - top >= least else None
 
   def box(self, x, y, width, height):
     return [round((x - self.left) * self.scale), round((y - self.top) * self.scale), round(width * self.scale), round(height * self.scale)]
 
 
-def node(role, name, value, states, box, depth):
-  return {"role": role, "name": name, "value": value, "states": states, "x": box[0] + box[2] // 2, "y": box[1] + box[3] // 2, "box": box, "depth": depth}
+def node(role, name, value, states, box, depth, shown=None):
+  """A control at its centre, or at that of its part shown when only part is."""
+  shown = shown or box
+  return {"role": role, "name": name, "value": value, "states": states, "x": shown[0] + shown[2] // 2, "y": shown[1] + shown[3] // 2, "box": box, "depth": depth}
 
 
 # AT-SPI ----------------------------------------------------------------------------
@@ -342,8 +349,11 @@ def flatten(accessible, offset, space, bounds, nodes, depth, parent_name=None, p
   named = (accessible["name"] and accessible["name"] != parent_name) or accessible["value"] not in (None, "")
   shown = width > 0 and height > 0 and x > -1000000 and y > -1000000
   box = space.box(x - offset[0], y - offset[1], width, height)
-  if shown and (named or accessible["role"] in ACTIONABLE or depth == 0) and (depth == 0 or space.visible(box, bounds)):
-    nodes.append(node(accessible["role"], accessible["name"], accessible["value"], accessible["states"], box, depth))
+  # A control scrolled partly out of the window or popup is clicked on the part
+  # that shows; a sliver of one is left out.
+  part = space.shown(box, bounds)
+  if shown and (named or accessible["role"] in ACTIONABLE or depth == 0) and (depth == 0 or part):
+    nodes.append(node(accessible["role"], accessible["name"], accessible["value"], accessible["states"], box, depth, part if depth else None))
     depth += 1
   for child in accessible["children"]:
     flatten(child, offset, space, bounds, nodes, depth, accessible["name"] or parent_name, popups, claimed)
@@ -541,6 +551,7 @@ def cdp_tree(state, port, page=None):
   zoom = ratio / space.scale if space.scale else 1
   top = max(0, gh - inner_height * zoom)
   left = max(0, (gw - inner_width * zoom) / 2)
+  viewport = space.box(left, top, inner_width * zoom, inner_height * zoom)
 
   tree = devtools.call("Accessibility.getFullAXTree")["nodes"]
   by_id = {n["nodeId"]: n for n in tree}
@@ -578,8 +589,8 @@ def cdp_tree(state, port, page=None):
     quad = model["border"]
     xs, ys = quad[0::2], quad[1::2]
     x, y, width, height = min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)
-    if width <= 0 or height <= 0 or x + width <= 0 or y + height <= 0 or x >= inner_width or y >= inner_height:
-      continue  # scrolled out of view
+    if width <= 0 or height <= 0:
+      continue
     properties = {p["name"]: (p.get("value") or {}).get("value") for p in item.get("properties", [])}
     flags = [name for name in STATES if properties.get(name) in (True, "true", "mixed")]
     if properties.get("expanded") is False:
@@ -588,8 +599,11 @@ def cdp_tree(state, port, page=None):
       flags.append("disabled")
     role = item["role"]["value"]
     box = space.box(left + x * zoom, top + y * zoom, width * zoom, height * zoom)
+    part = space.shown(box, viewport)
+    if not part:
+      continue  # scrolled out of view, or all but a sliver
     value = (item.get("value") or {}).get("value")
-    nodes.append({**node(role, (item.get("name") or {}).get("value", "") or "", value if role != "textbox" or not properties.get("protected") else None, flags, box, 0), "id": item["nodeId"]})
+    nodes.append({**node(role, (item.get("name") or {}).get("value", "") or "", value if role != "textbox" or not properties.get("protected") else None, flags, box, 0, part), "id": item["nodeId"]})
 
   # Indent by listed ancestors only, like the AT-SPI listing.
   listed = {item["id"] for item in nodes}
