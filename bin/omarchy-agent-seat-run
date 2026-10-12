@@ -30,7 +30,9 @@
 # X11 sockets, $XDG_RUNTIME_DIR and /run/user (Hyprland, D-Bus, the keyring),
 # /proc and /dev, any directory holding one of those, and anything inside
 # ~/.config, ~/.ssh, ~/.gnupg or ~/.local/share/keyrings, or wherever one of
-# those links to.
+# those links to. Only a directory or a regular file can be shared, and the
+# sandbox mounts the very one that was checked, by an open descriptor, never a
+# path that could be swapped in the meantime.
 
 home=$(realpath -m -- "$HOME")
 runtime_dir=$(realpath -m -- "$XDG_RUNTIME_DIR")
@@ -80,6 +82,44 @@ app_bundle() {
   [[ -d $directory/lib || -d $directory/resources || -e $directory/resources.pak || -e $directory/AppRun ]]
 }
 
+# Opens a checked directory or file and sets pinned_fd to it, so the sandbox
+# mounts what was checked even if the path is swapped (for a link into ~/.ssh,
+# say, by an app with a writable share above it) before bwrap runs. A
+# directory is opened through its "." so a swapped-in FIFO cannot block the
+# launch. Fails unless the open file is still the checked path and of its kind.
+pinned=()
+pin() {
+  local path=$1 fd kind
+
+  if [[ -d $path ]]; then
+    kind="directory"
+    { exec {fd}<"$path/."; } 2>/dev/null || return 1
+  elif [[ -f $path ]]; then
+    kind="file"
+    { exec {fd}<"$path"; } 2>/dev/null || return 1
+  else
+    return 1
+  fi
+  pinned+=("$fd")
+  [[ $(readlink "/proc/self/fd/$fd") == "$path" ]] || return 1
+  if [[ $kind == "directory" ]]; then
+    [[ -d /proc/self/fd/$fd ]] || return 1
+  else
+    [[ -f /proc/self/fd/$fd ]] || return 1
+  fi
+  pinned_fd=$fd
+}
+
+# Closes every pinned file.
+unpin() {
+  local fd
+
+  for fd in "${pinned[@]}"; do
+    exec {fd}<&-
+  done
+  pinned=()
+}
+
 wait_for_window=true
 gpu=false
 cdp=false
@@ -98,10 +138,18 @@ while [[ $1 == --* ]]; do
         echo "Refusing to share $path with an agent app: it would expose $exposed" >&2
         exit 1
       fi
+      if [[ ! -d $path && ! -f $path ]]; then
+        echo "Refusing to share $path with an agent app: only a directory or a regular file can be shared" >&2
+        exit 1
+      fi
+      if ! pin "$path"; then
+        echo "Refusing to share $path with an agent app: it changed or could not be opened once checked" >&2
+        exit 1
+      fi
       if [[ $1 == "--share" ]]; then
-        shares+=(--bind "$path" "$path")
+        shares+=(--bind-fd "$pinned_fd" "$path")
       else
-        shares+=(--ro-bind "$path" "$path")
+        shares+=(--ro-bind-fd "$pinned_fd" "$path")
       fi
       shift
       ;;
@@ -130,9 +178,17 @@ if [[ -n $executable && $executable != /usr/* ]]; then
     echo "Refusing to run $executable on the agent seat: it would expose $exposed" >&2
     exit 1
   elif app_bundle "$bundle" && ! exposes "$bundle" >/dev/null; then
-    program=(--ro-bind "$bundle" "$bundle")
+    if ! pin "$bundle"; then
+      echo "Refusing to run $executable on the agent seat: its directory changed or could not be opened once checked" >&2
+      exit 1
+    fi
+    program=(--ro-bind-fd "$pinned_fd" "$bundle")
   else
-    program=(--ro-bind "$executable" "$executable")
+    if ! pin "$executable"; then
+      echo "Refusing to run $executable on the agent seat: it changed or could not be opened once checked" >&2
+      exit 1
+    fi
+    program=(--ro-bind-fd "$pinned_fd" "$executable")
   fi
   set -- "$executable" "${@:2}"
 fi
@@ -189,7 +245,11 @@ broker_answers() {
 # a broker answers. A new broker replaces both sockets before it answers on
 # control, so the wayland-0 bound below is then its own, never a dead one.
 if ! broker_answers; then
-  setsid -f omarchy-agent-seat-broker serve >>"$runtime/broker.log" 2>&1 8>&- 9>&-
+  # The broker outlives this launch, so it gets none of the pinned files.
+  (
+    unpin
+    setsid -f omarchy-agent-seat-broker serve >>"$runtime/broker.log" 2>&1 8>&- 9>&-
+  )
   deadline=$((SECONDS + 10))
   until broker_answers; do
     if ((SECONDS >= deadline)); then
@@ -259,8 +319,11 @@ if [[ $cdp == "true" ]]; then
   echo "$port" >"$session/cdp-port"
   set -- "$@" "--remote-debugging-port=$port"
 fi
+# The supervisor passes the pinned files on to bwrap, which mounts them and
+# closes them before the app starts; this launch needs them no longer.
 setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 8>&- 9>&- &
 supervisor_pid=$!
+unpin
 for _ in {1..50}; do
   read -r tracked_supervisor _ _ tracked_bwrap _ <"$record" || true
   (( ${tracked_bwrap:-0} != 0 )) && break

@@ -211,6 +211,52 @@ run_headless --share "$test_dir/out" "$test_dir/opt/tool/tool" || fail "a lone p
 [[ $(tr '\n' ' ' <"$test_dir/out/plain") == "tool " ]] || fail "a directory that is no bundle stays hidden" "$(cat "$test_dir/out/plain")"
 pass "an app bundle gets its directory, other programs only their file"
 
+# An app with a writable share of a projects directory can swap an approved
+# project in it for a link to ~/.ssh while a launch sharing that project waits
+# its turn. The sandbox still gets the directory that was checked, and none of
+# the files the launcher holds open reaches the app.
+mkdir -p "$test_dir/projects/site"
+echo "site" >"$test_dir/projects/site/index.html"
+echo "note" >"$test_dir/note"
+echo "key" >"$home/vault/ssh/id_ed25519"
+cat >"$test_dir/peek" <<'EOF'
+#!/bin/bash
+{
+  echo "site: $(ls -A "$2" | tr '\n' ' ')"
+  echo "note: $(cat "$3")"
+  echo "fds: $(ls /proc/self/fd | sort -n | tr '\n' ' ')"
+} >"$1/peek" 2>&1
+EOF
+chmod +x "$test_dir/peek"
+exec {held}>"$seat/launch.lock"
+flock "$held"
+# The launch gets none of this test's own descriptors, so any the app holds
+# are the launcher's.
+"${on_seat[@]}" omarchy-agent-seat-run --no-wait --share "$test_dir/out" --share "$test_dir/projects/site" --share-ro "$test_dir/note" \
+  "$test_dir/peek" "$test_dir/out" "$test_dir/projects/site" "$test_dir/note" >"$test_dir/race" 2>&1 {held}>&- &
+launcher_pid=$!
+# The launch opens the lock right after checking its shares, then waits on it.
+for _ in {1..100}; do
+  [[ -e /proc/$launcher_pid/fd/8 ]] && break
+  sleep 0.05
+done
+[[ -e /proc/$launcher_pid/fd/8 ]] || fail "a launch waits for the launch lock" "$(cat "$test_dir/race")"
+mv "$test_dir/projects/site" "$test_dir/projects/site.checked"
+ln -s "$home/.ssh" "$test_dir/projects/site"
+flock -u "$held"
+exec {held}>&-
+wait "$launcher_pid" || fail "a launch whose share was swapped while it waited goes ahead" "$(cat "$test_dir/race")"
+launcher_pid=
+for _ in {1..100}; do
+  compgen -G "$seat/sandboxes/sandbox.*" >/dev/null || break
+  sleep 0.05
+done
+result=$(cat "$test_dir/out/peek" 2>/dev/null)
+grep -qx "site: index.html " <<<"$result" || fail "a share swapped for a link after its check mounts the checked directory, not the link's target" "$result $(cat "$seat/apps.log" 2>/dev/null)"
+grep -qx "note: note" <<<"$result" || fail "a shared file is readable" "$result"
+grep -qx "fds: 0 1 2 3 " <<<"$result" || fail "the app inherits no descriptor the launcher opened" "$result"
+pass "a share swapped for a link to ~/.ssh after its check still mounts the checked directory, and its descriptor stays out of the app"
+
 # A launch that waits for its window keeps other launches from diffing the
 # window list until it has one, without holding up stop.
 "${on_seat[@]}" omarchy-agent-seat-run /usr/bin/sleep 30 >/dev/null 2>&1 &
