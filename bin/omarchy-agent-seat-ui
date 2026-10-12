@@ -487,7 +487,7 @@ def cdp_target(port, title, size=None, page=None):
 
   Raises Ambiguous when several shown pages fit the window equally well, or
   when page, a number from the refusal's list or part of a URL, does not pick
-  exactly one of them.
+  exactly one of them. A number outside the list is an error, not a URL part.
   """
   with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5) as response:
     targets = [t for t in json.load(response) if t.get("type") == "page" and t.get("webSocketDebuggerUrl") and not t.get("url", "").startswith("devtools://")]
@@ -504,9 +504,15 @@ def cdp_target(port, title, size=None, page=None):
     return None
   # Numbered by target id, which stays the same from one call to the next.
   candidates.sort(key=lambda t: t["id"])
+  listing = "\n".join(f"{number}. {html.unescape(t.get('title') or '')} — {t.get('url', '')}" for number, t in enumerate(candidates, 1))
+  hint = "Rerun with --page N to pick one (its number above, or part of its URL)."
   chosen = candidates
   if page is not None:
-    if page.isdigit() and 1 <= int(page) <= len(candidates):
+    if page.isdigit():
+      # A number always means a place in the list, never part of a URL.
+      if not 1 <= int(page) <= len(candidates):
+        only = "there is only 1 page" if len(candidates) == 1 else f"there are only {len(candidates)} pages"
+        raise Ambiguous(f"--page {page}: {only} shown in windows titled {title!r}:\n{listing}\n{hint}")
       chosen = [candidates[int(page) - 1]]
     else:
       needle = page.lower()
@@ -516,8 +522,7 @@ def cdp_target(port, title, size=None, page=None):
       reason = f"{len(candidates)} pages are shown in windows titled {title!r}, and DevTools cannot tell which is this one:"
     else:
       reason = f"--page {page!r} matches {len(chosen) or 'none'} of the {len(candidates)} pages shown in windows titled {title!r}:"
-    listing = "\n".join(f"{number}. {html.unescape(t.get('title') or '')} — {t.get('url', '')}" for number, t in enumerate(candidates, 1))
-    raise Ambiguous(f"{reason}\n{listing}\nRerun with --page N to pick one (its number above, or part of its URL).")
+    raise Ambiguous(f"{reason}\n{listing}\n{hint}")
   return chosen[0]
 
 

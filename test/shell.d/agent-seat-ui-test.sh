@@ -500,6 +500,7 @@ print(json.dumps({
   "number": pick(twins, "2"),
   "url": pick(twins, "COM/5"),
   "nowhere": pick(twins, "nowhere"),
+  "outside": pick(twins, "5"),
   "single": pick(twins[:1], "1"),
 }))
 EOF
@@ -516,6 +517,10 @@ pass "--page picks a page by part of its URL, in any case"
 nowhere=$(jq -r '.nowhere' <<<"$picked")
 [[ $nowhere == "refused: --page 'nowhere' matches none"* ]] && grep -q "^1\. Twin — https://example.com/5$" <<<"$nowhere" && grep -q "^2\. Twin — https://example.com/7$" <<<"$nowhere" || fail "--page matching no page refuses and lists the pages" "$nowhere"
 pass "--page matching no page refuses and lists the pages"
+# 5 is in a page's URL, but a number only ever counts in the list.
+outside=$(jq -r '.outside' <<<"$picked")
+[[ $outside == "refused: --page 5: there are only 2 pages"* ]] && grep -q "^2\. Twin — https://example.com/7$" <<<"$outside" || fail "a --page number outside the list refuses and lists the pages" "$outside"
+pass "a --page number outside the list refuses and lists the pages, even when a URL holds it"
 [[ $(jq -r '.single' <<<"$picked") == */devtools/page/7 ]] || fail "--page 1 reads the only page" "$picked"
 pass "--page 1 reads the only page shown"
 
