@@ -912,6 +912,7 @@ def translucent(seat, problems):
     seat.draw(20, 40, 30, RED)
     seat.subsurface(23, 20, 5, 5)
     seat.draw(23, 10, 10, b"\x00\x80\x00\x80", ARGB)
+    seat.request(20, "commit")
     check(problems, "a translucent subsurface over red", seat.pixel(22, 6, 6), "7f8000")
     check(problems, "the window beside it", seat.pixel(22, 1, 1), "ff0000")
 
@@ -943,6 +944,7 @@ def viewport(seat, problems):
     seat.request(24, "set_source", 0, 0, 10, 10)
     seat.request(24, "set_destination", 20, 20)
     seat.draw(23, 40, 30, quadrants)
+    seat.request(20, "commit")
     check(problems, "a window with a cropped subsurface over it", seat.size(22), "20x20")
     check(problems, "the colours of a viewport's 10x10 red source stretched to 20x20", seat.colours(22), ["ff0000"])
 
@@ -1017,6 +1019,32 @@ def single_pixel(seat, problems):
     seat.request(20, "commit")
     check(problems, "a one colour window with a scale 2 subsurface", (seat.size(22), seat.pixel(22, 9, 9), seat.pixel(22, 10, 10)), ("80x60", "ff0000", "00ff00"))
 
+def synchronized(seat, problems):
+    # A red 40x30 window with a 10x10 subsurface at 5,5, which shows a new
+    # frame only once the window commits, until it is desynchronized; then a
+    # 4x4 synchronized subsurface of it at 2,2, under it again synchronized.
+    seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, RED)
+    child = seat.subsurface(23, 20, 5, 5)
+    seat.draw(23, 10, 10, GREEN)
+    check(problems, "a subsurface's first frame before its window commits", (seat.pixel(22, 6, 6), seat.client.hit(22, 6, 6)), ("ff0000", (20, 6, 6)))
+    seat.request(20, "commit")
+    check(problems, "a subsurface's first frame once its window commits", (seat.pixel(22, 6, 6), seat.client.hit(22, 6, 6)), ("00ff00", (23, 1, 1)))
+    seat.draw(23, 10, 10, BLUE)
+    check(problems, "a subsurface's next frame before its window commits", seat.pixel(22, 6, 6), "00ff00")
+    seat.request(20, "commit")
+    check(problems, "a subsurface's next frame once its window commits", seat.pixel(22, 6, 6), "0000ff")
+    seat.request(child, "set_desync")
+    seat.draw(23, 10, 10, WHITE)
+    check(problems, "a desynchronized subsurface's frame", seat.pixel(22, 6, 6), "ffffff")
+    seat.request(child, "set_sync")
+    seat.subsurface(24, 23, 2, 2)
+    seat.draw(24, 4, 4, BLUE)
+    seat.request(23, "commit")
+    check(problems, "a nested subsurface's frame after its parent commits", seat.pixel(22, 8, 8), "ffffff")
+    seat.request(20, "commit")
+    check(problems, "a nested subsurface's frame once the window commits", seat.pixel(22, 8, 8), "0000ff")
+
 problems = []
 globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
 print("; ".join(problems) or "ok")
@@ -1062,6 +1090,10 @@ pass "a screenshot turns and flips a buffer by its transform"
 result=$(inproc single_pixel)
 [[ $result == "ok" ]] || fail "a screenshot draws single pixel buffers as their colour, stretched and blended" "$result"
 pass "a screenshot draws single pixel buffers as their colour, stretched and blended"
+
+result=$(inproc synchronized)
+[[ $result == "ok" ]] || fail "a synchronized subsurface's frame shows only once its window commits" "$result"
+pass "a synchronized subsurface's frame shows only once its window commits"
 
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 

@@ -705,7 +705,10 @@ class Client:
     return True
 
   def request_wl_compositor_create_surface(self, _, args):
-    self.surfaces[args[0]] = {"buffer": None, "pending": None, "scale": 1, "transform": 0, "viewport": None, "source": None, "input": None, "stack": [args[0]], "parent": None, "position": (0, 0)}
+    self.surfaces[args[0]] = {
+      "buffer": None, "scale": 1, "transform": 0, "viewport": None, "source": None, "input": None,
+      "pending": {}, "cached": {}, "sync": False, "stack": [args[0]], "parent": None, "position": (0, 0),
+    }
     return True
 
   def request_wl_compositor_create_region(self, _, args):
@@ -722,26 +725,65 @@ class Client:
     self.regions[region].append(("subtract", *args))
     return True
 
+  # A surface's buffer, scale, transform, viewport and input region change
+  # together when it commits. A synchronized subsurface's commit only goes
+  # into a cache, shown when its parent's state is, as Hyprland shows it: the
+  # agent sees no frame the user can't.
+
   def request_wl_surface_attach(self, surface, args):
-    self.surfaces[surface]["pending"] = self.buffers.get(args[0], (0, 0, None)) if args[0] else False
+    self.surfaces[surface]["pending"]["buffer"] = self.buffers.get(args[0], (0, 0, None)) if args[0] else None
     return True
 
   def request_wl_surface_commit(self, surface, _):
     state = self.surfaces[surface]
-    if state["pending"] is not None:
-      state["buffer"], state["pending"] = state["pending"] or None, None
+    state["cached"].update(state["pending"])
+    state["pending"] = {}
+    if not self.synchronized(surface):
+      self.apply(surface)
+    return True
+
+  def synchronized(self, surface):
+    """Whether a surface's commits wait for its parent's: a subsurface in sync mode, or under one."""
+    seen = set()
+    while surface in self.surfaces and surface not in seen and self.surfaces[surface]["parent"] is not None:
+      if self.surfaces[surface]["sync"]:
+        return True
+      seen.add(surface)
+      surface = self.surfaces[surface]["parent"]
+    return False
+
+  def apply(self, surface):
+    """Show a surface's committed state, and that of the synchronized subsurfaces under it."""
+    state = self.surfaces[surface]
+    state.update(state["cached"])
+    state["cached"] = {}
+    for child in state["stack"]:
+      if child != surface and child in self.surfaces and self.synchronized(child):
+        self.apply(child)
+
+  def request_wl_subsurface_set_sync(self, subsurface, _):
+    if self.roles.get(subsurface) in self.surfaces:
+      self.surfaces[self.roles[subsurface]]["sync"] = True
+    return True
+
+  def request_wl_subsurface_set_desync(self, subsurface, _):
+    surface = self.roles.get(subsurface)
+    if surface in self.surfaces:
+      self.surfaces[surface]["sync"] = False
+      if not self.synchronized(surface):
+        self.apply(surface)  # what it committed meanwhile shows now, as in wlroots
     return True
 
   def request_wl_surface_set_buffer_scale(self, surface, args):
-    self.surfaces[surface]["scale"] = max(1, args[0])
+    self.surfaces[surface]["pending"]["scale"] = max(1, args[0])
     return True
 
   def request_wl_surface_set_buffer_transform(self, surface, args):
-    self.surfaces[surface]["transform"] = args[0] if 0 <= args[0] <= 7 else 0
+    self.surfaces[surface]["pending"]["transform"] = args[0] if 0 <= args[0] <= 7 else 0
     return True
 
   def request_wl_surface_set_input_region(self, surface, args):
-    self.surfaces[surface]["input"] = list(self.regions.get(args[0], [])) if args[0] else None
+    self.surfaces[surface]["pending"]["input"] = list(self.regions.get(args[0], [])) if args[0] else None
     return True
 
   def request_wl_shm_create_pool(self, _, args):
@@ -792,14 +834,14 @@ class Client:
     return True
 
   def request_wp_viewport_set_destination(self, viewport, args):
-    self.surfaces[self.roles[viewport]]["viewport"] = tuple(args) if args[0] > 0 else None
+    self.surfaces[self.roles[viewport]]["pending"]["viewport"] = tuple(args) if args[0] > 0 else None
     return True
 
   # The part of the buffer the surface shows, in surface coordinates before
   # the destination scales it: x, y, width and height, all -1 when unset.
 
   def request_wp_viewport_set_source(self, viewport, args):
-    self.surfaces[self.roles[viewport]]["source"] = tuple(args) if args[2] > 0 and args[3] > 0 else None
+    self.surfaces[self.roles[viewport]]["pending"]["source"] = tuple(args) if args[2] > 0 and args[3] > 0 else None
     return True
 
   # A surface's stack is its subsurfaces and itself, bottom to top. A new
@@ -807,9 +849,15 @@ class Client:
   # its parent.
 
   def request_wl_subcompositor_get_subsurface(self, _, args):
+    ancestor = args[2]
+    while ancestor in self.surfaces:
+      if ancestor == args[1]:
+        raise ValueError("a surface can't be a subsurface of itself")
+      ancestor = self.surfaces[ancestor]["parent"]
     self.roles[args[0]] = args[1]
     self.surfaces[args[2]]["stack"].append(args[1])
     self.surfaces[args[1]]["parent"] = args[2]
+    self.surfaces[args[1]]["sync"] = True  # until the app says otherwise
     return True
 
   def request_wl_subsurface_place_above(self, subsurface, args):
@@ -842,8 +890,7 @@ class Client:
 
   def request_wp_viewport_destroy(self, viewport, _):
     if self.roles.get(viewport) in self.surfaces:
-      self.surfaces[self.roles[viewport]]["viewport"] = None
-      self.surfaces[self.roles[viewport]]["source"] = None
+      self.surfaces[self.roles[viewport]]["pending"].update(viewport=None, source=None)
     return True
 
   def unparent(self, surface):
@@ -853,6 +900,7 @@ class Client:
     if state["parent"] in self.surfaces and surface in self.surfaces[state["parent"]]["stack"]:
       self.surfaces[state["parent"]]["stack"].remove(surface)
     state["parent"] = None
+    state["sync"] = False
 
   def request_wl_subsurface_set_position(self, subsurface, args):
     self.surfaces[self.roles[subsurface]]["position"] = tuple(args)
