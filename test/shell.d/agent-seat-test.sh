@@ -1028,6 +1028,28 @@ def modifiers(seat, problems):
     check(problems, "the user's key reaches the app", [name for name, _ in events][-1:], ["key"])
     check(problems, "the app's modifiers when the user's key arrives", [tuple(args[1:]) for name, args in events if name == "modifiers"][-1:], [held])
 
+def user_click(seat, problems):
+    # The user's pointer rests in the app, the agent clicks elsewhere in the
+    # same surface, and the user clicks without moving.
+    seat.request(SEAT, "get_pointer", POINTER)
+    window = seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, RED)
+    seat.event(POINTER, "enter", 900, 20, 2, 2)
+    seat.event(POINTER, "motion", 0, 5, 5)
+    seat.broker.do_click(window, 30, 20)
+    seat.queued("events")
+
+    def click(serial):
+        seat.event(POINTER, "button", serial, 0, 0x110, 1)
+        seat.event(POINTER, "frame")
+        return [(name, args[1:] if name == "motion" else args) for object_id, name, args in seat.queued("events") if object_id == POINTER]
+
+    check(problems, "the user's click after the agent's", click(901), [("motion", [5, 5]), ("frame", []), ("button", [901, 0, 0x110, 1]), ("frame", [])])
+    check(problems, "the user's next click", click(902), [("button", [902, 0, 0x110, 1]), ("frame", [])])
+    seat.event(POINTER, "motion", 0, 6, 6)
+    seat.queued("events")
+    check(problems, "the user's click after moving", click(903), [("button", [903, 0, 0x110, 1]), ("frame", [])])
+
 def translucent(seat, problems):
     # A red window under a green subsurface at half opacity, premultiplied.
     seat.window(20, 21, 22)
@@ -1323,6 +1345,10 @@ pass "focus entering an app without a key or click does not open the clipboard t
 result=$(inproc modifiers)
 [[ $result == "ok" ]] || fail "a modifier the user holds through the agent's typing still applies to the user's next key" "$result"
 pass "a modifier the user holds through the agent's typing still applies to the user's next key"
+
+result=$(inproc user_click)
+[[ $result == "ok" ]] || fail "the user's click lands under the user's pointer after the agent pointed elsewhere in the surface" "$result"
+pass "the user's click lands under the user's pointer after the agent pointed elsewhere in the surface"
 
 result=$(inproc translucent)
 [[ $result == "ok" ]] || fail "a screenshot blends a translucent layer over what is under it" "$result"

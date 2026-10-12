@@ -806,6 +806,7 @@ class Client:
     self.advertised = {}
     self.params = {}  # GPU buffer params -> the size of the buffer they will create
     self.pointers, self.keyboards = {}, {}  # object -> the surface this app believes it is focused on
+    self.pointer_positions = {}  # pointer -> (x, y) where this app believes it is in that surface
     self.surfaces, self.regions, self.buffers, self.pools = {}, {}, {}, {}
     self.pool_fds = weakref.WeakSet()  # every Pool still holding a descriptor, destroyed or not
     self.roles = {}  # role object (subsurface, viewport, xdg_surface, toplevel, popup) -> surface id or xdg surface id
@@ -1283,6 +1284,8 @@ class Client:
 
     if interface == "wl_pointer" and name not in ("enter", "leave", "motion") and self.user_pointer:
       self.focus_pointer(object_id, *self.user_pointer)  # the agent may have moved this app's focus
+      if name != "frame":
+        self.restore_user_position(object_id)  # or only moved it within the user's surface
 
     if result is True:
       self.down.queue(*encode(object_id, opcode, signature, args))
@@ -1392,6 +1395,7 @@ class Client:
     if self.user_pointer:
       self.user_pointer = (self.user_pointer[0], args[1], args[2])
       self.focus_pointer(pointer, *self.user_pointer)
+    self.pointer_positions[pointer] = (args[1], args[2])
     return True
 
   def event_wl_pointer_button(self, _, args):
@@ -1420,7 +1424,22 @@ class Client:
     self.pointers[pointer] = surface if surface in self.surfaces else None
     if self.pointers[pointer]:
       self.send_event(pointer, "enter", serial or self.broker.next_serial(), surface, x, y)
+      self.pointer_positions[pointer] = (x, y)
     return True
+
+  def restore_user_position(self, pointer):
+    """Move a pointer the agent left elsewhere in the user's surface back under
+    the user's cursor. Hyprland sends no motion with a button or a scroll, so
+    the app would otherwise press or scroll where the agent pointed last."""
+    surface, x, y = self.user_pointer
+    if self.pointers.get(pointer) != surface or self.pointer_positions.get(pointer) == (x, y):
+      return
+    self.send_event(pointer, "motion", self.broker.now(), x, y)
+    self.pointer_positions[pointer] = (x, y)
+    # A group of its own, as the agent's motions are, ahead of the user's
+    # button or scroll and the frame Hyprland ends that with.
+    if self.objects[pointer][1] >= 5:
+      self.send_event(pointer, "frame")
 
   def event_xdg_popup_configure(self, popup, args):
     self.popups[popup]["position"] = (args[0], args[1])
@@ -1431,6 +1450,7 @@ class Client:
     for table in (self.surfaces, self.regions, self.buffers, self.pools, self.roles, self.xdg_surfaces, self.popups, self.params):
       table.pop(object_id, None)
     self.pointers.pop(object_id, None)
+    self.pointer_positions.pop(object_id, None)
     self.keyboards.pop(object_id, None)
     if object_id in self.toplevels:
       self.broker.remove_window(self.toplevels.pop(object_id)["window"])
@@ -2224,6 +2244,7 @@ class Broker:
     for pointer in client.pointers:
       if not client.focus_pointer(pointer, surface, lx, ly):
         client.send_event(pointer, "motion", self.now(), lx, ly)
+        client.pointer_positions[pointer] = (lx, ly)
     self.pointer_frame(client)
     return client
 

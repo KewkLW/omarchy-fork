@@ -183,6 +183,8 @@ Agent apps share your network namespace, so besides the internet they reach ever
 
 **A fifth review found a screenshot that could exhaust the broker.** A buffer's needed pixels were read as one span from the first to the last, padded to that width: an app can declare a buffer fifty million pixels wide over a pool it never fills (a sparse file costs it nothing), shrink it through a viewport and turn it, and a small screenshot then allocated 200 MiB for each row. Reads now cover runs of needed pixels and gaps of at most 256 between them, on both the turned and the straight path, so a row costs no more than the screenshot's width. The suite declares such a buffer and checks the broker's peak memory. The same review caught a local name in `ui` that shadowed the window-size comparison, so two matching trees from a broker without pids crashed instead of being told apart.
 
+**A sixth review found the user's click landing under the agent's pointer.** After the agent pointed elsewhere in the surface the user's pointer was in, the app held the agent's position, and Hyprland sends no motion with a button or a scroll, so a user who clicked without moving acted where the agent pointed last. The broker now records where the app believes each pointer is and, before a user's button or axis event, sends a motion to the user's coordinates when they differ, in a frame of its own.
+
 ## What it does not do
 
 - **One agent lane.** The seat has one agent identity. Several agents can use it at once, but it doesn't tell them apart (see the FAQ).
