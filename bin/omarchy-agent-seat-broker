@@ -465,6 +465,15 @@ def blend(canvas, target, pixels):
       canvas[target + start : target + end] = bytes(min(255, pixels[start + i] + (under[i] * (255 - alphas[run.start() + i // 4]) + 127) // 255) for i in range(end - start))
 
 
+def buffer_pixel(transform, x, y, width, height):
+  """The pixel of a buffer shown at x, y once a wl_output transform turns
+  the buffer to width x height, as wlroots maps a surface to its buffer:
+  turned 90, the buffer's bottom left pixel is the top left one shown."""
+  if transform & 4:
+    x = width - 1 - x
+  return ((x, y), (y, width - 1 - x), (width - 1 - x, height - 1 - y), (height - 1 - y, x))[transform & 3]
+
+
 def write_png(path, canvas, width, height):
   rows, rgb = bytearray(), bytearray(width * 3)
   for y in range(height):
@@ -696,7 +705,7 @@ class Client:
     return True
 
   def request_wl_compositor_create_surface(self, _, args):
-    self.surfaces[args[0]] = {"buffer": None, "pending": None, "scale": 1, "viewport": None, "source": None, "input": None, "stack": [args[0]], "parent": None, "position": (0, 0)}
+    self.surfaces[args[0]] = {"buffer": None, "pending": None, "scale": 1, "transform": 0, "viewport": None, "source": None, "input": None, "stack": [args[0]], "parent": None, "position": (0, 0)}
     return True
 
   def request_wl_compositor_create_region(self, _, args):
@@ -725,6 +734,10 @@ class Client:
 
   def request_wl_surface_set_buffer_scale(self, surface, args):
     self.surfaces[surface]["scale"] = max(1, args[0])
+    return True
+
+  def request_wl_surface_set_buffer_transform(self, surface, args):
+    self.surfaces[surface]["transform"] = args[0] if 0 <= args[0] <= 7 else 0
     return True
 
   def request_wl_surface_set_input_region(self, surface, args):
@@ -1036,8 +1049,15 @@ class Client:
     if state["source"]:
       return state["source"][2:]
     if state["buffer"]:
-      return state["buffer"][0] / state["scale"], state["buffer"][1] / state["scale"]
+      width, height = self.turned(surface)
+      return width / state["scale"], height / state["scale"]
     return 0, 0
+
+  def turned(self, surface):
+    """The size of a surface's buffer once its transform turns it."""
+    state = self.surfaces[surface]
+    width, height = state["buffer"][:2]
+    return (height, width) if state["transform"] & 1 else (width, height)
 
   def geometry(self, surface):
     """The window geometry of an xdg surface in surface coordinates, else the whole surface."""
@@ -1047,10 +1067,11 @@ class Client:
     return (0, 0, *self.size(surface))
 
   def crop(self, surface):
-    """The part of its buffer a surface shows, in buffer pixels: left, top,
-    right and bottom, and buffer pixels per surface unit across and down."""
+    """The part of its buffer a surface shows, in pixels of the buffer turned
+    by its transform: left, top, right and bottom, and pixels per surface
+    unit across and down."""
     state = self.surfaces[surface]
-    buffer_width, buffer_height = state["buffer"][:2]
+    buffer_width, buffer_height = self.turned(surface)
     width, height = self.size(surface)
     if state["source"]:
       x, y, w, h = (value * state["scale"] for value in state["source"])
@@ -1076,7 +1097,7 @@ class Client:
         gx, gy, gw, gh = self.geometry(surface)
         x0, y0, x1, y1 = max(gx, 0), max(gy, 0), min(gx + gw, sw), min(gy + gh, sh)
         if x1 > x0 and y1 > y0:
-          layers.append((buffer, self.crop(surface), x + x0, y + y0, x0, y0, x1 - x0, y1 - y0))
+          layers.append((buffer, self.crop(surface), x + x0, y + y0, x0, y0, x1 - x0, y1 - y0, self.surfaces[surface]["transform"]))
     if not layers:
       raise ValueError("the window has not drawn anything yet")
 
@@ -1087,7 +1108,7 @@ class Client:
       raise ValueError(f"the window is {width}x{height} pixels, more than a screenshot can hold")
     canvas = bytearray(width * height * 4)
 
-    for (_, _, (pool, offset, stride, format)), (cx, cy, right, bottom, rx, ry), x, y, gx, gy, gw, gh in layers:
+    for (buffer_width, buffer_height, (pool, offset, stride, format)), (cx, cy, right, bottom, rx, ry), x, y, gx, gy, gw, gh, transform in layers:
       if format not in (0, 1):  # ARGB8888 and XRGB8888, what apps draw with
         continue
       sx, sy = cx + gx * rx, cy + gy * ry
@@ -1108,14 +1129,18 @@ class Client:
       # SIGBUS. Whatever is missing stays black. Translucent layers blend over
       # what is under them; XRGB8888 has no alpha and covers it.
       end = min(pool.size, os.fstat(pool.fd).st_size)
+      turned = transform and self.turned_rows(pool, offset, stride, end, transform, buffer_width, buffer_height, columns, rows)
       for row, source_row in enumerate(rows):
-        source = offset + source_row * stride + first * 4
-        if not 0 <= source < end:
-          continue
-        pixels = os.pread(pool.fd, min(span * 4, end - source), source)
-        if span != len(columns):
-          read = len(pixels) // 4
-          pixels = b"".join(pixels[(column - first) * 4 : (column - first + 1) * 4] for column in columns if column - first < read)
+        if turned:
+          pixels = turned(source_row)
+        else:
+          source = offset + source_row * stride + first * 4
+          if not 0 <= source < end:
+            continue
+          pixels = os.pread(pool.fd, min(span * 4, end - source), source)
+          if span != len(columns):
+            read = len(pixels) // 4
+            pixels = b"".join(pixels[(column - first) * 4 : (column - first + 1) * 4] for column in columns if column - first < read)
         target = ((dy + row) * width + dx) * 4
         if format == 0:
           blend(canvas, target, pixels)
@@ -1123,6 +1148,30 @@ class Client:
           canvas[target : target + len(pixels)] = pixels
 
     return canvas, width, height, (left, top, scale)
+
+  @staticmethod
+  def turned_rows(pool, offset, stride, end, transform, buffer_width, buffer_height, columns, rows):
+    """For a buffer with a transform: a function from a row of the turned
+    buffer to the pixels at its columns, read from the buffer's own rows.
+
+    The buffer's column and row each depend on only one of the turned
+    buffer's, so the first row and column of the turned part name every
+    pixel of the buffer to read.
+    """
+    width, height = (buffer_height, buffer_width) if transform & 1 else (buffer_width, buffer_height)
+    needed = [buffer_pixel(transform, column, rows[0], width, height) for column in columns] + [buffer_pixel(transform, columns[0], row, width, height) for row in rows]
+    left, right = min(x for x, _ in needed), max(x for x, _ in needed)
+    lines = {}
+    for y in {y for _, y in needed}:
+      source = offset + y * stride + left * 4
+      if 0 <= source < end:
+        lines[y] = os.pread(pool.fd, min((right + 1 - left) * 4, end - source), source)
+
+    def pixels(row):
+      found = (buffer_pixel(transform, column, row, width, height) for column in columns)
+      return b"".join(lines.get(y, b"")[(x - left) * 4 : (x - left + 1) * 4].ljust(4, b"\0") for x, y in found)
+
+    return pixels
 
   def hit(self, toplevel, x, y):
     for surface, sx, sy in reversed(self.layers(self.toplevels[toplevel]["xdg"], 0, 0)):

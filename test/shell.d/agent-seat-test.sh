@@ -827,9 +827,9 @@ class Seat:
         self.request(role, "set_position", x, y)
         return role
 
-    def draw(self, surface, width, height, pixel, format=XRGB, scale=1):
+    def draw(self, surface, width, height, pixel, format=XRGB, scale=1, transform=0):
         """Fill a surface with one 4-byte pixel, or with the pixels of a whole
-        buffer, as a buffer of width x height at a buffer scale."""
+        buffer, as a buffer of width x height at a buffer scale and transform."""
         pool, buffer = self.next_pool + 1, self.next_pool + 2
         self.next_pool += 2
         memory = os.memfd_create("pixels")
@@ -838,6 +838,7 @@ class Seat:
         os.close(memory)
         self.request(pool, "create_buffer", buffer, 0, width, height, width * 4, format)
         self.request(surface, "set_buffer_scale", scale)
+        self.request(surface, "set_buffer_transform", transform)
         self.request(surface, "attach", buffer, 0, 0)
         self.request(surface, "commit")
 
@@ -980,6 +981,18 @@ def stacking(seat, problems):
     check(problems, "a subsurface moved below its window", (seat.pixel(22, 7, 7), seat.client.hit(22, 7, 7)), ("ff0000", (20, 7, 7)))
     check(problems, "where they overlap, after the older one moves below the window", (seat.pixel(22, 20, 15), seat.client.hit(22, 20, 15)), ("0000ff", (24, 5, 5)))
 
+def transform(seat, problems):
+    # A 40x30 buffer, red but for a green 10x5 block in its top left corner,
+    # turned 90 degrees, then flipped and turned 270.
+    corner = b"".join(GREEN if x < 10 and y < 5 else RED for y in range(30) for x in range(40))
+    seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, corner, transform=1)
+    check(problems, "a 40x30 buffer turned 90 degrees", seat.size(22), "30x40")
+    check(problems, "its top left corner turned 90 degrees", [seat.pixel(22, x, y) for x, y in ((25, 0), (29, 9), (24, 5), (27, 10), (2, 2), (2, 37))], ["00ff00", "00ff00", "ff0000", "ff0000", "ff0000", "ff0000"])
+    check(problems, "a window turned 90 degrees, clicked", (seat.client.size(20), seat.client.hit(22, 29, 39)), ((30.0, 40.0), (20, 29, 39)))
+    seat.draw(20, 40, 30, corner, transform=7)
+    check(problems, "its top left corner flipped and turned 270 degrees", [seat.pixel(22, x, y) for x, y in ((25, 30), (29, 39), (24, 35), (27, 29), (27, 5))], ["00ff00", "00ff00", "ff0000", "ff0000", "ff0000"])
+
 problems = []
 globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
 print("; ".join(problems) or "ok")
@@ -1017,6 +1030,10 @@ pass "a click in a hole cut out of a surface's input region falls through to the
 result=$(inproc stacking)
 [[ $result == "ok" ]] || fail "screenshots and clicks follow subsurfaces moved above or below each other and their window" "$result"
 pass "screenshots and clicks follow subsurfaces moved above or below each other and their window"
+
+result=$(inproc transform)
+[[ $result == "ok" ]] || fail "a screenshot turns and flips a buffer by its transform" "$result"
+pass "a screenshot turns and flips a buffer by its transform"
 
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 
