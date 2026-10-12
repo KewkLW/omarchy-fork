@@ -33,11 +33,36 @@ trap cleanup EXIT
 supervisor_start=$(process_start_time "$$") || exit 1
 write_record
 
+# The files bwrap mounts by descriptor (--bind-fd, --ro-bind-fd) are the only
+# descriptors beyond stdin, stdout and stderr that bwrap gets; it closes them
+# once mounted, so the app inherits none. Anything else inherited is closed.
+pinned=()
+previous=
+for arg in "$@"; do
+  if [[ $previous == "--bind-fd" || $previous == "--ro-bind-fd" ]] && [[ $arg =~ ^[0-9]+$ ]]; then
+    pinned+=("$arg")
+  fi
+  previous=$arg
+done
+for fd in /proc/$$/fd/*; do
+  fd=${fd##*/}
+  if ((fd > 2 && fd != 255)) && [[ " ${pinned[*]} " != *" $fd "* && -L /proc/$$/fd/$fd ]]; then
+    exec {fd}<&-
+  fi
+done
+
 # The supervisor stays above bwrap so stop has one verifiable process to kill.
 # --die-with-parent then SIGKILLs bwrap's PID-namespace init and everything in
 # that namespace when the supervisor dies, even when an app ignores SIGTERM.
 bwrap --die-with-parent --setenv OMARCHY_AGENT_SEAT_SANDBOX "$marker" "$@" &
 bwrap_pid=$!
+
+# bwrap has its own copies of the pinned files now.
+for fd in "${pinned[@]}"; do
+  if ((fd > 2)); then
+    exec {fd}<&-
+  fi
+done
 bwrap_start=$(process_start_time "$bwrap_pid") || bwrap_start=0
 write_record
 

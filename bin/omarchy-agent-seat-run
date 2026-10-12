@@ -34,6 +34,16 @@
 # sandbox mounts the very one that was checked, by an open descriptor, never a
 # path that could be swapped in the meantime.
 
+# Whatever the caller left open would pass on to the app, so every descriptor
+# but stdin, stdout, stderr and bash's own hold on this script (255) is closed
+# before anything else is opened.
+for fd in /proc/$$/fd/*; do
+  fd=${fd##*/}
+  if ((fd > 2 && fd != 255)) && [[ -L /proc/$$/fd/$fd ]]; then
+    exec {fd}<&-
+  fi
+done
+
 home=$(realpath -m -- "$HOME")
 runtime_dir=$(realpath -m -- "$XDG_RUNTIME_DIR")
 # Refused when a path is one of these or holds one.

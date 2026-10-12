@@ -257,6 +257,18 @@ grep -qx "note: note" <<<"$result" || fail "a shared file is readable" "$result"
 grep -qx "fds: 0 1 2 3 " <<<"$result" || fail "the app inherits no descriptor the launcher opened" "$result"
 pass "a share swapped for a link to ~/.ssh after its check still mounts the checked directory, and its descriptor stays out of the app"
 
+# A descriptor the caller leaves open does not reach the app.
+cat >"$test_dir/fds" <<'EOF'
+#!/bin/bash
+echo "fds: $(ls /proc/self/fd | sort -n | tr '\n' ' ')" >"$1/fds"
+EOF
+chmod +x "$test_dir/fds"
+run_headless --share "$test_dir/out" "$test_dir/fds" "$test_dir/out" 7<"$test_dir/note" ||
+  fail "a launch with an inherited descriptor runs" "$(cat "$seat/apps.log" 2>/dev/null)"
+result=$(cat "$test_dir/out/fds" 2>/dev/null)
+grep -qx "fds: 0 1 2 3 " <<<"$result" || fail "the app inherits no descriptor the caller left open" "$result"
+pass "a descriptor the caller leaves open does not reach the app"
+
 # A launch that waits for its window keeps other launches from diffing the
 # window list until it has one, without holding up stop.
 "${on_seat[@]}" omarchy-agent-seat-run /usr/bin/sleep 30 >/dev/null 2>&1 &
