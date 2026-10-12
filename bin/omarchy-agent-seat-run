@@ -250,20 +250,6 @@ agent_home="$HOME/.local/state/omarchy/agent-seat/home"
 old_agent_home="$HOME/.local/share/omarchy/agent-seat/home"
 sandbox_supervisor=$(realpath -e "$OMARCHY_PATH/bin/omarchy-agent-seat-sandbox")
 
-# A home made before it moved comes along once, but only from a real directory:
-# behind a link to the upgrade's tree it is not the user's to move.
-if [[ ! -e $agent_home && ! -L $HOME/.local/share/omarchy && ! -L ${old_agent_home%/*} && -d $old_agent_home && ! -L $old_agent_home ]]; then
-  if ! error=$(mkdir -p -- "${agent_home%/*}" 2>&1 && mv -T -- "$old_agent_home" "$agent_home" 2>&1); then
-    echo "Could not move the agent seat's home from $old_agent_home to $agent_home: ${error#*: }" >&2
-    exit 1
-  fi
-  rmdir -- "${old_agent_home%/*}" 2>/dev/null
-fi
-if ! error=$(mkdir -p -- "$agent_home" 2>&1); then
-  echo "Could not create the agent seat's home at $agent_home: ${error#*: }" >&2
-  exit 1
-fi
-
 # Each seat window with the pid of the app that opened it, as the broker sees
 # it: the host pid of the process inside the sandbox.
 windows() {
@@ -303,6 +289,30 @@ flock 8
 # supervisor is still being registered.
 exec 9>"$runtime/sandboxes.lock"
 flock 9
+
+# A home made before it moved comes along once, but only from a real directory:
+# behind a link to the upgrade's tree it is not the user's to move. It moves
+# under the launch lock, so two launches cannot both try, and only by rename:
+# a copy across filesystems could be cut short and leave two half homes.
+if [[ ! -e $agent_home && ! -L $HOME/.local/share/omarchy && ! -L ${old_agent_home%/*} && -d $old_agent_home && ! -L $old_agent_home ]]; then
+  if ! error=$(mkdir -p -- "${agent_home%/*}" 2>&1); then
+    echo "Could not create ${agent_home%/*} for the agent seat's home: ${error#*: }" >&2
+    exit 1
+  fi
+  if [[ $(stat -c %d -- "$old_agent_home") != $(stat -c %d -- "${agent_home%/*}") ]]; then
+    echo "The agent seat's home now lives at $agent_home, on another filesystem than the old $old_agent_home. Move it yourself, with the seat stopped: mv -T $old_agent_home $agent_home" >&2
+    exit 1
+  fi
+  if ! error=$(mv -T -- "$old_agent_home" "$agent_home" 2>&1); then
+    echo "Could not move the agent seat's home from $old_agent_home to $agent_home: ${error#*: }" >&2
+    exit 1
+  fi
+  rmdir -- "${old_agent_home%/*}" 2>/dev/null
+fi
+if ! error=$(mkdir -p -- "$agent_home" 2>&1); then
+  echo "Could not create the agent seat's home at $agent_home: ${error#*: }" >&2
+  exit 1
+fi
 
 broker_answers() {
   omarchy-agent-seat-broker call '{"command":"windows"}' >/dev/null 2>&1
@@ -390,8 +400,10 @@ fi
 setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 8>&- 9>&- &
 supervisor_pid=$!
 unpin
-# The supervisor starts the sandbox's bus before bwrap.
-for _ in {1..300}; do
+# The supervisor starts the sandbox's bus before bwrap, which takes it up to
+# about 7 seconds when the bus or the registry does not answer; this wait
+# outlasts that, so the lock is held until bwrap is recorded.
+for _ in {1..1000}; do
   { read -r tracked_supervisor _ _ tracked_bwrap _ <"$record"; } 2>/dev/null || true  # a sandbox that already ended took its record
   (( ${tracked_bwrap:-0} != 0 )) && break
   kill -0 "$supervisor_pid" 2>/dev/null || break

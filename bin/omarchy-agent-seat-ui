@@ -171,10 +171,11 @@ def sandbox_of(pid):
 def bus_address(directory):
   """The address of a sandbox's private bus and a descriptor of its socket, or (None, None).
 
-  The sandbox can write where its socket is, and swap it for a link to any
-  socket on the host, the user's own buses included, between a check of the
-  path and a connect to it. So the socket is opened once, following no link,
-  checked to be a socket of the user's, and connected to through that
+  The sandbox gets the socket alone, bound read-only, so it cannot swap a
+  link in where the socket is; should that ever change, a link to any socket
+  on the host, the user's own buses included, could appear between a check
+  of the path and a connect to it. So the socket is opened once, following no
+  link, checked to be a socket of the user's, and connected to through that
   descriptor (/proc/self/fd/N), which no later link can redirect. The caller
   keeps the descriptor open and passes it on to the AT-SPI reader.
   """

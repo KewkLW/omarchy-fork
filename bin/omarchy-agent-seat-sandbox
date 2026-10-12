@@ -25,7 +25,6 @@ write_record() {
 }
 
 cleanup() {
-  ((${#daemons[@]})) && kill -KILL "${daemons[@]}" 2>/dev/null
   [[ -e $record ]] && unlink "$record"
   rm -rf -- "${record%/*}/$marker.d"
 }
@@ -59,10 +58,11 @@ done
 # which omarchy agent seat ui reads. The accessibility registry runs here too,
 # as the user, with that bus alone in its environment: like the broker, it
 # serves the app's traffic from outside. Both are this supervisor's children,
-# so stop ends them with the sandbox, and they die with it besides.
+# so stop ends them with the sandbox, and the kernel kills them the moment
+# this supervisor exits (--pdeathsig), so nothing here kills them by pid,
+# which another process could have taken by then.
 session="${record%/*}/$marker.d"
 bus="$session/bus/bus"
-daemons=()
 
 # Starts a daemon on the private bus with nothing else of this session.
 daemon() {
@@ -73,7 +73,6 @@ daemon() {
     cd / || exit 1
     exec setpriv --pdeathsig KILL env -i PATH=/usr/bin DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" AT_SPI_BUS_ADDRESS="unix:path=$bus" "$@" </dev/null
   ) &
-  daemons+=("$!")
 }
 
 if [[ -d ${bus%/*} && -x /usr/bin/dbus-daemon ]]; then
@@ -98,8 +97,10 @@ EOF
   if [[ -S $bus && -x /usr/lib/at-spi2-registryd ]]; then
     daemon /usr/lib/at-spi2-registryd >/dev/null 2>&1
     # Apps register with the registry as they start, so it must be up first.
-    for _ in {1..100}; do
-      dbus-send --bus="unix:path=$bus" --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.a11y.atspi.Registry 2>/dev/null | grep -q "boolean true" && break
+    # Each ask gives the bus 100 ms, so a bus that listens but never answers
+    # holds the launch about 5 seconds, not 25 a turn.
+    for _ in {1..50}; do
+      dbus-send --bus="unix:path=$bus" --reply-timeout=100 --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.a11y.atspi.Registry 2>/dev/null | grep -q "boolean true" && break
       sleep 0.01
     done
   fi
