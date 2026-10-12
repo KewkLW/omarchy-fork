@@ -228,6 +228,50 @@ run_headless --share "$test_dir/out" "$home/.local/bin/tool" "$test_dir/out" ||
 [[ $(cat "$test_dir/out/local-bin" 2>/dev/null) == "ran" ]] || fail "a program in ~/.local/bin runs on the seat" "$(cat "$seat/apps.log" 2>/dev/null)"
 pass "a program in ~/.local/bin runs on the seat, though the directory cannot be shared"
 
+# The private bus runs outside the sandbox, which gets its socket alone, read-only:
+# no directory of the user's runtime to write in, and no socket to swap for a
+# link the seat's own reader would follow to another bus.
+if [[ -x /usr/bin/dbus-daemon ]]; then
+  rm -f "$test_dir/out/bus" "$test_dir/out/bus-go"
+  "${on_seat[@]}" omarchy-agent-seat-run --no-wait --share "$test_dir/out" /usr/bin/bash -c '
+    bus=$XDG_RUNTIME_DIR/agent-bus
+    {
+      [[ -S $bus/bus ]] && echo "socket"
+      echo "beside: $(ls -A "$bus" | tr "\n" " ")"
+      echo "mount: $(findmnt -T "$bus/bus" -no TARGET,OPTIONS | cut -d, -f1)"
+      echo "directory mount: $(findmnt -T "$bus" -no TARGET)"
+      dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.GetId >/dev/null 2>&1 && echo "bus answers"
+      touch "$bus/planted" 2>/dev/null
+      mv "$bus/bus" "$bus/moved" 2>/dev/null && ln -s /elsewhere "$bus/bus" 2>/dev/null && echo "socket replaced"
+    } >"$1/bus.tmp" 2>&1
+    mv "$1/bus.tmp" "$1/bus"
+    until [[ -e $1/bus-go ]]; do sleep 0.05; done' _ "$test_dir/out" ||
+    fail "an app with a private bus starts" "$(cat "$seat/apps.log" 2>/dev/null)"
+  for _ in {1..100}; do [[ -e $test_dir/out/bus ]] && break; sleep 0.05; done
+  bus_report=$(cat "$test_dir/out/bus" 2>/dev/null)
+  sessions=("$seat"/sandboxes/*.d)
+  host_side=$(ls -A "${sessions[0]}/bus" 2>&1 | tr '\n' ' ')
+  supervisor=$(cat "$seat"/sandboxes/sandbox.* 2>/dev/null | cut -d" " -f1)
+  daemons=$(pgrep -P "$supervisor" -x 'dbus-daemon|at-spi2-registr' | tr '\n' ' ')
+  touch "$test_dir/out/bus-go"
+  for _ in {1..100}; do
+    compgen -G "$seat/sandboxes/sandbox.*" >/dev/null || break
+    sleep 0.05
+  done
+  grep -qx "socket" <<<"$bus_report" && grep -qx "beside: bus " <<<"$bus_report" && grep -qx "bus answers" <<<"$bus_report" ||
+    fail "the app reaches its private bus through the socket alone" "$bus_report"
+  grep -qx "mount: $runtime/agent-bus/bus ro" <<<"$bus_report" ||
+    fail "the private bus's socket is bound read-only, by itself" "$bus_report"
+  grep -q "^directory mount: .*agent-bus$" <<<"$bus_report" && fail "no directory of the user's runtime is bound into the sandbox" "$bus_report"
+  [[ $bus_report != *"socket replaced"* && $host_side == "bus " ]] ||
+    fail "the app can neither replace the socket nor write beside it" "$bus_report host: $host_side"
+  [[ $(wc -w <<<"$daemons") == 2 ]] || fail "the bus and the registry run outside the sandbox, under its supervisor" "$daemons"
+  for pid in $daemons; do
+    kill -0 "$pid" 2>/dev/null && fail "the bus and the registry end with their sandbox" "$(ps -o pid,cmd -p "$pid")"
+  done
+  pass "the private bus runs outside the sandbox, which gets its socket alone, read-only"
+fi
+
 grep -qx "scratch: scratch" <<<"$result" || fail "a read-only share is readable" "$result"
 [[ $result != *"scratch writable"* && ! -e $test_dir/scratch/new ]] || fail "a read-only share is not writable" "$result"
 pass "a read-only share of a scratch directory is readable and not writable"

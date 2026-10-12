@@ -154,26 +154,6 @@ if ! bwrap_works; then
   exit 0
 fi
 
-# The sandbox's init starts the app even where its bus daemons are missing,
-# masked here by /dev/null, which is not executable. Its own PID namespace ends
-# a daemon it did start when the app exits.
-init_without() {
-  local masks=() daemon
-  for daemon in "$@"; do
-    masks+=(--ro-bind /dev/null "$daemon")
-  done
-  rm -rf "$test_dir/init-bus"
-  mkdir -p "$test_dir/init-bus"
-  bwrap --dev-bind / / --unshare-pid --die-with-parent "${masks[@]}" \
-    --setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$test_dir/init-bus/bus" \
-    "$ROOT/bin/omarchy-agent-seat-init" /usr/bin/echo started 2>&1
-}
-started=$(init_without /usr/bin/dbus-daemon /usr/lib/at-spi2-registryd)
-[[ $started == "started" && ! -e $test_dir/init-bus/bus ]] || fail "init starts the app without dbus-daemon" "$started"
-started=$(init_without /usr/lib/at-spi2-registryd)
-[[ $started == "started" && -S $test_dir/init-bus/bus ]] || fail "init starts the app on its bus without at-spi2-registryd" "$started"
-pass "init starts the app without dbus-daemon or at-spi2-registryd"
-
 seat omarchy-agent-seat-broker serve 2>"$test_dir/broker.log" &
 broker_pid=$!
 for _ in {1..50}; do [[ -S $runtime/omarchy/agent-seat/control ]] && break; sleep 0.1; done
@@ -670,5 +650,5 @@ pass "click-ui hands --page to ui and the other options to the pointer"
 seat omarchy-agent-seat-stop >/dev/null
 for _ in {1..50}; do kill -0 "$broker_pid" 2>/dev/null || break; sleep 0.1; done
 compgen -G "$runtime/omarchy/agent-seat/sandboxes/*.d" >/dev/null && fail "stop removes the private buses" "$(ls -la "$runtime/omarchy/agent-seat/sandboxes")"
-pgrep -f "dbus-daemon --config-file=$runtime/agent-bus/bus.conf" >/dev/null && fail "stop ends the private bus daemons"
+pgrep -f "dbus-daemon --config-file=$runtime/omarchy/agent-seat/sandboxes/" >/dev/null && fail "stop ends the private bus daemons"
 pass "stop ends the private buses with their sandboxes"

@@ -369,17 +369,17 @@ record=$(mktemp "$runtime/sandboxes/sandbox.XXXXXX")
 marker=${record##*.}
 
 # A private session bus, reachable only from this sandbox and the seat's own
-# commands, carries the app's accessibility tree (omarchy agent seat ui).
+# commands, carries the app's accessibility tree (omarchy agent seat ui). The
+# supervisor runs it outside the sandbox, which gets its socket alone, bound
+# read-only; an app that finds no bus there still starts.
 session="$runtime/sandboxes/$marker.d"
 mkdir -p -m 0700 "$session" "$session/bus"
 bus="unix:path=$XDG_RUNTIME_DIR/agent-bus/bus"
 sandbox+=(
-  --bind "$session/bus" "$XDG_RUNTIME_DIR/agent-bus"
-  --ro-bind "$(realpath -e "$OMARCHY_PATH/bin/omarchy-agent-seat-init")" /run/omarchy-agent-seat-init
+  --ro-bind-try "$session/bus/bus" "$XDG_RUNTIME_DIR/agent-bus/bus"
   --setenv DBUS_SESSION_BUS_ADDRESS "$bus" --setenv AT_SPI_BUS_ADDRESS "$bus"
   --setenv GTK_A11Y atspi --setenv NO_AT_BRIDGE 0 --setenv QT_LINUX_ACCESSIBILITY_ALWAYS_ON 1
 )
-set -- /run/omarchy-agent-seat-init "$@"
 if [[ $cdp == "true" ]]; then
   port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
   echo "$port" >"$session/cdp-port"
@@ -390,8 +390,9 @@ fi
 setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 8>&- 9>&- &
 supervisor_pid=$!
 unpin
-for _ in {1..50}; do
-  read -r tracked_supervisor _ _ tracked_bwrap _ <"$record" || true
+# The supervisor starts the sandbox's bus before bwrap.
+for _ in {1..300}; do
+  { read -r tracked_supervisor _ _ tracked_bwrap _ <"$record"; } 2>/dev/null || true  # a sandbox that already ended took its record
   (( ${tracked_bwrap:-0} != 0 )) && break
   kill -0 "$supervisor_pid" 2>/dev/null || break
   sleep 0.01
