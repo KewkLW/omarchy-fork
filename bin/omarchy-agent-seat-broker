@@ -941,9 +941,10 @@ class Client:
     return True
 
   # A surface's buffer, scale, transform, viewport and input region change
-  # together when it commits. A synchronized subsurface's commit only goes
-  # into a cache, shown when its parent's state is, as Hyprland shows it: the
-  # agent sees no frame the user can't.
+  # together when it commits, and so do where its subsurfaces sit and how
+  # they stack. A synchronized subsurface's commit only goes into a cache,
+  # shown when its parent's state is, as Hyprland shows it: the agent sees no
+  # frame the user can't.
 
   def request_wl_surface_attach(self, surface, args):
     self.surfaces[surface]["pending"]["buffer"] = self.buffers.get(args[0], (0, 0, None)) if args[0] else None
@@ -951,7 +952,9 @@ class Client:
 
   def request_wl_surface_commit(self, surface, _):
     state = self.surfaces[surface]
+    positions = state["pending"].pop("positions", {})
     state["cached"].update(state["pending"])
+    state["cached"].setdefault("positions", {}).update(positions)  # one commit's moves add to an earlier one's
     state["pending"] = {}
     if not self.synchronized(surface):
       self.apply(surface)
@@ -970,8 +973,12 @@ class Client:
   def apply(self, surface):
     """Show a surface's committed state, and that of the synchronized subsurfaces under it."""
     state = self.surfaces[surface]
+    positions = state["cached"].pop("positions", {})
     state.update(state["cached"])
     state["cached"] = {}
+    for child, position in positions.items():
+      if child in self.surfaces and self.surfaces[child]["parent"] == surface:
+        self.surfaces[child]["position"] = position
     for child in state["stack"]:
       if child != surface and child in self.surfaces and self.synchronized(child):
         self.apply(child)
@@ -1060,8 +1067,9 @@ class Client:
     return True
 
   # A surface's stack is its subsurfaces and itself, bottom to top. A new
-  # subsurface goes on top, and can then move above or below any sibling or
-  # its parent.
+  # subsurface goes on top at once, and can then move above or below any
+  # sibling or its parent: in the parent's pending stack, shown when the
+  # parent's state is.
 
   def request_wl_subcompositor_get_subsurface(self, _, args):
     ancestor = args[2]
@@ -1070,7 +1078,8 @@ class Client:
         raise ValueError("a surface can't be a subsurface of itself")
       ancestor = self.surfaces[ancestor]["parent"]
     self.roles[args[0]] = args[1]
-    self.surfaces[args[2]]["stack"].append(args[1])
+    for stack in self.stacks(args[2]):
+      stack.append(args[1])
     self.surfaces[args[1]]["parent"] = args[2]
     self.surfaces[args[1]]["sync"] = True  # until the app says otherwise
     return True
@@ -1085,9 +1094,19 @@ class Client:
 
   def restack(self, surface, sibling, above):
     parent = self.surfaces.get(self.surfaces.get(surface, {}).get("parent"))
-    if parent and sibling != surface and sibling in parent["stack"] and surface in parent["stack"]:
-      parent["stack"].remove(surface)
-      parent["stack"].insert(parent["stack"].index(sibling) + above, surface)
+    if not parent:
+      return
+    if "stack" not in parent["pending"]:
+      parent["pending"]["stack"] = list(parent["cached"].get("stack", parent["stack"]))
+    stack = parent["pending"]["stack"]
+    if sibling != surface and sibling in stack and surface in stack:
+      stack.remove(surface)
+      stack.insert(stack.index(sibling) + above, surface)
+
+  def stacks(self, surface):
+    """A surface's stack as shown, committed and pending."""
+    state = self.surfaces[surface]
+    return [state["stack"]] + [state[kind]["stack"] for kind in ("cached", "pending") if "stack" in state[kind]]
 
   # A destroyed subsurface leaves its parent at once, before its id can come
   # back as an unrelated surface.
@@ -1112,13 +1131,19 @@ class Client:
     state = self.surfaces.get(surface)
     if not state:
       return
-    if state["parent"] in self.surfaces and surface in self.surfaces[state["parent"]]["stack"]:
-      self.surfaces[state["parent"]]["stack"].remove(surface)
+    if state["parent"] in self.surfaces:
+      for stack in self.stacks(state["parent"]):
+        if surface in stack:
+          stack.remove(surface)
+      for kind in ("cached", "pending"):
+        self.surfaces[state["parent"]][kind].get("positions", {}).pop(surface, None)
     state["parent"] = None
     state["sync"] = False
 
   def request_wl_subsurface_set_position(self, subsurface, args):
-    self.surfaces[self.roles[subsurface]]["position"] = tuple(args)
+    parent = self.surfaces.get(self.surfaces[self.roles[subsurface]]["parent"])
+    if parent:
+      parent["pending"].setdefault("positions", {})[self.roles[subsurface]] = tuple(args)
     return True
 
   # Hyprland -> client

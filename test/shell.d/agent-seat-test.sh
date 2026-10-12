@@ -1105,6 +1105,27 @@ def synchronized(seat, problems):
     seat.request(20, "commit")
     check(problems, "a nested subsurface's frame once the window commits", seat.pixel(22, 8, 8), "0000ff")
 
+def double_buffered(seat, problems):
+    # A red 40x30 window with a green 10x10 subsurface at 5,5, moved to
+    # 20,10; then a blue one at the same place over it, moved below it.
+    # Each change shows only once the window commits.
+    seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, RED)
+    green = seat.subsurface(23, 20, 5, 5)
+    seat.draw(23, 10, 10, GREEN)
+    seat.request(20, "commit")
+    seat.request(green, "set_position", 20, 10)
+    check(problems, "a moved subsurface before its window commits", [(seat.pixel(22, x, y), seat.client.hit(22, x, y)) for x, y in ((6, 6), (21, 11))], [("00ff00", (23, 1, 1)), ("ff0000", (20, 21, 11))])
+    seat.request(20, "commit")
+    check(problems, "a moved subsurface once its window commits", [(seat.pixel(22, x, y), seat.client.hit(22, x, y)) for x, y in ((6, 6), (21, 11))], [("ff0000", (20, 6, 6)), ("00ff00", (23, 1, 1))])
+    blue = seat.subsurface(24, 20, 20, 10)
+    seat.draw(24, 10, 10, BLUE)
+    seat.request(20, "commit")
+    seat.request(blue, "place_below", 23)
+    check(problems, "a subsurface moved below another before its window commits", (seat.pixel(22, 21, 11), seat.client.hit(22, 21, 11)), ("0000ff", (24, 1, 1)))
+    seat.request(20, "commit")
+    check(problems, "a subsurface moved below another once its window commits", (seat.pixel(22, 21, 11), seat.client.hit(22, 21, 11)), ("00ff00", (23, 1, 1)))
+
 def limits(seat, problems):
     # A window one pixel wider than a screenshot can hold, one exactly as
     # wide, and a 400x400 buffer shown 10x10 through a viewport, which would
@@ -1177,6 +1198,10 @@ pass "a screenshot draws single pixel buffers as their colour, stretched and ble
 result=$(inproc synchronized)
 [[ $result == "ok" ]] || fail "a synchronized subsurface's frame shows only once its window commits" "$result"
 pass "a synchronized subsurface's frame shows only once its window commits"
+
+result=$(inproc double_buffered)
+[[ $result == "ok" ]] || fail "a subsurface's position and stacking change only when its window commits" "$result"
+pass "a subsurface's position and stacking change only when its window commits"
 
 result=$(inproc limits)
 [[ $result == "ok" ]] || fail "a screenshot is at most 4096 pixels a side and 4 pixels per surface unit" "$result"
