@@ -268,6 +268,19 @@ elif step in ("fdflood", "poolflood"):
     except OSError:
         print("disconnected")
 
+elif step == "truncated":
+    # A shared memory pool with its descriptor and new id but no size.
+    bind("wl_shm", 1, 4)
+    memory = os.memfd_create("truncated")
+    try:
+        conn.sock.sendmsg([message(4, 0, struct.pack("<I", 100))], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [memory]))])
+        conn.send(message(1, 0, struct.pack("<I", 5)))
+        while (msg := conn.read()) is not None and msg[0] != 5:
+            pass
+        print("disconnected" if msg is None else "connected")
+    except OSError:
+        print("disconnected")
+
 elif step == "syncflood":
     # Ask for replies as fast as possible and never read one.
     import time
@@ -1097,6 +1110,13 @@ sleep 0.2
 (( $(descriptors) <= before )) || fail "a dropped app leaves no descriptors behind" "$before -> $(descriptors)"
 [[ $(python3 "$test_dir/app.py" "$socket" globals) == *wl_seat* ]] || fail "the broker serves apps after a descriptor flood"
 pass "apps flooding the broker with descriptors are dropped without a leak"
+
+before=$(descriptors)
+[[ $(python3 "$test_dir/app.py" "$socket" truncated) == "disconnected" ]] || fail "an app sending a malformed request is dropped"
+sleep 0.2
+(( $(descriptors) <= before )) || fail "a malformed request leaves none of its descriptors behind" "$before -> $(descriptors)"
+[[ $(python3 "$test_dir/app.py" "$socket" globals) == *wl_seat* ]] || fail "the broker serves apps after a malformed request"
+pass "a malformed request drops only its app and leaves none of its descriptors behind"
 
 python3 "$test_dir/app.py" "$socket" syncflood >"$test_dir/flood.out" &
 flood_pid=$!

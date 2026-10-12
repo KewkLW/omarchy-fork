@@ -199,6 +199,8 @@ def decode(signature, body, fds):
     elif kind == "fd":
       args.append(fds.pop(0))
 
+  if offset > len(body):
+    raise ValueError("message too short")
   return args
 
 
@@ -559,6 +561,17 @@ class Client:
       raise ValueError("missing file descriptors")
     return interface, version, name, signature, destructor
 
+  def decode(self, channel, signature, raw):
+    """A message's arguments. A malformed one closes the descriptors it carried
+    before it fails, so they can't pile up in the broker."""
+    fds = [channel.infds.pop(0) for _ in range(fd_count(signature))]
+    try:
+      return decode(signature, raw[8:], list(fds))
+    except Exception:
+      for fd in fds:
+        os.close(fd)
+      raise ValueError("malformed message")
+
   def track_new_objects(self, signature, args, version):
     for (kind, interface), value in zip(signature, args):
       if kind == "new_id" and interface:
@@ -570,7 +583,7 @@ class Client:
 
   def request(self, object_id, opcode, raw):
     interface, version, name, signature, destructor = self.message(object_id, opcode, "requests", self.down)
-    args = decode(signature, raw[8:], self.down.infds)
+    args = self.decode(self.down, signature, raw)
     if DEBUG:
       log(f"-> {interface}@{object_id}.{name}{args}")
 
@@ -808,7 +821,7 @@ class Client:
 
   def event(self, object_id, opcode, raw):
     interface, version, name, signature, destructor = self.message(object_id, opcode, "events", self.up)
-    args = decode(signature, raw[8:], self.up.infds)
+    args = self.decode(self.up, signature, raw)
     if DEBUG:
       log(f"<- {interface}@{object_id}.{name}{args}")
     try:
