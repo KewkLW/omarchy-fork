@@ -44,6 +44,7 @@ cleanup() {
     [[ $pid =~ ^[0-9]+$ ]] && kill "$pid" 2>/dev/null
   done
   [[ -n ${launcher_pid:-} ]] && kill "$launcher_pid" 2>/dev/null
+  [[ -n ${swapper_pid:-} ]] && kill "$swapper_pid" 2>/dev/null
   [[ -n ${broker_pid:-} ]] && kill "$broker_pid" 2>/dev/null
   [[ -n ${compositor_pid:-} ]] && kill "$compositor_pid" 2>/dev/null
   # A broker a launch started; the shim execs it, so its pid is the broker's.
@@ -334,6 +335,49 @@ grep -qx "site: index.html " <<<"$result" || fail "a share swapped for a link af
 grep -qx "note: note" <<<"$result" || fail "a shared file is readable" "$result"
 grep -qx "fds: 0 1 2 3 " <<<"$result" || fail "the app inherits no descriptor the launcher opened" "$result"
 pass "a share swapped for a link to ~/.ssh after its check still mounts the checked directory, and its descriptor stays out of the app"
+
+# A FIFO with no writer would hold a plain open, and so the launch, forever.
+# One shared outright is refused at once. One an app swaps in for a shared
+# file between the launcher's check and its open is refused too: the
+# launcher's own pin, run here while a file and a FIFO take turns at one path
+# as fast as they can, is refused or pins the file but never blocks.
+mkfifo "$test_dir/pipe"
+started=${EPOCHREALTIME/./}
+output=$(timeout 10 "${on_seat[@]}" PATH="$test_dir/no-broker:$ROOT/bin:$PATH" omarchy-agent-seat-run --share-ro "$test_dir/pipe" /usr/bin/true 2>&1) &&
+  fail "sharing a FIFO is refused"
+[[ $output == "Refusing "* ]] || fail "sharing a FIFO is refused" "$output"
+((${EPOCHREALTIME/./} - started < 2000000)) || fail "sharing a FIFO is refused at once" "$output"
+mkdir -p "$test_dir/swaps"
+echo "pinned" >"$test_dir/swaps/file"
+mkfifo "$test_dir/swaps/pipe"
+python3 - "$test_dir/swaps" <<'EOF' &
+import os, sys
+os.chdir(sys.argv[1])
+while True:
+    for kind in ("pipe", "file"):
+        os.link(kind, "next")
+        os.rename("next", "share")
+EOF
+swapper_pid=$!
+for _ in {1..100}; do [[ -e $test_dir/swaps/share ]] && break; sleep 0.05; done
+output=$(timeout 10 bash -c '
+  eval "$(sed -n "/^pinned=()\$/,/^}\$/p; /^unpin() {\$/,/^}\$/p" "$1")"
+  tries=0
+  until ((SECONDS >= 2)); do
+    if pin "$2"; then
+      [[ $(<"/proc/self/fd/$pinned_fd") == "pinned" ]] || echo "pinned something else"
+    fi
+    unpin
+    tries=$((tries + 1))
+  done
+  echo "tries: $tries"' _ "$ROOT/bin/omarchy-agent-seat-run" "$test_dir/swaps/share" 2>&1)
+status=$?
+kill "$swapper_pid"
+wait "$swapper_pid" 2>/dev/null
+swapper_pid=
+((status == 0)) || fail "a FIFO swapped in for a shared file after its check never blocks the launch" "status $status: $output"
+[[ $output =~ ^tries:\ [1-9] ]] || fail "a FIFO swapped in for a shared file after its check is refused or the file is pinned" "$output"
+pass "a FIFO shared or swapped in for a shared file after its check is refused at once, never waited on"
 
 # A descriptor the caller leaves open does not reach the app.
 cat >"$test_dir/fds" <<'EOF'

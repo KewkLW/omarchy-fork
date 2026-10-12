@@ -120,19 +120,41 @@ app_bundle() {
 
 # Opens a checked directory or file and sets pinned_fd to it, so the sandbox
 # mounts what was checked even if the path is swapped (for a link into ~/.ssh,
-# say, by an app with a writable share above it) before bwrap runs. A
-# directory is opened through its "." so a swapped-in FIFO cannot block the
-# launch. Fails unless the open file is still the checked path and of its kind.
+# say, by an app with a writable share above it) before bwrap runs. Neither
+# open can block on a FIFO swapped in after the check, which would hang the
+# launch until something wrote to it: a directory is opened through its ".",
+# and a file by a helper that opens it without blocking and keeps it open
+# while this shell opens the very same file through the helper's descriptor,
+# only once the helper found it a regular file. Fails unless the open file is
+# still the checked path and of its kind.
 pinned=()
 pin() {
-  local path=$1 fd kind
+  local path=$1 fd kind opener_pid opener_out opener_in opened
 
   if [[ -d $path ]]; then
     kind="directory"
     { exec {fd}<"$path/."; } 2>/dev/null || return 1
   elif [[ -f $path ]]; then
     kind="file"
-    { exec {fd}<"$path"; } 2>/dev/null || return 1
+    coproc opener {
+      exec python3 -c '
+import os, stat, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+if stat.S_ISREG(os.fstat(fd).st_mode):
+    print(fd, flush=True)
+    sys.stdin.read()
+' "$path" 2>/dev/null
+    }
+    opener_pid=$opener_PID opener_out=${opener[0]} opener_in=${opener[1]}
+    read -r -u "$opener_out" opened
+    if [[ $opened =~ ^[0-9]+$ ]] && { exec {fd}<"/proc/$opener_pid/fd/$opened"; } 2>/dev/null; then
+      opened=true
+    else
+      opened=false
+    fi
+    exec {opener_in}>&- {opener_out}<&-
+    wait "$opener_pid" 2>/dev/null
+    [[ $opened == "true" ]] || return 1
   else
     return 1
   fi

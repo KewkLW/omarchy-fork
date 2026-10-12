@@ -68,10 +68,18 @@ MAX_CLIENTS_PER_SANDBOX = 16
 MAX_CLIENTS = 64
 MAX_POOLS_PER_SANDBOX = 256
 MAX_POOLS = 640
+# Each object an app makes costs the broker an entry in its tables (a surface
+# most, near 1 KiB), so live objects are capped per connection, per sandbox
+# and for the seat (see check_objects). A real app holds hundreds.
+MAX_APP_OBJECTS = 4096
+MAX_OBJECTS_PER_SANDBOX = 16384
+MAX_OBJECTS = 40960
 # An input region is kept as rectangles (see set_region); each costs the
-# broker memory, so they are capped in one region and across an app's.
+# broker memory, so they are capped in one region, and across an app's
+# regions and the input regions its surfaces keep, per app and per sandbox.
 MAX_REGION_RECTANGLES = 1024
 MAX_APP_REGION_RECTANGLES = 4096
+MAX_REGION_RECTANGLES_PER_SANDBOX = 16384
 LISTENER_PAUSE_SECONDS = 1  # how long to stop accepting when out of descriptors
 PAUSE_READING_BYTES = 256 << 10  # stop reading one side while this much waits for the other
 MAX_UNSENT_BYTES = 16 << 20  # and drop the app if its queue grows past this anyway
@@ -850,6 +858,7 @@ class Client:
       raise
     self.up = Channel(upstream)
     self.objects = {1: ("wl_display", 1)}
+    self.syncs = set()  # callbacks of wl_display.sync in self.objects, see check_objects
     self.pid, self.sandbox = 0, None  # the app's, once accepted
     self.snapshots_until = 0  # commits copy their pixels until then (time.monotonic)
     self.advertised = {}
@@ -857,7 +866,7 @@ class Client:
     self.pointers, self.keyboards = {}, {}  # object -> the surface this app believes it is focused on
     self.pointer_positions = {}  # pointer -> (x, y) where this app believes it is in that surface
     self.surfaces, self.regions, self.buffers, self.pools = {}, {}, {}, {}
-    self.region_rectangles = 0  # in all of self.regions, see set_region
+    self.region_rectangles = 0  # in all of self.regions and the surfaces' input regions, see set_region
     self.pool_fds = weakref.WeakSet()  # every Pool still holding a descriptor, destroyed or not
     self.roles = {}  # role object (subsurface, viewport, xdg_surface, toplevel, popup) -> surface id or xdg surface id
     self.xdg_surfaces = {}  # xdg_surface -> {"surface", "geometry", "popups"}
@@ -926,6 +935,33 @@ class Client:
         os.close(fd)
       raise ValueError("malformed message")
 
+  def kept_objects(self):
+    """The app's live objects but for its syncs' callbacks (see check_objects)."""
+    return len(self.objects) - len(self.syncs)
+
+  def check_objects(self, interface, name, signature):
+    """Refuse a request that makes an object past the app's, its sandbox's or
+    the seat's share, before it reaches Hyprland. Counted from the live
+    tables, so an object stops counting once Hyprland frees its id. Only the
+    app's requests count: an object Hyprland makes is not the app's doing.
+
+    Nor does a sync's callback, which Hyprland answers and frees at once:
+    one read can hold thousands of syncs, and while an app does not read its
+    replies the broker stops reading Hyprland's, so callbacks in flight
+    would drop an app that the read pauses hold back instead. Those pauses
+    bound them, to two socket buffers and PAUSE_READING_BYTES of 12 byte
+    requests, a few MiB. A frame callback counts: Hyprland keeps it until
+    the surface is shown, which an app need never do."""
+    if (interface, name) == ("wl_display", "sync") or not any(kind == "new_id" for kind, _ in signature):
+      return
+    clients = set(self.broker.clients) | {self}
+    if self.kept_objects() >= MAX_APP_OBJECTS:
+      raise ValueError(f"more than {MAX_APP_OBJECTS} objects")
+    if sum(client.kept_objects() for client in clients if client.sandbox == self.sandbox) >= MAX_OBJECTS_PER_SANDBOX:
+      raise ValueError(f"too many objects in {self.sandbox}")
+    if sum(client.kept_objects() for client in clients) >= MAX_OBJECTS:
+      raise ValueError("too many objects on the seat")
+
   def track_new_objects(self, signature, args, version):
     for (kind, interface), value in zip(signature, args):
       if kind == "new_id" and interface:
@@ -949,6 +985,7 @@ class Client:
         args[1] = (bound, self.version_cap(bound), new_id)
 
     try:
+      self.check_objects(interface, name, signature)
       self.track_new_objects(signature, args, version)
       handler = getattr(self, f"request_{interface}_{name}", None)
       result = handler(object_id, args) if handler else True
@@ -960,6 +997,10 @@ class Client:
       self.up.queue(*encode(object_id, opcode, signature, args))
     else:
       close_fds(signature, args)
+
+  def request_wl_display_sync(self, _, args):
+    self.syncs.add(args[0])
+    return True
 
   # The clipboard is the user's. An app reads it only while the user's keyboard
   # is in it and the user acted last, so the agent can't paste it out, and it
@@ -1078,7 +1119,11 @@ class Client:
   # or cut out, not the requests that made it: kept as requests, an app adding
   # the same rectangle over and over would grow the broker without limit.
   # Rectangles that cut each other up can still multiply, so a region and an
-  # app's regions together are capped, and an app past that is dropped.
+  # app's regions together are capped, and an app past that is dropped. A
+  # surface keeps its input region's rectangles after the region is gone, up
+  # to three sets of them (set, committed and shown), so those count against
+  # the app too: otherwise an app could fill a region, set it on a surface,
+  # destroy it and fill another, thousands of surfaces over.
 
   def request_wl_region_add(self, region, args):
     if args[2] > 0 and args[3] > 0:  # an empty rectangle adds nothing
@@ -1090,12 +1135,29 @@ class Client:
     return True
 
   def set_region(self, region, rectangles):
-    total = self.region_rectangles - len(self.regions.get(region, ())) + len(rectangles)
     if len(rectangles) > MAX_REGION_RECTANGLES:
       raise ValueError(f"more than {MAX_REGION_RECTANGLES} rectangles in one region")
-    if total > MAX_APP_REGION_RECTANGLES:
-      raise ValueError(f"more than {MAX_APP_REGION_RECTANGLES} rectangles in its regions")
-    self.regions[region], self.region_rectangles = rectangles, total
+    self.count_rectangles(len(rectangles) - len(self.regions.get(region, ())))
+    self.regions[region] = rectangles
+
+  def count_rectangles(self, change):
+    """Add to the rectangles the app keeps, refusing more than its share or its sandbox's."""
+    total = self.region_rectangles + change
+    if change > 0:
+      if total > MAX_APP_REGION_RECTANGLES:
+        raise ValueError(f"more than {MAX_APP_REGION_RECTANGLES} rectangles in its regions")
+      clients = set(self.broker.clients) | {self}
+      if sum(client.region_rectangles for client in clients if client.sandbox == self.sandbox) + change > MAX_REGION_RECTANGLES_PER_SANDBOX:
+        raise ValueError(f"more than {MAX_REGION_RECTANGLES_PER_SANDBOX} rectangles in the regions of {self.sandbox}")
+    self.region_rectangles = total
+
+  def input_rectangles(self, surface):
+    """The rectangles of the input regions a surface keeps: set, committed and
+    shown, each counted once. A region set on several surfaces counts on each,
+    which only overstates."""
+    state = self.surfaces[surface]
+    kept = {id(region): len(region) for region in (state["pending"].get("input"), state["cached"].get("input"), state["input"]) if region}
+    return sum(kept.values())
 
   # A surface's buffer, scale, transform, viewport, input region and window
   # geometry change together when it commits, and so do where its
@@ -1119,6 +1181,7 @@ class Client:
 
   def request_wl_surface_commit(self, surface, _):
     state = self.surfaces[surface]
+    kept = self.input_rectangles(surface)
     pending = state["pending"]
     buffer = pending["buffer"] if "buffer" in pending else state["cached"].get("buffer", state["buffer"])
     # A copy of an earlier commit's pixels never outlives a later commit.
@@ -1127,6 +1190,7 @@ class Client:
     state["cached"].update(state["pending"])
     state["cached"].setdefault("positions", {}).update(positions)  # one commit's moves add to an earlier one's
     state["pending"] = {}
+    self.count_rectangles(self.input_rectangles(surface) - kept)  # never more: a commit only lets go of regions
     if not self.synchronized(surface):
       self.apply(surface)
     return True
@@ -1161,10 +1225,12 @@ class Client:
   def apply(self, surface):
     """Show a surface's committed state, and that of the synchronized subsurfaces under it."""
     state = self.surfaces[surface]
+    kept = self.input_rectangles(surface)
     positions = state["cached"].pop("positions", {})
     geometry = state["cached"].pop("geometry", None)
     state.update(state["cached"])
     state["cached"] = {}
+    self.count_rectangles(self.input_rectangles(surface) - kept)
     # The window geometry belongs to the xdg surface, and stays as last
     # committed until the app sets another.
     if geometry:
@@ -1202,7 +1268,9 @@ class Client:
   def request_wl_surface_set_input_region(self, surface, args):
     # A region's rectangles are a tuple, replaced rather than changed, so the
     # surface can share it.
+    kept = self.input_rectangles(surface)
     self.surfaces[surface]["pending"]["input"] = self.regions.get(args[0], ()) if args[0] else None
+    self.count_rectangles(self.input_rectangles(surface) - kept)
     return True
 
   def request_wl_shm_create_pool(self, _, args):
@@ -1565,7 +1633,10 @@ class Client:
 
   def forget(self, object_id):
     self.objects.pop(object_id, None)
+    self.syncs.discard(object_id)
     self.region_rectangles -= len(self.regions.get(object_id, ()))
+    if object_id in self.surfaces:
+      self.region_rectangles -= self.input_rectangles(object_id)
     for table in (self.surfaces, self.regions, self.buffers, self.pools, self.roles, self.xdg_surfaces, self.popups, self.params):
       table.pop(object_id, None)
     self.pointers.pop(object_id, None)

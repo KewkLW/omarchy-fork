@@ -1220,7 +1220,7 @@ def region_flood(seat, problems):
     seat.request(COMPOSITOR, "create_region", 25)
     check(problems, "1024 separate rectangles in one region", [refused(25, 2 * i, 0, 1, 1) for i in range(1024)], [False] * 1024)
     check(problems, "one more in that region", refused(25, 3000, 0, 1, 1), True)
-    for region, count in ((26, 1024), (27, 1024), (28, 1020)):  # with the hole's 4, the app's 4096
+    for region, count in ((26, 1024), (27, 1024), (28, 1016)):  # with the hole's 4, and the 4 its subsurface keeps, the app's 4096
         seat.request(COMPOSITOR, "create_region", region)
         for i in range(count):
             seat.request(region, "add", 2 * i, 0, 1, 1)
@@ -1248,6 +1248,65 @@ def region_flood(seat, problems):
                     problems.append(f"a region made by {requests} at {x},{y}: got {not inside}, want {inside}")
                     return
         seat.client.forget(30)
+
+def object_flood(seat, problems):
+    # An app's objects cost the broker memory for as long as they live, a
+    # surface most of a KiB. An app making and destroying surfaces 100 at a
+    # time, 10,000 over, keeps working; one making 10,000 and destroying none
+    # is dropped at 4,096 objects, before its surfaces cost the broker more
+    # than a few MiB.
+    def peak():
+        with open("/proc/self/status") as status:
+            return next(int(line.split()[1]) for line in status if line.startswith("VmHWM:"))
+    def refused(request, word):
+        try:
+            request()
+        except ValueError as error:
+            return word in str(error)
+        return False
+
+    # A surface keeps its input region's rectangles after the region is
+    # gone, so a full region set on surface after surface, each destroyed
+    # once set, counts against the app's 4,096 rectangles too.
+    kept = []
+    for i in range(5):
+        seat.request(COMPOSITOR, "create_surface", 40 + i)
+        seat.request(COMPOSITOR, "create_region", 50 + i)
+        for x in range(1024):
+            seat.request(50 + i, "add", 2 * x, 0, 1, 1)
+        kept.append(refused(lambda: seat.request(40 + i, "set_input_region", 50 + i), "rectangles"))
+        seat.queued("requests")
+        seat.client.forget(50 + i)  # as when Hyprland frees its id
+        if kept[-1]:
+            break
+    check(problems, "full regions set on surfaces, the regions destroyed, until refused", kept, [False, False, False, True])
+    for i in range(len(kept) - 1):  # not the refused one's: the app would be gone with it
+        seat.client.forget(40 + i)
+    check(problems, "rectangles counted once those surfaces are gone", seat.client.region_rectangles, 0)
+
+    made = []
+    for _ in range(100):
+        made += [refused(lambda: seat.request(COMPOSITOR, "create_surface", 1000 + i), "objects") for i in range(100)]
+        for i in range(100):
+            seat.request(1000 + i, "destroy")
+        seat.queued("requests")
+        for i in range(100):
+            seat.event(1, "delete_id", 1000 + i)  # as Hyprland frees each id
+        seat.queued("events")
+    check(problems, "surfaces made and destroyed 100 at a time, 10,000 times over, refused", any(made), False)
+    seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, RED)
+    check(problems, "a window drawn after that", seat.pixel(22, 1, 1), "ff0000")
+
+    before, objects = peak(), None
+    for i in range(10_000):
+        if refused(lambda: seat.request(COMPOSITOR, "create_surface", 2000 + i), "objects"):
+            objects = len(seat.client.objects)
+            break
+        if i % 1000 == 0:  # as if passed on to Hyprland
+            seat.queued("requests")
+    check(problems, "the app's objects when a surface is refused", objects, 4096)
+    check(problems, "the cost in memory of making 10,000 surfaces (KiB)", peak() - before < 5 * 1024, True)
 
 def stacking(seat, problems):
     # A red 40x30 window with a green 20x20 subsurface at 5,5 and a blue one
@@ -1538,6 +1597,10 @@ pass "a click in a hole cut out of a surface's input region falls through to the
 result=$(inproc region_flood)
 [[ $result == "ok" ]] || fail "an app setting a region over and over does not grow the broker, and too many rectangles drop it" "$result"
 pass "an app setting a region over and over does not grow the broker, and too many rectangles drop it"
+
+result=$(inproc object_flood)
+[[ $result == "ok" ]] || fail "an app making objects without destroying them is dropped at its share, and one destroying them keeps working" "$result"
+pass "an app making objects without destroying them is dropped at its share, and one destroying them keeps working"
 
 result=$(inproc stacking)
 [[ $result == "ok" ]] || fail "screenshots and clicks follow subsurfaces moved above or below each other and their window" "$result"
