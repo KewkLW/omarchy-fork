@@ -42,6 +42,7 @@ cleanup() {
   # A broker a launch started; the shim execs it, so its pid is the broker's.
   [[ -s $test_dir/slow-broker/pid ]] && kill "$(<"$test_dir/slow-broker/pid")" 2>/dev/null
   wait 2>/dev/null
+  chmod -R u+w "$test_dir" 2>/dev/null
   rm -rf "$test_dir"
 }
 trap cleanup EXIT
@@ -281,6 +282,53 @@ run_headless --share "$test_dir/draft" /usr/bin/bash -c '
   fail "an app with a shared file runs" "$(cat "$seat/apps.log" 2>/dev/null)"
 [[ $(<"$test_dir/draft") == $'draft\nwritten' ]] || fail "a file shared read-write is written through, alone in its directory" "$(cat "$test_dir/draft")"
 pass "a file shared read-write is written through from the sandbox, and the files beside it stay hidden"
+
+# The seat's home lives in Omarchy's state. One made under
+# ~/.local/share/omarchy before that moved comes along once.
+seat_home="$home/.local/state/omarchy/agent-seat/home"
+old_seat_home="$home/.local/share/omarchy/agent-seat/home"
+rm -rf "$home/.local/state/omarchy/agent-seat"
+mkdir -p "$old_seat_home"
+echo "cookie" >"$old_seat_home/cookie"
+run_headless --share "$test_dir/out" /usr/bin/bash -c 'cat "$HOME/cookie" >"$1/cookie"' _ "$test_dir/out" ||
+  fail "an app runs with a home made at the old place" "$(cat "$seat/apps.log" 2>/dev/null)"
+[[ $(cat "$test_dir/out/cookie" 2>/dev/null) == "cookie" ]] || fail "the app sees the home made at the old place" "$(cat "$seat/apps.log" 2>/dev/null)"
+[[ -f $seat_home/cookie && ! -e $old_seat_home ]] || fail "a home made at the old place moves to Omarchy's state" "$(ls -laR "$home/.local" 2>&1)"
+pass "a home made under ~/.local/share/omarchy moves once to ~/.local/state/omarchy"
+
+# An upgrade to Omarchy 4 turns ~/.local/share/omarchy into a link to the
+# read-only /usr/share/omarchy. Launches still work, and a home found behind
+# that link is not the user's to move.
+rm -rf "$home/.local/share/omarchy" "$test_dir/out/upgraded"
+mkdir -p "$test_dir/system-omarchy"
+chmod a-w "$test_dir/system-omarchy"
+ln -s "$test_dir/system-omarchy" "$home/.local/share/omarchy"
+output=$("${on_seat[@]}" omarchy-agent-seat-run --no-wait --share "$test_dir/out" /usr/bin/bash -c 'echo "upgraded" >"$1/upgraded"' _ "$test_dir/out" 2>&1) ||
+  fail "a launch works with ~/.local/share/omarchy linked to a read-only tree" "$output"
+for _ in {1..100}; do [[ -s $test_dir/out/upgraded ]] && break; sleep 0.05; done
+[[ $(cat "$test_dir/out/upgraded" 2>/dev/null) == "upgraded" ]] ||
+  fail "an app runs with ~/.local/share/omarchy linked to a read-only tree" "$output $(cat "$seat/apps.log" 2>/dev/null)"
+chmod u+w "$test_dir/system-omarchy"
+mkdir -p "$test_dir/system-omarchy/agent-seat/home"
+chmod -R a-w "$test_dir/system-omarchy"
+rm -rf "$home/.local/state/omarchy/agent-seat"
+run_headless /usr/bin/true || fail "a launch works beside a home behind the upgrade's link" "$(cat "$seat/apps.log" 2>/dev/null)"
+[[ -d $test_dir/system-omarchy/agent-seat/home && -d $seat_home ]] || fail "a home behind the upgrade's link stays where it is" "$(ls -laR "$home/.local" 2>&1)"
+chmod -R u+w "$test_dir/system-omarchy"
+pass "a launch works with ~/.local/share/omarchy linked to a read-only tree, and leaves what is behind the link"
+
+# A home that cannot be made fails the launch at once, with the reason.
+mv "$home/.local/state" "$home/.local/state.real"
+mkdir -p "$test_dir/readonly-state"
+chmod a-w "$test_dir/readonly-state"
+ln -s "$test_dir/readonly-state" "$home/.local/state"
+output=$("${on_seat[@]}" omarchy-agent-seat-run --no-wait /usr/bin/true 2>&1) && fail "a launch whose home cannot be made fails" "$output"
+[[ $output == "Could not create the agent seat's home at $seat_home: "*"Permission denied" ]] ||
+  fail "a launch whose home cannot be made says why" "$output"
+rm "$home/.local/state"
+mv "$home/.local/state.real" "$home/.local/state"
+chmod u+w "$test_dir/readonly-state"
+pass "a launch whose home cannot be made fails at once and says why"
 
 # A launch that waits for its window keeps other launches from diffing the
 # window list until it has one, without holding up stop.

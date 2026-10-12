@@ -204,8 +204,26 @@ if [[ -n $executable && $executable != /usr/* ]]; then
 fi
 
 runtime="$XDG_RUNTIME_DIR/omarchy/agent-seat"
-agent_home="$HOME/.local/share/omarchy/agent-seat/home"
+# The seat's home is Omarchy state, kept beside the agent accounts. It never
+# lives under ~/.local/share/omarchy: an upgrade to Omarchy 4 turns that into a
+# link to the read-only /usr/share/omarchy, or to a shim it later removes.
+agent_home="$HOME/.local/state/omarchy/agent-seat/home"
+old_agent_home="$HOME/.local/share/omarchy/agent-seat/home"
 sandbox_supervisor=$(realpath -e "$OMARCHY_PATH/bin/omarchy-agent-seat-sandbox")
+
+# A home made before it moved comes along once, but only from a real directory:
+# behind a link to the upgrade's tree it is not the user's to move.
+if [[ ! -e $agent_home && ! -L $HOME/.local/share/omarchy && ! -L ${old_agent_home%/*} && -d $old_agent_home && ! -L $old_agent_home ]]; then
+  if ! error=$(mkdir -p -- "${agent_home%/*}" 2>&1 && mv -T -- "$old_agent_home" "$agent_home" 2>&1); then
+    echo "Could not move the agent seat's home from $old_agent_home to $agent_home: ${error#*: }" >&2
+    exit 1
+  fi
+  rmdir -- "${old_agent_home%/*}" 2>/dev/null
+fi
+if ! error=$(mkdir -p -- "$agent_home" 2>&1); then
+  echo "Could not create the agent seat's home at $agent_home: ${error#*: }" >&2
+  exit 1
+fi
 
 # Each seat window with the pid of the app that opened it, as the broker sees
 # it: the host pid of the process inside the sandbox.
@@ -277,7 +295,6 @@ if [[ $gpu == "true" ]]; then
   display=$(jq -r '.socket' <<<"$grant")
 fi
 
-mkdir -p "$agent_home"
 before=$(windows)
 
 sandbox=(
