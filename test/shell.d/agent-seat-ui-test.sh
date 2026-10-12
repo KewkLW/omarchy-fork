@@ -257,11 +257,13 @@ Gtk.main()
   [[ $(seat omarchy-agent-seat-state "$window" --json | jq -r '.[0].focus.owner') == "agent" ]] || fail "state reports that the agent acted last"
   pass "state reports whose input the window saw last"
 
-  seat omarchy-agent-seat-click-ui "$window" "fill l" >/dev/null || fail "click-ui falls back to a unique substring"
+  partial=$(seat omarchy-agent-seat-click-ui "$window" "fill l" 2>&1) && fail "click-ui refuses a name that is only part of a control's"
+  grep -q 'button "Fill later"' <<<"$partial" || fail "a partial name lists the control it is part of" "$partial"
+  seat omarchy-agent-seat-click-ui "$window" "fill later" >/dev/null || fail "click-ui clicks a full name in any case"
   candidates=$(seat omarchy-agent-seat-click-ui "$window" "button:" 2>&1) && fail "click-ui refuses an ambiguous name"
   grep -q 'button "Fill later"' <<<"$candidates" || fail "an ambiguous name lists the candidates" "$candidates"
   seat omarchy-agent-seat-click-ui "$window" "Nothing here" 2>/dev/null && fail "click-ui refuses a name that matches nothing"
-  pass "click-ui matches exact, then by substring, and lists ambiguous candidates"
+  pass "click-ui matches exact, then in any case, and lists partial and ambiguous candidates"
 
   # Menus that open outside the window, below and above it, where the screenshot
   # then starts.
@@ -640,6 +642,18 @@ place '[{"id": "1", "title": "Fake page", "visible": true, "window": [800, 600],
 [[ $clicked == "Not clicking Send in window 3: DevTools is docked below the page"* && ! -e $test_dir/placed/pointer.args ]] || fail "click-ui refuses to click a page above docked DevTools" "$clicked"
 pass "click-ui refuses to click a page above docked DevTools"
 
+# click-ui acts only on a control's full name, in any case: one that merely
+# contains the query is listed for the caller to name in full.
+echo '[{"id": "1", "title": "Fake page", "visible": true, "window": [800, 600], "inner": [800, 500]}]' >"$test_dir/pages.json"
+rm -f "$test_dir/placed/pointer.args"
+partial=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-click-ui 3 Sen 2>&1)
+(( $? == 1 )) && [[ ! -e $test_dir/placed/pointer.args ]] && grep -q "^No control is named 'Sen' in window 3" <<<"$partial" && grep -q '^  button "Send" @' <<<"$partial" || fail "click-ui refuses a partial name and lists the control it is part of" "$partial"
+found=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-ui 3 --find Sen 2>&1)
+[[ $found == 'button "Send" @'* ]] || fail "ui --find still reads a control by part of its name" "$found"
+clicked=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-click-ui 3 sEND 2>&1)
+[[ $clicked == "Clicked button \"Send\" at 90,210" && $(<"$test_dir/placed/pointer.args") == "3 click 90 210" ]] || fail "click-ui clicks a full name in any case" "$clicked"
+pass "click-ui clicks only a full name, in any case, and lists a partial one as a candidate"
+
 # click-ui hands --page to ui and the rest to the pointer.
 mkdir -p "$test_dir/stubs"
 cat >"$test_dir/stubs/omarchy-agent-seat-ui" <<EOF
@@ -653,7 +667,7 @@ echo "\$*" >"$test_dir/stubs/pointer.args"
 EOF
 chmod +x "$test_dir/stubs/omarchy-agent-seat-ui" "$test_dir/stubs/omarchy-agent-seat-pointer"
 clicked=$(PATH="$test_dir/stubs:$ROOT/bin:$PATH" omarchy-agent-seat-click-ui 3 Send --page 2 --double 2>&1) || fail "click-ui runs with --page" "$clicked"
-[[ $(<"$test_dir/stubs/ui.args") == "3 --find Send --json --page 2" ]] || fail "click-ui hands --page to ui" "$(<"$test_dir/stubs/ui.args")"
+[[ $(<"$test_dir/stubs/ui.args") == "3 --find Send --exact --json --page 2" ]] || fail "click-ui hands --page to ui" "$(<"$test_dir/stubs/ui.args")"
 [[ $(<"$test_dir/stubs/pointer.args") == "3 click 1 2 --double" ]] || fail "click-ui keeps --page from the pointer" "$(<"$test_dir/stubs/pointer.args")"
 pass "click-ui hands --page to ui and the other options to the pointer"
 

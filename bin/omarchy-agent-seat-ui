@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 # omarchy:summary=Read the controls of an agent seat window by name, role and position
-# omarchy:args=<window> [--json] [--find <name> | --find <role>:<name>] [--page <selector>]
+# omarchy:args=<window> [--json] [--find <name> | --find <role>:<name>] [--exact] [--page <selector>]
 # omarchy:examples=omarchy agent seat ui 1 | omarchy agent seat ui 1 --find button:Save --json | omarchy agent seat ui 1 --page 2
 
 # Lists what an app on the agent seat shows, from its accessibility tree rather
@@ -22,7 +22,9 @@
 #
 # --find resolves one control: an exact name, then a case-insensitive one, then
 # a unique substring, optionally narrowed by role ("button:Save"). Several
-# matches list the candidates and exit 1.
+# matches list the candidates and exit 1. --exact, which click-ui passes,
+# leaves out the substring: names that only contain the query are listed as
+# candidates and it exits 1.
 #
 # Exits 2 when the window has no tree to read (Wine, games, canvas apps, or an
 # Electron app without --cdp): take a screenshot instead.
@@ -753,7 +755,7 @@ def cdp_tree(state, port, page=None):
 # Finding one control ---------------------------------------------------------------
 
 
-def find(nodes, query):
+def find(nodes, query, substring=True):
   role = None
   roles = {n["role"].lower() for n in nodes}
   if ":" in query:
@@ -764,7 +766,10 @@ def find(nodes, query):
   candidates = [n for n in nodes if not role or n["role"].lower() == role or n["role"].lower().split()[-1:] == [role]]
   if role and not query:
     return candidates
-  for test in (lambda name: name == query, lambda name: name.lower() == query.lower(), lambda name: query.lower() in name.lower()):
+  tests = [lambda name: name == query, lambda name: name.lower() == query.lower()]
+  if substring:
+    tests.append(lambda name: query.lower() in name.lower())
+  for test in tests:
     found = [n for n in candidates if n["name"] and test(n["name"])]
     # A control nested in one of the same name and place (a menu button's
     # toggle) is one target: click the innermost.
@@ -786,11 +791,13 @@ def main(args):
     atspi_dump(args[1])
     return
 
-  as_json, query, page, positional = False, None, None, []
+  as_json, query, exact, page, positional = False, None, False, None, []
   while args:
     arg = args.pop(0)
     if arg == "--json":
       as_json = True
+    elif arg == "--exact":
+      exact = True
     elif arg == "--find" and args:
       query = args.pop(0)
     elif arg == "--page" and args:
@@ -798,7 +805,7 @@ def main(args):
     else:
       positional.append(arg)
   if len(positional) != 1 or not positional[0].isdigit():
-    fail("Usage: omarchy agent seat ui <window> [--json] [--find <name> | --find <role>:<name>] [--page <selector>]")
+    fail("Usage: omarchy agent seat ui <window> [--json] [--find <name> | --find <role>:<name>] [--exact] [--page <selector>]")
   window = int(positional[0])
 
   state = window_state(window)
@@ -839,7 +846,12 @@ def main(args):
     fail(f"Window {window} has no accessibility tree to read (an app without one, like Wine, a game or a canvas, or Electron without --cdp). Use omarchy agent seat screenshot {window}.", 2)
 
   if query is not None:
-    found = find(nodes, query)
+    found = find(nodes, query, substring=not exact)
+    # A name that only contains the query ("Delete" in "Delete account") is
+    # a guess, never acted on: the caller reruns with the full name.
+    near = [] if found or not exact else find(nodes, query)
+    if near:
+      fail(f"No control is named {query!r} in window {window}; {'this one contains' if len(near) == 1 else 'these contain'} it. Rerun with the full name:\n" + "\n".join("  " + describe(n) for n in near))
     if len(found) != 1:
       fail(f"No control matches {query!r} in window {window}" if not found else f"{len(found)} controls match {query!r} in window {window}:\n" + "\n".join("  " + describe(n) for n in found))
     nodes = found
