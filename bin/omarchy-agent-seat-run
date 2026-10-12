@@ -27,12 +27,19 @@
 # here: sharing is part of the command, so the agent's own permission rules
 # decide it, like any file the agent touches itself. Shares that would undo
 # the sandbox are refused: the root, the user's home or /tmp as a whole, the
-# X11 sockets, $XDG_RUNTIME_DIR and /run/user (Hyprland, D-Bus, the keyring),
-# /proc and /dev, any directory holding one of those, and anything inside
-# ~/.config, ~/.ssh, ~/.gnupg or ~/.local/share/keyrings, or wherever one of
-# those links to. Only a directory or a regular file can be shared, and the
-# sandbox mounts the very one that was checked, by an open descriptor, never a
-# path that could be swapped in the meantime.
+# X11 sockets, $XDG_RUNTIME_DIR, /run/user and /run/dbus (Hyprland, D-Bus, the
+# keyring), /proc and /dev, any directory holding one of those, and what the
+# user or an agent later runs outside the sandbox: anything inside ~/.config,
+# ~/.ssh, ~/.gnupg, ~/.local/share/keyrings, ~/.local/bin, Omarchy's own
+# ~/.local/share and ~/.local/state trees, the mise shims, the user's systemd
+# units and desktop entries, and the agents' own homes (~/.claude, ~/.codex
+# and the like), the shell's startup files and ~/.gitconfig, or wherever one of
+# those links to. A read-write share of a repository keeps its top-level .git
+# read-only, so the app cannot plant hooks or config that git later runs as
+# the user; a nested repository's .git is not covered. Only a directory or a
+# regular file can be shared, and the sandbox mounts the very one that was
+# checked, by an open descriptor, never a path that could be swapped in the
+# meantime.
 
 # Whatever the caller left open would pass on to the app, so every descriptor
 # but stdin, stdout, stderr and bash's own hold on this script (255) is closed
@@ -48,8 +55,21 @@ home=$(realpath -m -- "$HOME")
 runtime_dir=$(realpath -m -- "$XDG_RUNTIME_DIR")
 # Refused when a path is one of these or holds one.
 broad=("$home" /tmp)
-# Refused when a path is one of these, lies inside one, or holds one.
-private=("$home/.config" "$home/.ssh" "$home/.gnupg" "$home/.local/share/keyrings" "$runtime_dir" /run/user /tmp/.X11-unix /proc /dev)
+# Refused when a path is one of these, lies inside one, or holds one: what
+# the session's sockets and the user's secrets (keys, config, the agents'
+# logins) sit in. A program run from one is refused too.
+private=(
+  "$home/.config" "$home/.ssh" "$home/.gnupg" "$home/.local/share/keyrings" "$runtime_dir" /run/user /run/dbus /tmp/.X11-unix /proc /dev
+  "$home/.claude" "$home/.claude.json" "$home/.codex" "$home/.pi" "$home/.grok" "$home/.gemini" "$home/.cursor" "$home/.local/state/omarchy"
+)
+# Shared the same way, but only shared: the user, their session or an agent
+# runs these outside the sandbox, so an app must not write them. Running a
+# program from one hands the app that file alone, read-only.
+run_outside=(
+  "$home/.local/bin" "$home/.local/share/applications" "$home/.local/share/systemd" "$home/.local/share/mise" "$home/.local/share/omarchy"
+  "$home/.profile" "$home/.bashrc" "$home/.bash_profile" "$home/.bash_login" "$home/.bash_logout" "$home/.bash_aliases"
+  "$home/.zshenv" "$home/.zprofile" "$home/.zshrc" "$home/.zlogin" "$home/.zlogout" "$home/.gitconfig"
+)
 
 # Shares are compared resolved, so a root that is a link (~/.ssh pointing into
 # ~/vault, say) is refused at its target as well as at its own path.
@@ -59,11 +79,17 @@ done
 for root in "${private[@]}"; do
   private+=("$(realpath -m -- "$root")")
 done
+for root in "${run_outside[@]}"; do
+  run_outside+=("$(realpath -m -- "$root")")
+done
 
-# Prints what a resolved path would expose to an agent app, if anything.
+# Prints what a resolved path would expose to an agent app, if anything; with
+# "share", what sharing it would, which includes what runs outside the sandbox.
 exposes() {
   local path=$1 root
+  local -a roots=("${private[@]}")
 
+  [[ ${2:-} == "share" ]] && roots+=("${run_outside[@]}")
   if [[ $path == "/" ]]; then
     echo "/"
     return 0
@@ -74,7 +100,7 @@ exposes() {
       return 0
     fi
   done
-  for root in "${private[@]}"; do
+  for root in "${roots[@]}"; do
     if [[ $path == "$root" || $path == "$root"/* || $root == "$path"/* ]]; then
       echo "$root"
       return 0
@@ -144,7 +170,7 @@ while [[ $1 == --* ]]; do
         echo "Nothing to share at ${2:-(no path given)}" >&2
         exit 1
       fi
-      if exposed=$(exposes "$path"); then
+      if exposed=$(exposes "$path" share); then
         echo "Refusing to share $path with an agent app: it would expose $exposed" >&2
         exit 1
       fi
@@ -157,7 +183,20 @@ while [[ $1 == --* ]]; do
         exit 1
       fi
       if [[ $1 == "--share" ]]; then
+        if [[ $path/ == */.git/* ]]; then
+          echo "Refusing to share $path with an agent app read-write: it is a repository's .git, where git finds the hooks it runs" >&2
+          exit 1
+        fi
         shares+=(--bind-fd "$pinned_fd" "$path")
+        # Bound over the share, so the app can neither write into it nor
+        # replace it: a mount point cannot be renamed or removed.
+        if [[ -d $path && ( -e $path/.git || -L $path/.git ) ]]; then
+          if [[ -L $path/.git ]] || ! pin "$path/.git"; then
+            echo "Refusing to share $path with an agent app read-write: its .git is a link, or changed once checked" >&2
+            exit 1
+          fi
+          shares+=(--ro-bind-fd "$pinned_fd" "$path/.git")
+        fi
       else
         shares+=(--ro-bind-fd "$pinned_fd" "$path")
       fi

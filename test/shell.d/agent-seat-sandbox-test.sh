@@ -23,6 +23,13 @@ mkdir -p "$test_dir/bin" "$test_dir/out" "$test_dir/scratch" "$runtime" "$home/v
   "$home/.gnupg" "$home/.config/app" "$home/.local/share/keyrings"
 # A private directory kept elsewhere and linked into place.
 ln -s vault/ssh "$home/.ssh"
+# What the user, their session or an agent runs outside the sandbox, with one
+# startup file kept in a dotfiles directory.
+mkdir -p "$home/.local/bin" "$home/.local/share/applications" "$home/.local/share/systemd/user" "$home/.local/share/mise/shims" \
+  "$home/.local/share/omarchy/bin" "$home/.local/state/omarchy/toggles" "$home/.claude/hooks" "$home/.codex" "$home/.pi" \
+  "$home/.grok" "$home/.gemini" "$home/.cursor" "$home/dotfiles"
+touch "$home/.claude.json" "$home/.profile" "$home/.bashrc" "$home/.bash_profile" "$home/.zshenv" "$home/.zshrc" "$home/.gitconfig" "$home/dotfiles/zprofile"
+ln -s dotfiles/zprofile "$home/.zprofile"
 echo "canary" >"$home/canary"
 echo "scratch" >"$test_dir/scratch/file"
 echo "secret" >"$test_dir/secret"
@@ -116,6 +123,18 @@ done
 [[ ! -e $seat ]] || fail "a refused share starts nothing"
 pass "shares of the root, home, /tmp, runtime directories, /proc, /dev and private config are refused"
 
+ran_outside=("$home/.local/bin" "$home/.local/share/applications" "$home/.local/share/systemd/user" "$home/.local/share/mise/shims"
+  "$home/.local/share/omarchy" "$home/.local/state/omarchy/toggles" "$home/.claude" "$home/.claude/hooks" "$home/.claude.json"
+  "$home/.codex" "$home/.pi" "$home/.grok" "$home/.gemini" "$home/.cursor" "$home/.profile" "$home/.bashrc" "$home/.bash_profile"
+  "$home/.zshenv" "$home/.zshrc" "$home/.zprofile" "$home/dotfiles" "$home/dotfiles/zprofile" "$home/.gitconfig")
+[[ -e /run/dbus ]] && ran_outside+=(/run/dbus)
+for path in "${ran_outside[@]}"; do
+  refused --share "$path" || fail "sharing $path is refused"
+  refused --share-ro "$path" || fail "sharing $path read-only is refused"
+done
+[[ ! -e $seat ]] || fail "a refused share starts nothing"
+pass "shares of startup files, ~/.local/bin, desktop entries, Omarchy's trees, the agents' homes and the system bus are refused"
+
 for path in "$home/.ssh" "$home/.ssh/" "$home/vault/ssh" "$home/vault"; do
   refused --share "$path" || fail "a linked private directory is refused: $path"
   refused --share-ro "$path" || fail "a linked private directory is refused read-only: $path"
@@ -127,6 +146,12 @@ chmod +x "$home/.config/app/tool"
 output=$("${on_seat[@]}" PATH="$test_dir/no-broker:$ROOT/bin:$PATH" omarchy-agent-seat-run "$home/.config/app/tool" 2>&1) && fail "a program inside ~/.config is refused"
 [[ $output == "Refusing "* ]] || fail "a program inside ~/.config is refused" "$output"
 pass "a program inside ~/.config is refused"
+
+printf '#!/bin/bash\n' >"$home/.claude/hooks/tool"
+chmod +x "$home/.claude/hooks/tool"
+output=$("${on_seat[@]}" PATH="$test_dir/no-broker:$ROOT/bin:$PATH" omarchy-agent-seat-run "$home/.claude/hooks/tool" 2>&1) && fail "a program inside an agent's home is refused"
+[[ $output == "Refusing "* ]] || fail "a program inside an agent's home is refused" "$output"
+pass "a program inside an agent's home is refused"
 
 output=$("${on_seat[@]}" omarchy-agent-seat-windows 2>/dev/null) && fail "windows fails while no broker runs" "$output"
 [[ -z $output ]] || fail "windows prints nothing while no broker runs" "$output"
@@ -194,6 +219,14 @@ pass "the sandbox sees no home, X11, Hyprland, D-Bus or keyring, and only the br
 
 [[ $result != *"probe directory visible"* ]] || fail "a program outside /usr gets only its own file" "$result"
 pass "a program outside /usr gets only its own file, not its directory"
+
+# ~/.local/bin cannot be shared, but a program in it still runs.
+printf '#!/bin/bash\necho "ran" >"$1/local-bin"\n' >"$home/.local/bin/tool"
+chmod +x "$home/.local/bin/tool"
+run_headless --share "$test_dir/out" "$home/.local/bin/tool" "$test_dir/out" ||
+  fail "a program in ~/.local/bin runs on the seat" "$(cat "$seat/apps.log" 2>/dev/null)"
+[[ $(cat "$test_dir/out/local-bin" 2>/dev/null) == "ran" ]] || fail "a program in ~/.local/bin runs on the seat" "$(cat "$seat/apps.log" 2>/dev/null)"
+pass "a program in ~/.local/bin runs on the seat, though the directory cannot be shared"
 
 grep -qx "scratch: scratch" <<<"$result" || fail "a read-only share is readable" "$result"
 [[ $result != *"scratch writable"* && ! -e $test_dir/scratch/new ]] || fail "a read-only share is not writable" "$result"
@@ -282,6 +315,31 @@ run_headless --share "$test_dir/draft" /usr/bin/bash -c '
   fail "an app with a shared file runs" "$(cat "$seat/apps.log" 2>/dev/null)"
 [[ $(<"$test_dir/draft") == $'draft\nwritten' ]] || fail "a file shared read-write is written through, alone in its directory" "$(cat "$test_dir/draft")"
 pass "a file shared read-write is written through from the sandbox, and the files beside it stay hidden"
+
+# A repository shared read-write keeps its .git read-only, so the app edits
+# the work tree but plants no hook git would run later; a worktree's .git file
+# cannot be pointed elsewhere either.
+mkdir -p "$test_dir/repo/.git/hooks" "$test_dir/worktree"
+echo "draft" >"$test_dir/repo/file"
+echo "gitdir: $test_dir/repo/.git" >"$test_dir/worktree/.git"
+run_headless --share "$test_dir/repo" --share "$test_dir/worktree" /usr/bin/bash -c '
+  echo "edited" >>"$1/file"
+  echo "planted" >"$1/.git/hooks/pre-commit"
+  mv "$1/.git" "$1/moved"
+  rm -rf "$1/.git"
+  mkdir -p "$1/.git/hooks" && echo "planted" >"$1/.git/hooks/post-checkout"
+  echo "gitdir: /tmp/elsewhere" >"$2/.git"
+  mv "$2/.git" "$2/moved"' _ "$test_dir/repo" "$test_dir/worktree" ||
+  fail "an app with a repository shared runs" "$(cat "$seat/apps.log" 2>/dev/null)"
+[[ $(<"$test_dir/repo/file") == $'draft\nedited' ]] || fail "an app edits a repository shared read-write" "$(cat "$test_dir/repo/file")"
+[[ -d $test_dir/repo/.git/hooks && ! -e $test_dir/repo/moved && -z $(ls -A "$test_dir/repo/.git/hooks") ]] ||
+  fail "an app plants nothing in the .git of a repository shared read-write" "$(ls -laR "$test_dir/repo")"
+[[ $(<"$test_dir/worktree/.git") == "gitdir: $test_dir/repo/.git" && ! -e $test_dir/worktree/moved ]] ||
+  fail "an app cannot repoint a worktree's .git file" "$(ls -la "$test_dir/worktree"; cat "$test_dir/worktree/.git")"
+for path in "$test_dir/repo/.git" "$test_dir/repo/.git/hooks"; do
+  refused --share "$path" || fail "sharing $path read-write is refused"
+done
+pass "a repository shared read-write is editable, but its .git stays read-only and cannot be shared read-write"
 
 # The seat's home lives in Omarchy's state. One made under
 # ~/.local/share/omarchy before that moved comes along once.
