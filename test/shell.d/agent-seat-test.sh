@@ -747,7 +747,7 @@ broker = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.
 loader.exec_module(broker)
 
 SEAT, COMPOSITOR, WM, SHM, SUBCOMPOSITOR, DATA = 2, 3, 4, 5, 6, 7
-KEYBOARD, POINTER, DEVICE, SOURCE = 8, 9, 10, 11
+KEYBOARD, POINTER, DEVICE, SOURCE, VIEWPORTER = 8, 9, 10, 11, 12
 ARGB, XRGB = 0, 1
 
 class Seat:
@@ -761,7 +761,7 @@ class Seat:
         self.hyprland = listener.accept()[0]
         self.client.pid = 0
         self.broker.clients.append(self.client)
-        self.client.objects.update({SEAT: ("wl_seat", 7), COMPOSITOR: ("wl_compositor", 6), WM: ("xdg_wm_base", 6), SHM: ("wl_shm", 1), SUBCOMPOSITOR: ("wl_subcompositor", 1), DATA: ("wl_data_device_manager", 3)})
+        self.client.objects.update({SEAT: ("wl_seat", 7), COMPOSITOR: ("wl_compositor", 6), WM: ("xdg_wm_base", 6), SHM: ("wl_shm", 1), SUBCOMPOSITOR: ("wl_subcompositor", 1), DATA: ("wl_data_device_manager", 3), VIEWPORTER: ("wp_viewporter", 1)})
         self.next_pool = 1000
 
     def send(self, kind, object_id, name, *args):
@@ -814,11 +814,12 @@ class Seat:
         self.request(role, "set_position", x, y)
 
     def draw(self, surface, width, height, pixel, format=XRGB, scale=1):
-        """Fill a surface with one 4-byte pixel, as a buffer of width x height at a buffer scale."""
+        """Fill a surface with one 4-byte pixel, or with the pixels of a whole
+        buffer, as a buffer of width x height at a buffer scale."""
         pool, buffer = self.next_pool + 1, self.next_pool + 2
         self.next_pool += 2
         memory = os.memfd_create("pixels")
-        os.write(memory, pixel * width * height)
+        os.write(memory, pixel * width * height if len(pixel) == 4 else pixel)
         self.request(SHM, "create_pool", pool, memory, width * height * 4)
         os.close(memory)
         self.request(pool, "create_buffer", buffer, 0, width, height, width * 4, format)
@@ -834,7 +835,12 @@ class Seat:
         _, width, height, _ = self.client.capture(toplevel)
         return f"{width}x{height}"
 
-RED, GREEN, BLUE = b"\x00\x00\xff\xff", b"\x00\xff\x00\xff", b"\xff\x00\x00\xff"
+    def colours(self, toplevel):
+        """Every colour in the window's screenshot."""
+        canvas, width, height, _ = self.client.capture(toplevel)
+        return sorted({bytes(canvas[i : i + 3][::-1]).hex() for i in range(0, width * height * 4, 4)})
+
+RED, GREEN, BLUE, WHITE = b"\x00\x00\xff\xff", b"\x00\xff\x00\xff", b"\xff\x00\x00\xff", b"\xff\xff\xff\xff"
 
 def check(problems, what, got, want):
     if got != want:
@@ -910,6 +916,21 @@ def scales(seat, problems):
     check(problems, "a scale 1 window's screenshot", seat.size(32), "40x30")
     check(problems, "a scale 2 popup over a scale 1 window", [seat.pixel(32, x, y) for x, y in ((10, 10), (29, 19), (30, 20), (35, 25))], ["0000ff", "0000ff", "ff0000", "ff0000"])
 
+def viewport(seat, problems):
+    # A 20x20 white window under a subsurface whose 40x30 buffer is four
+    # quadrants, red top left, and whose viewport shows the 10x10 top left
+    # corner stretched to 20x20.
+    seat.window(20, 21, 22)
+    seat.draw(20, 20, 20, WHITE)
+    seat.subsurface(23, 20, 0, 0)
+    quadrants = b"".join((RED if x < 20 else GREEN) if y < 15 else (BLUE if x < 20 else WHITE) for y in range(30) for x in range(40))
+    seat.request(VIEWPORTER, "get_viewport", 24, 23)
+    seat.request(24, "set_source", 0, 0, 10, 10)
+    seat.request(24, "set_destination", 20, 20)
+    seat.draw(23, 40, 30, quadrants)
+    check(problems, "a window with a cropped subsurface over it", seat.size(22), "20x20")
+    check(problems, "the colours of a viewport's 10x10 red source stretched to 20x20", seat.colours(22), ["ff0000"])
+
 problems = []
 globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
 print("; ".join(problems) or "ok")
@@ -935,6 +956,10 @@ pass "a screenshot blends a translucent layer over what is under it"
 result=$(inproc scales)
 [[ $result == "ok" ]] || fail "a screenshot draws a popup of another scale at the window's scale" "$result"
 pass "a screenshot draws a popup of another scale at the window's scale"
+
+result=$(inproc viewport)
+[[ $result == "ok" ]] || fail "a screenshot draws only the part of a buffer a viewport shows" "$result"
+pass "a screenshot draws only the part of a buffer a viewport shows"
 
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 

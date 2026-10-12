@@ -683,7 +683,7 @@ class Client:
     return True
 
   def request_wl_compositor_create_surface(self, _, args):
-    self.surfaces[args[0]] = {"buffer": None, "pending": None, "scale": 1, "viewport": None, "input": None, "children": [], "parent": None, "position": (0, 0)}
+    self.surfaces[args[0]] = {"buffer": None, "pending": None, "scale": 1, "viewport": None, "source": None, "input": None, "children": [], "parent": None, "position": (0, 0)}
     return True
 
   def request_wl_compositor_create_region(self, _, args):
@@ -759,6 +759,13 @@ class Client:
     self.surfaces[self.roles[viewport]]["viewport"] = tuple(args) if args[0] > 0 else None
     return True
 
+  # The part of the buffer the surface shows, in surface coordinates before
+  # the destination scales it: x, y, width and height, all -1 when unset.
+
+  def request_wp_viewport_set_source(self, viewport, args):
+    self.surfaces[self.roles[viewport]]["source"] = tuple(args) if args[2] > 0 and args[3] > 0 else None
+    return True
+
   def request_wl_subcompositor_get_subsurface(self, _, args):
     self.roles[args[0]] = args[1]
     self.surfaces[args[2]]["children"].append(args[1])
@@ -782,6 +789,7 @@ class Client:
   def request_wp_viewport_destroy(self, viewport, _):
     if self.roles.get(viewport) in self.surfaces:
       self.surfaces[self.roles[viewport]]["viewport"] = None
+      self.surfaces[self.roles[viewport]]["source"] = None
     return True
 
   def unparent(self, surface):
@@ -987,6 +995,8 @@ class Client:
     state = self.surfaces[surface]
     if state["viewport"]:
       return state["viewport"]
+    if state["source"]:
+      return state["source"][2:]
     if state["buffer"]:
       return state["buffer"][0] / state["scale"], state["buffer"][1] / state["scale"]
     return 0, 0
@@ -998,10 +1008,22 @@ class Client:
         return xdg["geometry"]
     return (0, 0, *self.size(surface))
 
+  def crop(self, surface):
+    """The part of its buffer a surface shows, in buffer pixels: left, top,
+    right and bottom, and buffer pixels per surface unit across and down."""
+    state = self.surfaces[surface]
+    buffer_width, buffer_height = state["buffer"][:2]
+    width, height = self.size(surface)
+    if state["source"]:
+      x, y, w, h = (value * state["scale"] for value in state["source"])
+    else:
+      x, y, w, h = 0, 0, buffer_width, buffer_height
+    right, bottom = min(x + w, buffer_width), min(y + h, buffer_height)
+    return x, y, right, bottom, w / (width or 1), h / (height or 1)
+
   def scale(self, toplevel):
     surface = self.xdg_surfaces[self.toplevels[toplevel]["xdg"]]["surface"]
-    width = self.size(surface)[0]
-    return self.surfaces[surface]["buffer"][0] / width if width and self.surfaces[surface]["buffer"] else 1
+    return self.crop(surface)[4] if self.size(surface)[0] and self.surfaces[surface]["buffer"] else 1
 
   def capture(self, toplevel):
     """Compose the window, its subsurfaces and its popups from their shared memory buffers."""
@@ -1016,7 +1038,7 @@ class Client:
         gx, gy, gw, gh = self.geometry(surface)
         x0, y0, x1, y1 = max(gx, 0), max(gy, 0), min(gx + gw, sw), min(gy + gh, sh)
         if x1 > x0 and y1 > y0:
-          layers.append((buffer, buffer[0] / (sw or 1), x + x0, y + y0, x0, y0, x1 - x0, y1 - y0))
+          layers.append((buffer, self.crop(surface), x + x0, y + y0, x0, y0, x1 - x0, y1 - y0))
     if not layers:
       raise ValueError("the window has not drawn anything yet")
 
@@ -1027,19 +1049,19 @@ class Client:
       raise ValueError(f"the window is {width}x{height} pixels, more than a screenshot can hold")
     canvas = bytearray(width * height * 4)
 
-    for (buffer_width, buffer_height, (pool, offset, stride, format)), buffer_scale, x, y, gx, gy, gw, gh in layers:
+    for (_, _, (pool, offset, stride, format)), (cx, cy, right, bottom, rx, ry), x, y, gx, gy, gw, gh in layers:
       if format not in (0, 1):  # ARGB8888 and XRGB8888, what apps draw with
         continue
-      sx, sy = round(gx * buffer_scale), round(gy * buffer_scale)
+      sx, sy = cx + gx * rx, cy + gy * ry
       dx, dy = round((x - left) * scale), round((y - top) * scale)
       if dx < 0 or dy < 0:
         continue
       # Each screenshot pixel the layer covers comes from the nearest pixel of
-      # its own buffer, which can have another scale than the window's: a
-      # scale 1 popup over a scale 2 window is drawn twice as large.
-      ratio = buffer_scale / scale
-      columns = [column for column in (sx + int((i + 0.5) * ratio) for i in range(min(round(gw * scale), width - dx))) if column < buffer_width]
-      rows = [row for row in (sy + int((i + 0.5) * ratio) for i in range(min(round(gh * scale), height - dy))) if row < buffer_height]
+      # the part of its buffer it shows, which can have another scale than the
+      # window's: a scale 1 popup over a scale 2 window is drawn twice as
+      # large, and a viewport stretches its source over its destination.
+      columns = [column for column in (int(sx + (i + 0.5) * rx / scale) for i in range(min(round(gw * scale), width - dx))) if column < right]
+      rows = [row for row in (int(sy + (i + 0.5) * ry / scale) for i in range(min(round(gh * scale), height - dy))) if row < bottom]
       if not columns or not rows:
         continue
       first, span = columns[0], columns[-1] + 1 - columns[0]
