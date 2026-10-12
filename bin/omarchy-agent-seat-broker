@@ -633,9 +633,18 @@ class Client:
   def user_owns(self, serial):
     return self.last_actor == "user" and serial in self.clipboard_serials
 
+  # Focus arriving is not the user acting: with focus following the mouse, the
+  # pointer passing over an agent window, or the seat being shown, enters it.
+  # Its serial may move the cursor or start a grab, but only a key or button
+  # the user pressed lets the app at the clipboard.
+
   def user_serial(self, serial):
     self.user_serials.append(serial)
+
+  def user_input(self, serial):
+    self.user_serials.append(serial)
     self.clipboard_serials.append(serial)
+    self.last_actor = "user"
 
   def agent_acts(self):
     """The agent takes the app over: the user's earlier input no longer sets the clipboard."""
@@ -973,7 +982,6 @@ class Client:
   def event_wl_keyboard_enter(self, keyboard, args):
     self.user_serial(args[0])
     self.user_keyboard = args[1]
-    self.last_actor = "user"
     self.focus_keyboard(keyboard, args[1], args[0])
     return False
 
@@ -986,8 +994,19 @@ class Client:
     return True
 
   def event_wl_keyboard_key(self, keyboard, args):
+    self.user_input(args[0])
+    return self.user_keyboard_event(keyboard)
+
+  # Hyprland sends the modifiers with every enter, so they are no sign of the
+  # user acting either.
+
+  def event_wl_keyboard_modifiers(self, keyboard, args):
     self.user_serial(args[0])
-    self.last_actor = "user"
+    self.user_modifiers = tuple(args[1:5])
+    return self.user_keyboard_event(keyboard)
+
+  def user_keyboard_event(self, keyboard):
+    """Pass on an event of the user's keyboard, back in the surface it is in."""
     if self.user_keyboard:
       self.focus_keyboard(keyboard, self.user_keyboard)
     if self.keyboards.get(keyboard) is None:
@@ -999,10 +1018,6 @@ class Client:
       self.agent_modifiers.discard(keyboard)
       self.send_event(keyboard, "modifiers", self.broker.next_serial(), *self.user_modifiers)
     return True
-
-  def event_wl_keyboard_modifiers(self, keyboard, args):
-    self.user_modifiers = tuple(args[1:5])
-    return self.event_wl_keyboard_key(keyboard, args)
 
   def set_modifiers(self, keyboard, depressed):
     """Give a keyboard the agent's modifiers; the user's come back with their next key."""
@@ -1029,8 +1044,7 @@ class Client:
     return True
 
   def event_wl_pointer_button(self, _, args):
-    self.user_serial(args[0])
-    self.last_actor = "user"
+    self.user_input(args[0])
     return True
 
   def focus_keyboard(self, keyboard, surface, serial=None):

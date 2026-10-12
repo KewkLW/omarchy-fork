@@ -891,6 +891,37 @@ def clipboard(seat, problems):
     seat.request(DEVICE, "set_selection", SOURCE, 902)
     check(problems, "the user's next keypress sets the clipboard again", forwarded(seat, "set_selection"), [[SOURCE, 902]])
 
+def focus_only(seat, problems):
+    # The user's keyboard and pointer enter the app, as when focus follows the
+    # mouse across it, and Hyprland sends the modifiers that come with an
+    # enter; then the user presses a key.
+    offer = 0xFF000001
+    seat.request(SEAT, "get_keyboard", KEYBOARD)
+    seat.request(SEAT, "get_pointer", POINTER)
+    seat.request(DATA, "get_data_device", DEVICE, SEAT)
+    seat.request(DATA, "create_data_source", SOURCE)
+    seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, RED)
+    seat.event(DEVICE, "data_offer", offer)
+    read, write = os.pipe()
+
+    def attempt(serial):
+        seat.queued("requests")
+        seat.request(DEVICE, "set_selection", SOURCE, serial)
+        seat.request(offer, "receive", "text/plain", write)
+        return forwarded(seat, "set_selection", "receive")
+
+    seat.event(KEYBOARD, "enter", 777, 20, b"")
+    seat.event(POINTER, "enter", 778, 20, 5, 5)
+    check(problems, "the clipboard after the keyboard and pointer only entered", attempt(777) + attempt(778), [[], [], [], []])
+    seat.event(KEYBOARD, "modifiers", 779, 0, 0, 0, 0)
+    check(problems, "the clipboard after the modifiers sent with an enter", attempt(779), [[], []])
+    seat.event(KEYBOARD, "key", 780, 0, 30, 1)
+    selection, receive = attempt(780)
+    check(problems, "the clipboard after the user's keypress", (selection, len(receive)), ([[SOURCE, 780]], 1))
+    os.close(read)
+    os.close(write)
+
 def modifiers(seat, problems):
     # The user holds Ctrl and Caps Lock is on, the agent types, and the user
     # presses C without letting go of Ctrl.
@@ -1058,6 +1089,10 @@ inproc() {
 result=$(inproc clipboard)
 [[ $result == "ok" ]] || fail "an app can't set the clipboard with the user's input from before the agent acted" "$result"
 pass "an app can't set the clipboard with the user's input from before the agent acted"
+
+result=$(inproc focus_only)
+[[ $result == "ok" ]] || fail "focus entering an app without a key or click does not open the clipboard to it" "$result"
+pass "focus entering an app without a key or click does not open the clipboard to it"
 
 result=$(inproc modifiers)
 [[ $result == "ok" ]] || fail "a modifier the user holds through the agent's typing still applies to the user's next key" "$result"
