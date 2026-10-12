@@ -577,6 +577,60 @@ for point in sys.argv[2:]:
 print()
 EOF
 
+# One app making as many connections as its sandbox may have, then one more,
+# while another app connects, and making pools over two of its connections
+# that together pass its sandbox's limit. It says what the broker did.
+cat >"$test_dir/crowd.py" <<'EOF'
+import array, importlib.machinery, importlib.util, os, socket, struct, subprocess, sys
+sys.path.insert(0, os.path.dirname(__file__))
+from wire import Connection, message, string, read_string
+
+loader = importlib.machinery.SourceFileLoader("broker", sys.argv[2])
+broker = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(broker)
+
+def connect():
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(sys.argv[1])
+    return Connection(sock)
+
+def served(conn, callback):
+    """Whether the broker answers a round trip rather than hanging up."""
+    try:
+        conn.send(message(1, 0, struct.pack("<I", callback)))
+        while (msg := conn.read()) is not None:
+            if msg[0] == callback:
+                return True
+    except OSError:
+        pass
+    return False
+
+def pools(conn, first, count):
+    conn.send(message(1, 1, struct.pack("<I", 2)))
+    conn.send(message(1, 0, struct.pack("<I", 3)))
+    shm = None
+    while (msg := conn.read())[0] != 3:
+        if msg[0] == 2 and msg[1] == 0 and read_string(msg[2], 4) == "wl_shm":
+            shm = struct.unpack_from("<I", msg[2])[0]
+    conn.send(message(2, 0, struct.pack("<I", shm) + string("wl_shm") + struct.pack("<II", 1, 4)))
+    memory = os.memfd_create("pool")
+    os.ftruncate(memory, 4096)
+    try:
+        for start in range(first, first + count, 25):
+            data = b"".join(message(4, 0, struct.pack("<Ii", pool, 4096)) for pool in range(start, start + 25))
+            conn.sock.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [memory] * 25))])
+    except OSError:
+        return "dropped"
+    return "kept" if served(conn, 5) else "dropped"
+
+connections = [connect() for _ in range(broker.MAX_CLIENTS_PER_SANDBOX)]
+print("served" if all(served(conn, 3) for conn in connections) else "not served")
+print("refused" if not served(connect(), 3) else "served")
+other = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "app.py"), sys.argv[1], "globals"], capture_output=True, text=True, start_new_session=True)
+print("another app served" if "wl_seat" in other.stdout else "another app refused")
+print(pools(connections[0], 100, 200), pools(connections[1], 100, 100))
+EOF
+
 # Starts draw.py with a scene; commands go to fd draw_in, its output comes
 # from fd draw_out.
 start_draw() {
@@ -782,7 +836,7 @@ pass "a broker without protocol descriptions names what is missing, and call sti
 # app sends them, events as Hyprland sends them, and what the broker queued for
 # each side since last asked. Each case prints "ok" or what went wrong.
 cat >"$test_dir/inproc.py" <<'EOF'
-import importlib.machinery, importlib.util, os, socket, struct, sys
+import importlib.machinery, importlib.util, os, socket, struct, sys, time
 
 loader = importlib.machinery.SourceFileLoader("broker", sys.argv[1])
 broker = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
@@ -1141,6 +1195,35 @@ def unmapped(seat, problems):
     check(problems, "a click on a subsurface without a buffer, and on one under it", (seat.client.hit(22, 2, 2), seat.client.hit(22, 6, 6)), ((20, 2, 2), (20, 6, 6)))
     check(problems, "the colours of a window whose subsurface has no buffer", seat.colours(22), ["ff0000"])
 
+def ancestry(seat, problems):
+    # This process recorded as a sandbox's supervisor, as the sandbox
+    # supervisor records itself, and a process under it that starts a
+    # session of its own; then the same record with another start time.
+    import subprocess
+    records = os.path.join(broker.RUNTIME_DIR, "sandboxes")
+    os.makedirs(records, exist_ok=True)
+    start = open(f"/proc/{os.getpid()}/stat").read().rsplit(")", 1)[1].split()[19]
+    child = subprocess.Popen(["setsid", "sh", "-c", "sleep 5 & wait"])
+    try:
+        for _ in range(100):
+            grandchild = subprocess.run(["pgrep", "-P", str(child.pid)], capture_output=True, text=True).stdout.split()
+            if grandchild:
+                break
+            time.sleep(0.02)
+        with open(os.path.join(records, "sandbox.ancestry"), "w") as record:
+            record.write(f"{os.getpid()} {start} ancestry 0 0\n")
+        check(problems, "a process under a sandbox's supervisor, in a session of its own", broker.sandbox_of(int(grandchild[0])), "sandbox ancestry")
+        with open(os.path.join(records, "sandbox.ancestry"), "w") as record:
+            record.write(f"{os.getpid()} {int(start) + 1} ancestry 0 0\n")
+        session = open(f"/proc/{grandchild[0]}/stat").read().rsplit(")", 1)[1].split()[3]
+        check(problems, "a process whose supervisor's pid was reused", broker.sandbox_of(int(grandchild[0])), f"session {session}")
+    finally:
+        os.unlink(os.path.join(records, "sandbox.ancestry"))
+        for pid in grandchild:
+            os.kill(int(pid), 9)
+        child.kill()
+        child.wait()
+
 def limits(seat, problems):
     # A window one pixel wider than a screenshot can hold, one exactly as
     # wide, and a 400x400 buffer shown 10x10 through a viewport, which would
@@ -1221,6 +1304,10 @@ pass "a subsurface's position and stacking change only when its window commits"
 result=$(inproc unmapped)
 [[ $result == "ok" ]] || fail "a subsurface without a buffer, and what is under it, takes no clicks" "$result"
 pass "a subsurface without a buffer, and what is under it, takes no clicks"
+
+result=$(inproc ancestry)
+[[ $result == "ok" ]] || fail "an app is counted against the sandbox whose supervisor it runs under" "$result"
+pass "an app is counted against the sandbox whose supervisor it runs under"
 
 result=$(inproc limits)
 [[ $result == "ok" ]] || fail "a screenshot is at most 4096 pixels a side and 4 pixels per surface unit" "$result"
@@ -1384,6 +1471,13 @@ sleep 0.2
 (( $(descriptors) <= before )) || fail "a malformed request leaves none of its descriptors behind" "$before -> $(descriptors)"
 [[ $(python3 "$test_dir/app.py" "$socket" globals) == *wl_seat* ]] || fail "the broker serves apps after a malformed request"
 pass "a malformed request drops only its app and leaves none of its descriptors behind"
+
+crowd=$(setsid -w python3 "$test_dir/crowd.py" "$socket" "$ROOT/bin/omarchy-agent-seat-broker" 2>&1)
+[[ $crowd == $'served\nrefused\n'* ]] || fail "an app gets no more connections than its sandbox may have" "$crowd"
+grep -q "refusing a connection from pid [0-9]*: session [0-9]* already has" "$test_dir/broker.log" || fail "a refused connection is logged" "$(tail -3 "$test_dir/broker.log")"
+[[ $crowd == *$'\nanother app served\n'* ]] || fail "another app still connects while one has all its sandbox may have" "$crowd"
+[[ $crowd == *$'\nkept dropped' ]] || fail "an app's pools are counted over all its connections" "$crowd"
+pass "an app's connections and pools are capped for its whole sandbox, not each connection"
 
 python3 "$test_dir/app.py" "$socket" syncflood >"$test_dir/flood.out" &
 flood_pid=$!
