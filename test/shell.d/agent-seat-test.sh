@@ -1050,6 +1050,29 @@ def user_click(seat, problems):
     seat.queued("events")
     check(problems, "the user's click after moving", click(903), [("button", [903, 0, 0x110, 1]), ("frame", [])])
 
+def drag_grab(seat, problems):
+    # A red 40x30 window with a green 10x10 subsurface at 20,10; the agent
+    # drags from 5,5 on the window to 25,15 in the subsurface, then moves on.
+    seat.request(SEAT, "get_pointer", POINTER)
+    window = seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, RED)
+    seat.subsurface(23, 20, 20, 10)
+    seat.draw(23, 10, 10, GREEN)
+    seat.request(20, "commit")
+    seat.queued("events")
+
+    def pointer_events():
+        found = []
+        for object_id, name, args in seat.queued("events"):
+            if object_id == POINTER and name != "frame":
+                found.append((name, args[3:] if name == "button" else args[1:]))
+        return found
+
+    seat.broker.do_drag(window, 5, 5, 25, 15, steps=2)
+    check(problems, "a drag from the window into its subsurface", pointer_events(), [("enter", [20, 5, 5]), ("button", [1]), ("motion", [15, 10]), ("motion", [25, 15]), ("button", [0])])
+    seat.broker.do_move(window, 26, 16)
+    check(problems, "a move after the drag's release", pointer_events(), [("leave", [20]), ("enter", [23, 6, 6])])
+
 def translucent(seat, problems):
     # A red window under a green subsurface at half opacity, premultiplied.
     seat.window(20, 21, 22)
@@ -1305,6 +1328,21 @@ def uncommitted(seat, problems):
     check(problems, "a screenshot once green is committed", seat.colours(22), ["00ff00"])
     os.close(memory)
 
+def window_geometry(seat, problems):
+    # A red 40x30 window, green in its top left 10x10, whose window geometry
+    # is 20x10 at 5,5; then set to 30x20 at 10,10 for a frame not committed
+    # yet, then committed, then another commit that does not set it.
+    corner = b"".join(GREEN if x < 10 and y < 10 else RED for y in range(30) for x in range(40))
+    seat.window(20, 21, 22)
+    seat.request(21, "set_window_geometry", 5, 5, 20, 10)
+    seat.draw(20, 40, 30, corner)
+    seat.request(21, "set_window_geometry", 10, 10, 30, 20)
+    check(problems, "a window geometry set but not committed", (seat.size(22), seat.pixel(22, 0, 0), seat.client.hit(22, 0, 0)), ("20x10", "00ff00", (20, 5, 5)))
+    seat.request(20, "commit")
+    check(problems, "a window geometry once committed", (seat.size(22), seat.pixel(22, 0, 0), seat.client.hit(22, 0, 0)), ("30x20", "ff0000", (20, 10, 10)))
+    seat.request(20, "commit")
+    check(problems, "a window geometry after a commit that does not set it", seat.size(22), "30x20")
+
 def limits(seat, problems):
     # A window one pixel wider than a screenshot can hold, one exactly as
     # wide, and a 400x400 buffer shown 10x10 through a viewport, which would
@@ -1349,6 +1387,10 @@ pass "a modifier the user holds through the agent's typing still applies to the 
 result=$(inproc user_click)
 [[ $result == "ok" ]] || fail "the user's click lands under the user's pointer after the agent pointed elsewhere in the surface" "$result"
 pass "the user's click lands under the user's pointer after the agent pointed elsewhere in the surface"
+
+result=$(inproc drag_grab)
+[[ $result == "ok" ]] || fail "the agent's drag keeps the pointer on the surface it pressed until the release" "$result"
+pass "the agent's drag keeps the pointer on the surface it pressed until the release"
 
 result=$(inproc translucent)
 [[ $result == "ok" ]] || fail "a screenshot blends a translucent layer over what is under it" "$result"
@@ -1401,6 +1443,10 @@ pass "an app is counted against the sandbox whose supervisor it runs under"
 result=$(inproc uncommitted)
 [[ $result == "ok" ]] || fail "a screenshot soon after another shows what the app committed, not what it drew since" "$result"
 pass "a screenshot soon after another shows what the app committed, not what it drew since"
+
+result=$(inproc window_geometry)
+[[ $result == "ok" ]] || fail "a window geometry changes screenshots and clicks only when the app commits it" "$result"
+pass "a window geometry changes screenshots and clicks only when the app commits it"
 
 result=$(inproc limits)
 [[ $result == "ok" ]] || fail "a screenshot is at most 4096 pixels a side and 4 pixels per surface unit" "$result"
@@ -1477,11 +1523,12 @@ pass "the agent scrolls"
 pointer move 30 10 2>/dev/null && fail "the agent pointer can't point outside a surface's input region"
 pass "the agent pointer can't point outside a surface's input region"
 
-# The eighth of twelve steps leaves the window's input region.
-pointer drag 2 2 30 10 2>/dev/null && fail "a drag that leaves the input region fails"
-events=$(pointer_events 10)
-[[ $events == *"button 272 1;frame;"*";button 272 0;frame" ]] || fail "a drag that leaves the input region still releases the button" "$events"
-pass "a drag that leaves the input region still releases the button"
+# The fifth of twelve steps crosses the subsurface and the eighth leaves the
+# window's input region; the window that took the press still gets them all.
+pointer drag 2 2 30 10 || fail "a drag past the input region of the surface it pressed succeeds"
+events=$(pointer_events 15)
+[[ $events == "motion 2 2;frame;button 272 1;frame;"*";motion 30 10;frame;button 272 0;frame" && $events != *enter* && $events != *leave* ]] || fail "a drag stays on the surface it pressed, past its input region and over its subsurface" "$events"
+pass "a drag stays on the surface it pressed, past its input region and over its subsurface"
 
 draw_command geometry
 shot=$(run_broker omarchy-agent-seat-screenshot "$window") || fail "a window declaring a huge geometry still gets a screenshot"

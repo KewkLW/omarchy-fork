@@ -542,7 +542,7 @@ def serve(conn):
                 # Its viewport, and the browser window around it; a DevTools
                 # docked in a window spans the page's part of it too.
                 inner, outer = page.get("inner", [800, 600]), page.get("outer") or page["window"]
-                values = [*inner, float(sys.argv[1])] + ([*outer, "visible" if page["visible"] else "hidden"] if "outerWidth" in params["expression"] else [])
+                values = [*inner, page.get("ratio", float(sys.argv[1]))] +([*outer, "visible" if page["visible"] else "hidden"] if "outerWidth" in params["expression"] else [])
                 result = {"result": {"type": "string", "value": json.dumps(values)}}
             elif method == "Browser.getWindowForTarget":
                 window = next(page["window"] for page in PAGES if page["id"] == params["targetId"])
@@ -734,12 +734,12 @@ pass "--page 1 reads the only page shown"
 # unverified and click-ui refuses to click there. An undocked DevTools, or a
 # frame of it the size of the page, changes nothing.
 cat >"$test_dir/placed.py" <<EOF
-import importlib.machinery, importlib.util, json, sys
+import importlib.machinery, importlib.util, json, os, sys
 loader = importlib.machinery.SourceFileLoader("seat_ui", "$ROOT/bin/omarchy-agent-seat-ui")
 spec = importlib.util.spec_from_loader("seat_ui", loader)
 ui = importlib.util.module_from_spec(spec)
 loader.exec_module(ui)
-ui.window_state = lambda window: {"window": window, "title": "Fake page - Chromium", "pid": 1, "drawn": True, "geometry": [0, 0, 800, 600], "origin": [0, 0, 1.5], "scale": 1.5}
+ui.window_state = lambda window: {"window": window, "title": "Fake page - Chromium", "pid": 1, "drawn": True, "geometry": [0, 0, 800, 600], "origin": [0, 0, 1.5], "scale": 1.5, **json.loads(os.environ.get("PLACED_STATE", "{}"))}
 ui.sandbox_of = lambda pid: "$test_dir/placed"
 ui.main(sys.argv[1:])
 EOF
@@ -771,6 +771,17 @@ docked='{"id": "8", "title": "DevTools", "url": "devtools://devtools/bundled/dev
 place '[{"id": "1", "title": "Fake page", "visible": true, "window": [800, 600], "inner": [800, 350]}, '"$docked"']'
 [[ $clicked == "Not clicking Send in window 3: DevTools is docked below the page"* && ! -e $test_dir/placed/pointer.args ]] || fail "click-ui refuses to click a page above docked DevTools" "$clicked"
 pass "click-ui refuses to click a page above docked DevTools"
+
+# A window moved to a monitor of scale 2 since its last screenshot, taken at
+# scale 1: the page's devicePixelRatio of 2 is the window's scale now, so its
+# CSS pixels are logical ones, placed in the screenshot's pixels at scale 1. It
+# is as wide as its window, not narrower.
+export PLACED_STATE='{"scale": 2, "origin": [0, 0, 1]}'
+place '[{"id": "1", "title": "Fake page", "visible": true, "window": [800, 600], "inner": [800, 500], "ratio": 2}]'
+found=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-ui 3 --find Send 2>&1)
+unset PLACED_STATE
+[[ $clicked == "Clicked button \"Send\" at 60,140" && $(<"$test_dir/placed/pointer.args") == "3 click 60 140" && $found == 'button "Send" @60,140' ]] && ! grep -q "guess" <<<"$listed" || fail "click-ui clicks a page whose window changed scale since its last screenshot" "$listed / $found / $clicked"
+pass "click-ui clicks a page whose window changed scale since its last screenshot, where it is in that screenshot"
 
 # click-ui acts only on a control's full name, in any case: one that merely
 # contains the query is listed for the caller to name in full.

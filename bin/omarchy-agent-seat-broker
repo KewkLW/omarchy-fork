@@ -1000,7 +1000,12 @@ class Client:
     return True
 
   def request_xdg_surface_set_window_geometry(self, xdg, args):
-    self.xdg_surfaces[xdg]["geometry"] = tuple(args)
+    # Double buffered like the rest of the surface: an app can set the
+    # geometry of a frame it has yet to commit, and until it does Hyprland
+    # still crops and places the old frame by the old geometry.
+    surface = self.xdg_surfaces[xdg]["surface"]
+    if surface in self.surfaces:
+      self.surfaces[surface]["pending"]["geometry"] = tuple(args)
     return True
 
   def request_xdg_wm_base_get_xdg_surface(self, _, args):
@@ -1028,11 +1033,12 @@ class Client:
     self.regions[region].append(("subtract", *args))
     return True
 
-  # A surface's buffer, scale, transform, viewport and input region change
-  # together when it commits, and so do where its subsurfaces sit and how
-  # they stack. A synchronized subsurface's commit only goes into a cache,
-  # shown when its parent's state is, as Hyprland shows it, so a screenshot
-  # and the agent's clicks follow the layout the user sees.
+  # A surface's buffer, scale, transform, viewport, input region and window
+  # geometry change together when it commits, and so do where its
+  # subsurfaces sit and how they stack. A synchronized subsurface's commit
+  # only goes into a cache, shown when its parent's state is, as Hyprland
+  # shows it, so a screenshot and the agent's clicks follow the layout the
+  # user sees.
   #
   # The pixels are another matter: they live in the app's shared memory,
   # which it can write again without committing, and copying every frame
@@ -1092,8 +1098,15 @@ class Client:
     """Show a surface's committed state, and that of the synchronized subsurfaces under it."""
     state = self.surfaces[surface]
     positions = state["cached"].pop("positions", {})
+    geometry = state["cached"].pop("geometry", None)
     state.update(state["cached"])
     state["cached"] = {}
+    # The window geometry belongs to the xdg surface, and stays as last
+    # committed until the app sets another.
+    if geometry:
+      for xdg in self.xdg_surfaces.values():
+        if xdg["surface"] == surface:
+          xdg["geometry"] = geometry
     for child, position in positions.items():
       if child in self.surfaces and self.surfaces[child]["parent"] == surface:
         self.surfaces[child]["position"] = position
@@ -2260,15 +2273,27 @@ class Broker:
   def do_drag(self, window, x1, y1, x2, y2, button="left", steps=12):
     x1, y1, x2, y2 = self.to_logical(window, x1, y1, x2, y2)
     client = self.move(window, x1, y1)
+    toplevel = self.window(window)[1]
+    surface, lx, ly = client.hit(toplevel, x1, y1)
+    left, top = x1 - lx, y1 - ly  # the pressed surface's origin in the window
     for pointer in client.pointers:
       client.send_event(pointer, "button", self.next_serial(), self.now(), BUTTONS[button], 1)
     self.pointer_frame(client)
-    # A step can leave every surface's input region; the button still comes
-    # up where the pointer last was, never stuck down in the app.
+    # As a compositor's implicit grab does, the surface that took the press
+    # keeps the pointer until the release: every motion goes to it in its own
+    # coordinates, even past its edges, and no leave ends a selection or a
+    # slider's drag early or sends the release elsewhere. The next move hit
+    # tests again and enters whatever surface is under the pointer then.
     try:
       for step in range(1, steps + 1):
-        self.move(window, x1 + (x2 - x1) * step / steps, y1 + (y2 - y1) * step / steps)
+        x, y = x1 + (x2 - x1) * step / steps - left, y1 + (y2 - y1) * step / steps - top
+        for pointer in client.pointers:
+          if client.pointers[pointer] == surface:
+            client.send_event(pointer, "motion", self.now(), x, y)
+            client.pointer_positions[pointer] = (x, y)
+        self.pointer_frame(client)
     finally:
+      # The button always comes up, never stuck down in the app.
       for pointer in client.pointers:
         client.send_event(pointer, "button", self.next_serial(), self.now(), BUTTONS[button], 0)
       self.pointer_frame(client)

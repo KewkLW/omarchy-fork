@@ -823,9 +823,13 @@ def cdp_tree(state, port, page=None):
 
   # CSS pixels to logical ones, and where the page sits in the window: browser
   # chrome goes above it, an Electron app's page fills the window. When that
-  # cannot be checked, the positions are listed as unverified.
-  zoom = ratio / space.scale if space.scale else 1
-  unverified = placement_doubt(port, metrics, space.scale or 1, (gw, gh))
+  # cannot be checked, the positions are listed as unverified. The page's
+  # devicePixelRatio is that of the window's scale now, which differs from the
+  # last screenshot's after a move to a monitor of another scale: it takes CSS
+  # pixels to logical ones, and space takes those to the screenshot's.
+  scale = state.get("scale") or space.scale or 1
+  zoom = ratio / scale
+  unverified = placement_doubt(port, metrics, scale, (gw, gh))
   top = max(0, gh - inner_height * zoom)
   left = max(0, (gw - inner_width * zoom) / 2)
   viewport = space.box(left, top, inner_width * zoom, inner_height * zoom)
