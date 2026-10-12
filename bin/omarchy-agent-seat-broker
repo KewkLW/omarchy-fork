@@ -703,8 +703,14 @@ class Client:
     self.regions[args[0]] = []
     return True
 
+  # A region is its rectangles in the order they were added or cut out.
+
   def request_wl_region_add(self, region, args):
-    self.regions[region].append(tuple(args))
+    self.regions[region].append(("add", *args))
+    return True
+
+  def request_wl_region_subtract(self, region, args):
+    self.regions[region].append(("subtract", *args))
     return True
 
   def request_wl_surface_attach(self, surface, args):
@@ -1105,10 +1111,20 @@ class Client:
       lx, ly = x - sx, y - sy
       if not (0 <= lx < width and 0 <= ly < height):
         continue
-      region = self.surfaces[surface]["input"]
-      if region is None or any(rx <= lx < rx + rw and ry <= ly < ry + rh for rx, ry, rw, rh in region):
+      if self.accepts_input(self.surfaces[surface]["input"], lx, ly):
         return surface, lx, ly
     return None
+
+  @staticmethod
+  def accepts_input(region, x, y):
+    """Whether a point is in an input region; None is the whole surface."""
+    if region is None:
+      return True
+    inside = False
+    for op, rx, ry, rw, rh in region:
+      if rx <= x < rx + rw and ry <= y < ry + rh:
+        inside = op == "add"
+    return inside
 
   def close(self):
     self.down.close()

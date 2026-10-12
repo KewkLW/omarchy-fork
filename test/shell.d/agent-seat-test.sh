@@ -944,6 +944,21 @@ def viewport(seat, problems):
     check(problems, "a window with a cropped subsurface over it", seat.size(22), "20x20")
     check(problems, "the colours of a viewport's 10x10 red source stretched to 20x20", seat.colours(22), ["ff0000"])
 
+def hole(seat, problems):
+    # A red window under a green 20x20 subsurface at 5,5 that takes input
+    # everywhere but a 10x10 hole in its middle.
+    seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, RED)
+    seat.subsurface(23, 20, 5, 5)
+    seat.request(COMPOSITOR, "create_region", 24)
+    seat.request(24, "add", 0, 0, 20, 20)
+    seat.request(24, "subtract", 5, 5, 10, 10)
+    seat.request(23, "set_input_region", 24)
+    seat.draw(23, 20, 20, GREEN)
+    seat.request(20, "commit")
+    check(problems, "a click on the subsurface around its hole", seat.client.hit(22, 7, 7), (23, 2, 2))
+    check(problems, "a click in the subsurface's hole", seat.client.hit(22, 15, 15), (20, 15, 15))
+
 problems = []
 globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
 print("; ".join(problems) or "ok")
@@ -973,6 +988,10 @@ pass "a screenshot draws a popup of another scale at the window's scale"
 result=$(inproc viewport)
 [[ $result == "ok" ]] || fail "a screenshot draws only the part of a buffer a viewport shows" "$result"
 pass "a screenshot draws only the part of a buffer a viewport shows"
+
+result=$(inproc hole)
+[[ $result == "ok" ]] || fail "a click in a hole cut out of a surface's input region falls through to the surface beneath" "$result"
+pass "a click in a hole cut out of a surface's input region falls through to the surface beneath"
 
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 
