@@ -35,9 +35,11 @@ import collections
 import ctypes
 import ctypes.util
 import errno
+import functools
 import glob
 import json
 import mmap
+import operator
 import os
 import re
 import secrets
@@ -48,6 +50,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 import weakref
 import xml.etree.ElementTree as ET
@@ -103,7 +106,10 @@ GPU_CHOICES = {"Allow once": "once", "Allow for this session": "session"}
 GPU_GRANT_UNUSED_SECONDS = 300  # an allowed launch that never connects gives its socket back, after a cold start's worth
 GPU_GRANT_IDLE_SECONDS = 10  # and one whose app has gone, after a grace for apps that reconnect
 
-MAX_CAPTURE_SIZE = 8192  # pixels a side, beyond any real screen
+MAX_CAPTURE_SIZE = 4096  # pixels a side: a 4K screen, and at most 64 MiB of canvas
+MAX_CAPTURE_SCALE = 4  # screenshot pixels per surface unit, beyond any real output scale
+CAPTURE_SECONDS = 10  # to compose and write one screenshot
+MAX_CAPTURES = 2  # screenshots being taken at once
 
 BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112}
 XDG_STATE_ACTIVATED = 4
@@ -419,13 +425,27 @@ class Keymap:
 
 
 class Pool:
-  """A dup of an app's shared memory pool, kept while any buffer uses it."""
+  """A dup of an app's shared memory pool, kept while any buffer uses it.
+
+  A screenshot being composed holds it open: closed meanwhile, its
+  descriptor number could come back as another file and be read instead.
+  """
 
   def __init__(self, fd, size):
     self.fd, self.size = fd, size
+    self.holders, self.closing = 0, False
+
+  def hold(self):
+    self.holders += 1
+
+  def release(self):
+    self.holders -= 1
+    if self.closing:
+      self.close()
 
   def close(self):
-    if self.fd >= 0:
+    self.closing = True
+    if self.fd >= 0 and not self.holders:
       os.close(self.fd)
       self.fd = -1
 
@@ -450,19 +470,63 @@ def screenshot_path(path, caller):
 def blend(canvas, target, pixels):
   """Draw premultiplied ARGB8888 pixels over the canvas at target.
 
-  Opaque runs, and runs over nothing drawn yet, are copied; only translucent
-  pixels over something are blended one by one, so a translucent window on
-  its own costs no more than an opaque one.
+  Opaque pixels, and pixels over nothing drawn yet, are copied; anything
+  else is blended a whole row at a time, so a translucent window on its own
+  costs no more than an opaque one.
   """
   pixels = pixels[: len(pixels) - len(pixels) % 4]
+  under = canvas[target : target + len(pixels)]
   alphas = pixels[3::4]
-  for run in re.finditer(rb"\xff+|[^\xff]+", alphas):
-    start, end = run.start() * 4, run.end() * 4
-    under = canvas[target + start : target + end]
-    if alphas[run.start()] == 255 or under.count(0) == len(under):
-      canvas[target + start : target + end] = pixels[start:end]
-    else:
-      canvas[target + start : target + end] = bytes(min(255, pixels[start + i] + (under[i] * (255 - alphas[run.start() + i // 4]) + 127) // 255) for i in range(end - start))
+  if alphas.count(255) == len(alphas) or under.count(0) == len(under):
+    canvas[target : target + len(pixels)] = pixels
+  else:
+    canvas[target : target + len(pixels)] = over(pixels, under)
+
+
+# Each pixel's 255 - alpha, bit by bit: 0xff where the bit is set.
+UNCOVERED_BITS = [bytes(0xFF if (255 - alpha) >> bit & 1 else 0 for alpha in range(256)) for bit in range(8)]
+
+
+@functools.lru_cache(maxsize=8)
+def lane_masks(count):
+  """For count bytes spread one to a 16-bit lane: each lane's low byte, its 128 and its 1."""
+  return tuple(int.from_bytes(lane * count, "little") for lane in (b"\xff\x00", b"\x80\x00", b"\x01\x00"))
+
+
+def lanes(data):
+  """Bytes as one integer with each byte in a 16-bit lane of its own."""
+  spread = bytearray(2 * len(data))
+  spread[0::2] = data
+  return int.from_bytes(spread, "little")
+
+
+def over(pixels, under):
+  """min(255, pixel + round(under * (255 - alpha) / 255)) for every byte.
+
+  Python has no per-byte arithmetic, so each byte gets a 16-bit lane of one
+  large integer, where whole-integer sums and shifts work on every lane at
+  once. The product with each pixel's 255 - alpha is a sum over its eight
+  bits, of under masked to the pixels with that bit set, shifted by it.
+  """
+  count = len(pixels)
+  low, half, one = lane_masks(count)
+  alphas = pixels[3::4]
+  under = lanes(under)
+  mask = bytearray(2 * count)
+  product = 0
+  for bit, table in enumerate(UNCOVERED_BITS):
+    selected = alphas.translate(table)
+    if selected.count(0) == len(selected):
+      continue
+    for channel in range(4):
+      mask[2 * channel :: 8] = selected
+    product += (under & int.from_bytes(mask, "little")) << bit
+  # Divided by 255, rounded as (x + 127) // 255: (t + (t >> 8)) >> 8 with t = x + 128.
+  product += half
+  product = ((product + ((product >> 8) & low)) >> 8) & low
+  total = product + lanes(pixels)
+  total = (total | ((total >> 8) & one) * 0xFF) & low  # saturated at 255
+  return total.to_bytes(2 * count, "little")[0::2]
 
 
 def buffer_pixel(transform, x, y, width, height):
@@ -491,6 +555,148 @@ def write_png(path, canvas, width, height):
       raise ValueError(f"{path} is not a regular file")
     png.truncate()
     png.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(rows), 1)) + chunk(b"IEND", b""))
+
+
+class Plan:
+  """What a screenshot draws: each layer's buffer, the part of it shown and
+  where, the screenshot's size, and its origin (left, top and scale)."""
+
+  def __init__(self, layers, origin, width, height):
+    self.layers, self.origin, self.width, self.height = layers, origin, width, height
+    self.pools = [buffer[2][0] for buffer, *_ in layers if isinstance(buffer[2], tuple)]
+    for pool in self.pools:
+      pool.hold()
+
+  def release(self):
+    for pool in self.pools:
+      pool.release()
+    self.pools = []
+
+
+def compose(plan, cancelled=None):
+  """Draw a screenshot's layers from their buffers, bottom to top.
+
+  It touches nothing but the plan, so it can run on a thread of its own, and
+  gives up when cancelled is set.
+  """
+  left, top, scale = plan.origin
+  width, height = plan.width, plan.height
+  canvas = bytearray(width * height * 4)
+
+  for (buffer_width, buffer_height, source), (cx, cy, right, bottom, rx, ry), x, y, gx, gy, gw, gh, transform in plan.layers:
+    solid = isinstance(source, bytes)
+    if not solid and source[3] not in (0, 1):  # ARGB8888 and XRGB8888, what apps draw with
+      continue
+    sx, sy = cx + gx * rx, cy + gy * ry
+    dx, dy = round((x - left) * scale), round((y - top) * scale)
+    if dx < 0 or dy < 0:
+      continue
+    # Each screenshot pixel the layer covers comes from the nearest pixel of
+    # the part of its buffer it shows, which can have another scale than the
+    # window's: a scale 1 popup over a scale 2 window is drawn twice as
+    # large, and a viewport stretches its source over its destination.
+    columns = [column for column in (int(sx + (i + 0.5) * rx / scale) for i in range(min(round(gw * scale), width - dx))) if column < right]
+    rows = [row for row in (int(sy + (i + 0.5) * ry / scale) for i in range(min(round(gh * scale), height - dy))) if row < bottom]
+    if not columns or not rows:
+      continue
+    if solid:
+      # One colour, stretched over the whole layer.
+      for row in range(len(rows)):
+        blend(canvas, ((dy + row) * width + dx) * 4, source * len(columns))
+      continue
+    pool, offset, stride, format = source
+    # Read rather than map: the app can shrink its pool at any moment, and
+    # touching a mapping past the end of the file kills the broker with
+    # SIGBUS. Whatever is missing stays black. Translucent layers blend over
+    # what is under them; XRGB8888 has no alpha and covers it.
+    end = min(pool.size, os.fstat(pool.fd).st_size)
+
+    def read(length, position, fd=pool.fd):
+      return os.pread(fd, length, position)
+
+    if transform:
+      pixels = turned_rows(read, offset, stride, end, transform, buffer_width, buffer_height, columns, rows)
+    else:
+      pixels = straight_rows(read, offset, stride, end, columns)
+    for row, source_row in enumerate(rows):
+      if cancelled and cancelled.is_set():
+        raise TimeoutError("the screenshot was given up")
+      line = pixels(source_row)
+      if line is None:
+        continue
+      target = ((dy + row) * width + dx) * 4
+      if format == 0:
+        blend(canvas, target, line)
+      else:
+        canvas[target : target + len(line)] = line
+
+  return canvas
+
+
+def words(indices):
+  """A function picking the 4-byte pixels at these indices, past a start, out of a memoryview cast to them."""
+  pick = operator.itemgetter(*indices)
+  if len(indices) == 1:
+    return lambda view, start: array.array("I", (pick(view[start:]),)).tobytes()
+  return lambda view, start: array.array("I", pick(view[start:])).tobytes()
+
+
+def straight_rows(read, offset, stride, end, columns):
+  """For a buffer without a transform: a function from one of its rows to
+  the pixels at the columns, or None when the row is past the pool's end."""
+  first, span = columns[0], columns[-1] + 1 - columns[0]
+  pick = words([column - first for column in columns]) if span != len(columns) else None
+
+  def pixels(row):
+    source = offset + row * stride + first * 4
+    if not 0 <= source < end:
+      return None
+    data = read(min(span * 4, end - source), source)
+    if not pick:
+      return data
+    if len(data) == span * 4:
+      return pick(memoryview(data).cast("I"), 0)
+    have = len(data) // 4  # the pool ends within the row
+    return b"".join(data[(column - first) * 4 : (column - first + 1) * 4] for column in columns if column - first < have)
+
+  return pixels
+
+
+def turned_rows(read, offset, stride, end, transform, buffer_width, buffer_height, columns, rows):
+  """For a buffer with a transform: a function from a row of the turned
+  buffer to the pixels at its columns, read from the buffer's own rows.
+
+  The buffer's column and row each depend on only one of the turned
+  buffer's, so the first row and column of the turned part name every
+  pixel of the buffer to read, and where a pixel sits among them is a sum
+  of a part from its column and a part from its row.
+  """
+  width, height = (buffer_height, buffer_width) if transform & 1 else (buffer_width, buffer_height)
+  across = [buffer_pixel(transform, column, rows[0], width, height) for column in columns]
+  down = [buffer_pixel(transform, columns[0], row, width, height) for row in rows]
+  xs = sorted({x for x, _ in across + down})
+  ys = sorted({y for _, y in across + down})
+  left, span = xs[0], xs[-1] + 1 - xs[0]
+  pick = words([x - left for x in xs])
+  # Only the pixels needed, a row of them for each buffer row: no larger
+  # than the screenshot however far a viewport shrinks the buffer. Missing
+  # ones stay black.
+  block = bytearray(len(ys) * len(xs) * 4)
+  for index, y in enumerate(ys):
+    source = offset + y * stride + left * 4
+    if 0 <= source < end:
+      data = read(min(span * 4, end - source), source).ljust(span * 4, b"\0")
+      block[index * len(xs) * 4 : (index + 1) * len(xs) * 4] = pick(memoryview(data).cast("I"), 0)
+  column = {x: index for index, x in enumerate(xs)}
+  line = {y: index * len(xs) for index, y in enumerate(ys)}
+  if transform & 1:  # the buffer's column follows the turned row, its row the turned column
+    pick = words([line[y] for _, y in across])
+    starts = {row: column[x] for row, (x, _) in zip(rows, down)}
+  else:
+    pick = words([column[x] for x, _ in across])
+    starts = {row: line[y] for row, (_, y) in zip(rows, down)}
+  view = memoryview(block).cast("I")
+  return lambda row: pick(view, starts[row])
 
 
 # One agent app connection ------------------------------------------------------
@@ -1149,16 +1355,18 @@ class Client:
   def scale(self, toplevel):
     """Screenshot pixels per surface unit: the window's buffer pixels per
     unit, or when the window is one colour stretched, the most any of its
-    other layers has."""
+    other layers has. No more than MAX_CAPTURE_SCALE: a small viewport over
+    a large buffer would otherwise blow every other layer up with it."""
     xdg = self.toplevels[toplevel]["xdg"]
     surface = self.xdg_surfaces[xdg]["surface"]
     if self.size(surface)[0] and self.surfaces[surface]["buffer"] and not isinstance(self.surfaces[surface]["buffer"][2], bytes):
-      return self.crop(surface)[4]
+      return min(self.crop(surface)[4], MAX_CAPTURE_SCALE)
     drawn = [self.crop(layer)[4] for layer, _, _ in self.layers(xdg, 0, 0) if self.size(layer)[0] and self.surfaces[layer]["buffer"] and isinstance(self.surfaces[layer]["buffer"][2], tuple)]
-    return max(drawn, default=1)
+    return min(max(drawn, default=1), MAX_CAPTURE_SCALE)
 
-  def capture(self, toplevel):
-    """Compose the window, its subsurfaces and its popups from their shared memory buffers."""
+  def capture_plan(self, toplevel):
+    """What a screenshot of the window draws, taken from the app's state now
+    so a thread can compose it while the app goes on changing that state."""
     scale = self.scale(toplevel)
     layers = []
     for surface, x, y in self.layers(self.toplevels[toplevel]["xdg"], 0, 0):
@@ -1179,79 +1387,15 @@ class Client:
     height = round((max(layer[3] + layer[7] for layer in layers) - top) * scale)
     if not (0 < width <= MAX_CAPTURE_SIZE and 0 < height <= MAX_CAPTURE_SIZE):
       raise ValueError(f"the window is {width}x{height} pixels, more than a screenshot can hold")
-    canvas = bytearray(width * height * 4)
+    return Plan(layers, (left, top, scale), width, height)
 
-    for (buffer_width, buffer_height, source), (cx, cy, right, bottom, rx, ry), x, y, gx, gy, gw, gh, transform in layers:
-      solid = isinstance(source, bytes)
-      if not solid and source[3] not in (0, 1):  # ARGB8888 and XRGB8888, what apps draw with
-        continue
-      sx, sy = cx + gx * rx, cy + gy * ry
-      dx, dy = round((x - left) * scale), round((y - top) * scale)
-      if dx < 0 or dy < 0:
-        continue
-      # Each screenshot pixel the layer covers comes from the nearest pixel of
-      # the part of its buffer it shows, which can have another scale than the
-      # window's: a scale 1 popup over a scale 2 window is drawn twice as
-      # large, and a viewport stretches its source over its destination.
-      columns = [column for column in (int(sx + (i + 0.5) * rx / scale) for i in range(min(round(gw * scale), width - dx))) if column < right]
-      rows = [row for row in (int(sy + (i + 0.5) * ry / scale) for i in range(min(round(gh * scale), height - dy))) if row < bottom]
-      if not columns or not rows:
-        continue
-      if solid:
-        # One colour, stretched over the whole layer.
-        for row in range(len(rows)):
-          blend(canvas, ((dy + row) * width + dx) * 4, source * len(columns))
-        continue
-      pool, offset, stride, format = source
-      first, span = columns[0], columns[-1] + 1 - columns[0]
-      # Read rather than map: the app can shrink its pool at any moment, and
-      # touching a mapping past the end of the file kills the broker with
-      # SIGBUS. Whatever is missing stays black. Translucent layers blend over
-      # what is under them; XRGB8888 has no alpha and covers it.
-      end = min(pool.size, os.fstat(pool.fd).st_size)
-      turned = transform and self.turned_rows(pool, offset, stride, end, transform, buffer_width, buffer_height, columns, rows)
-      for row, source_row in enumerate(rows):
-        if turned:
-          pixels = turned(source_row)
-        else:
-          source = offset + source_row * stride + first * 4
-          if not 0 <= source < end:
-            continue
-          pixels = os.pread(pool.fd, min(span * 4, end - source), source)
-          if span != len(columns):
-            read = len(pixels) // 4
-            pixels = b"".join(pixels[(column - first) * 4 : (column - first + 1) * 4] for column in columns if column - first < read)
-        target = ((dy + row) * width + dx) * 4
-        if format == 0:
-          blend(canvas, target, pixels)
-        else:
-          canvas[target : target + len(pixels)] = pixels
-
-    return canvas, width, height, (left, top, scale)
-
-  @staticmethod
-  def turned_rows(pool, offset, stride, end, transform, buffer_width, buffer_height, columns, rows):
-    """For a buffer with a transform: a function from a row of the turned
-    buffer to the pixels at its columns, read from the buffer's own rows.
-
-    The buffer's column and row each depend on only one of the turned
-    buffer's, so the first row and column of the turned part name every
-    pixel of the buffer to read.
-    """
-    width, height = (buffer_height, buffer_width) if transform & 1 else (buffer_width, buffer_height)
-    needed = [buffer_pixel(transform, column, rows[0], width, height) for column in columns] + [buffer_pixel(transform, columns[0], row, width, height) for row in rows]
-    left, right = min(x for x, _ in needed), max(x for x, _ in needed)
-    lines = {}
-    for y in {y for _, y in needed}:
-      source = offset + y * stride + left * 4
-      if 0 <= source < end:
-        lines[y] = os.pread(pool.fd, min((right + 1 - left) * 4, end - source), source)
-
-    def pixels(row):
-      found = (buffer_pixel(transform, column, row, width, height) for column in columns)
-      return b"".join(lines.get(y, b"")[(x - left) * 4 : (x - left + 1) * 4].ljust(4, b"\0") for x, y in found)
-
-    return pixels
+  def capture(self, toplevel):
+    """Compose the window, its subsurfaces and its popups now: its pixels, size and origin."""
+    plan = self.capture_plan(toplevel)
+    try:
+      return compose(plan), plan.width, plan.height, plan.origin
+    finally:
+      plan.release()
 
   def hit(self, toplevel, x, y):
     for surface, sx, sy in reversed(self.layers(self.toplevels[toplevel]["xdg"], 0, 0)):
@@ -1313,6 +1457,31 @@ class Job:
     self.process = subprocess.Popen(argv, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
 
 
+class Capture:
+  """A screenshot composed and written on a thread of its own, so every app
+  keeps being served meanwhile. The thread touches nothing but its plan and
+  the file, and says it is done through a pipe the broker waits on."""
+
+  def __init__(self, conn, window, client, toplevel, plan, path):
+    self.conn, self.window, self.client, self.toplevel, self.plan, self.path = conn, window, client, toplevel, plan, path
+    self.deadline = time.monotonic() + CAPTURE_SECONDS  # then the caller gets an error
+    self.cancelled = threading.Event()
+    self.answered = False
+    self.result = self.error = None
+    self.done, self.finished = os.pipe()
+    self.thread = threading.Thread(target=self.run, daemon=True)
+    self.thread.start()
+
+  def run(self):
+    try:
+      canvas = compose(self.plan, self.cancelled)
+      write_png(self.path, canvas, self.plan.width, self.plan.height)
+      self.result = {"path": self.path, "width": self.plan.width, "height": self.plan.height}
+    except Exception as error:
+      self.error = error
+    os.write(self.finished, b"\0")
+
+
 class Broker:
   def __init__(self):
     self.selector = selectors.DefaultSelector()
@@ -1328,6 +1497,7 @@ class Broker:
     self.grants = []
     self.gpu_session = False  # the user allowed the GPU for the rest of this session
     self.gpu_requests = collections.deque()  # (conn, program) waiting for the user, the first one asked
+    self.shots = []  # screenshots being taken
     self.jobs = []
     self.requests = []
 
@@ -1347,6 +1517,9 @@ class Broker:
     if problem:
       log(problem)
       sys.exit(1)
+    # A screenshot's thread hands the interpreter back to the event loop
+    # within a millisecond rather than five, each time an app's message waits.
+    sys.setswitchinterval(0.001)
     os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
     os.chmod(RUNTIME_DIR, 0o700)
     for path in glob.glob(os.path.join(RUNTIME_DIR, "gpu-*")):
@@ -1356,10 +1529,10 @@ class Broker:
     log(f"serving {WAYLAND_SOCKET} for {self.upstream}")
 
     while True:
-      waiting = self.paused or self.requests or any(job.deadline for job in self.jobs)
+      waiting = self.paused or self.requests or self.shots or any(job.deadline for job in self.jobs)
       for key, events in self.selector.select(timeout=1 if waiting else 5):
         kind, owner = key.data
-        if isinstance(owner, Client) and owner not in self.clients or isinstance(owner, Job) and owner not in self.jobs or isinstance(owner, Request) and owner not in self.requests:
+        if isinstance(owner, Client) and owner not in self.clients or isinstance(owner, Job) and owner not in self.jobs or isinstance(owner, Request) and owner not in self.requests or isinstance(owner, Capture) and owner not in self.shots:
           continue  # dropped or finished earlier in this round
         try:
           if kind == "wayland":
@@ -1372,6 +1545,10 @@ class Broker:
             self.job_output(owner)
           elif kind == "requester":
             self.requester_gone(owner)
+          elif kind == "shot":
+            self.shot_taken(owner)
+          elif kind == "shot-requester":
+            self.answer_shot(owner)
           elif events & selectors.EVENT_WRITE:
             owner.flush()
           else:
@@ -1533,6 +1710,9 @@ class Broker:
       if job.deadline and job.deadline < now:
         job.deadline = None
         job.process.kill()  # its output ends, and the job finishes with what it had
+    for shot in self.shots:
+      if not shot.answered and shot.deadline < now:
+        self.answer_shot(shot, error=f"the screenshot took more than {CAPTURE_SECONDS}s")
 
   def reply(self, conn, result=None, error=None):
     reply = {"ok": False, "error": str(error)} if error else {"ok": True, **(result or {})}
@@ -1543,6 +1723,8 @@ class Broker:
     conn.close()
 
   def stop(self):
+    for shot in list(self.shots):
+      self.answer_shot(shot, error="The agent seat stopped")
     for job in list(self.jobs):
       self.end_job(job)
       job.process.kill()
@@ -1700,21 +1882,51 @@ class Broker:
     left, top, scale = self.captures.get(int(window), (0, 0, client.scale(toplevel)))
     return [value / scale + (top if index % 2 else left) for index, value in enumerate(coordinates)]
 
+  # A screenshot is composed on a thread, so a large one holds up no app. The
+  # caller gets an error past CAPTURE_SECONDS, and hanging up gives it up. A
+  # GPU window's buffers are opaque to the broker, so Hyprland draws it instead,
+  # in a helper process the broker waits on like any other job.
+
   def defer_screenshot(self, conn, caller, window, path=None):
-    client, _ = self.window(window)
+    client, toplevel = self.window(window)
     path = screenshot_path(path or os.path.join(RUNTIME_DIR, f"window-{int(window)}.png"), caller)
     if client.grant:
-      # A GPU window's buffers are opaque to the broker, so Hyprland draws it.
       self.start_job(conn, [sys.executable, os.path.abspath(__file__), "capture", str(window), path], lambda output, code: self.captured(window, path, output, code))
-    else:
-      self.reply(conn, self.screenshot(window, path))
+      return
+    if len(self.shots) >= MAX_CAPTURES:
+      raise ValueError("other screenshots are still being taken; try again in a moment")
+    plan = client.capture_plan(toplevel)
+    try:
+      shot = Capture(conn, int(window), client, toplevel, plan, path)
+    except Exception:
+      plan.release()
+      raise
+    self.shots.append(shot)
+    self.selector.register(shot.done, selectors.EVENT_READ, ("shot", shot))
+    self.selector.register(conn, selectors.EVENT_READ, ("shot-requester", shot))
 
-  def screenshot(self, window, path):
-    client, toplevel = self.window(window)
-    canvas, width, height, origin = client.capture(toplevel)
-    write_png(path, canvas, width, height)
-    self.captures[int(window)] = origin
-    return {"path": path, "width": width, "height": height}
+  def answer_shot(self, shot, result=None, error=None):
+    """Answer a screenshot's caller, or with neither result nor error, let it go: it hung up."""
+    if shot.answered:
+      return
+    shot.answered = True
+    shot.cancelled.set()
+    self.selector.unregister(shot.conn)
+    if result or error:
+      self.reply(shot.conn, result, error)
+    else:
+      shot.conn.close()
+
+  def shot_taken(self, shot):
+    shot.thread.join()
+    self.selector.unregister(shot.done)
+    os.close(shot.done)
+    os.close(shot.finished)
+    self.shots.remove(shot)
+    shot.plan.release()
+    if shot.result and self.windows.get(shot.window) == (shot.client, shot.toplevel):
+      self.captures[shot.window] = shot.plan.origin
+    self.answer_shot(shot, shot.result, shot.error)
 
   def captured(self, window, path, output, code):
     result = json.loads(output or "{}")

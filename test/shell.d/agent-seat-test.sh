@@ -306,6 +306,20 @@ elif step == "thief":
         conn.send(message(6, 1, struct.pack("<II", 7, serial)))
     roundtrip(8)
 
+elif step == "latency":
+    # Round trips through the broker for two seconds: the slowest, in ms.
+    # Callbacks start past the one the compositor answers late.
+    import time
+    print("ready", flush=True)
+    slowest, callback, until = 0, 1000, time.monotonic() + 2
+    while time.monotonic() < until:
+        start = time.monotonic()
+        conn.send(message(1, 0, struct.pack("<I", callback)))
+        while conn.read(timeout=30)[0] != callback:
+            pass
+        slowest, callback = max(slowest, time.monotonic() - start), callback + 1
+    print(round(slowest * 1000), flush=True)
+
 elif step == "seat":
     bind("wl_seat", 7, 4)
     for object_id, opcode, body in roundtrip(5):
@@ -474,6 +488,21 @@ if scene == "scene":
     conn.send(message(POPUP_XDG, 2, struct.pack("<III", POPUP, XDG, POSITIONER)))
     for surface_id in (CHILD, POPUP_SURFACE, ROOT):
         conn.send(message(surface_id, 6))
+elif scene == "glass":
+    # A red 2000x2000 window under a subsurface as large, green at half
+    # opacity: every pixel of its screenshot is blended.
+    side = 2000
+    memory = os.memfd_create("draw")
+    os.write(memory, RED * side * side + b"\x00\x80\x00\x80" * side * side)
+    send_fd(message(SHM, 0, struct.pack("<Ii", POOL, 2 * side * side * 4)), memory)
+    surface(ROOT, 11, 0, side, side)
+    conn.send(message(POOL, 0, struct.pack("<IiiiiI", 12, side * side * 4, side, side, side * 4, 0)))
+    conn.send(message(COMPOSITOR, 0, struct.pack("<I", CHILD)))
+    conn.send(message(CHILD, 1, struct.pack("<Iii", 12, 0, 0)))
+    toplevel()
+    conn.send(message(SUBCOMPOSITOR, 1, struct.pack("<III", SUBSURFACE, CHILD, ROOT)))
+    conn.send(message(CHILD, 6))
+    conn.send(message(ROOT, 6))
 else:
     # A large window whose pool keeps shrinking and growing again.
     width, height = 2000, 1500
@@ -1076,6 +1105,25 @@ def synchronized(seat, problems):
     seat.request(20, "commit")
     check(problems, "a nested subsurface's frame once the window commits", seat.pixel(22, 8, 8), "0000ff")
 
+def limits(seat, problems):
+    # A window one pixel wider than a screenshot can hold, one exactly as
+    # wide, and a 400x400 buffer shown 10x10 through a viewport, which would
+    # make the screenshot's scale 40.
+    seat.window(20, 21, 22)
+    seat.draw(20, 4097, 1, RED)
+    try:
+        seat.size(22)
+        check(problems, "a window 4097 pixels wide", "a screenshot", "refused")
+    except ValueError as error:
+        check(problems, "a window 4097 pixels wide", "more than a screenshot can hold" in str(error), True)
+    seat.draw(20, 4096, 1, RED)
+    check(problems, "a window 4096 pixels wide", seat.size(22), "4096x1")
+    seat.window(30, 31, 32)
+    seat.request(VIEWPORTER, "get_viewport", 33, 30)
+    seat.request(33, "set_destination", 10, 10)
+    seat.draw(30, 400, 400, RED)
+    check(problems, "a 400x400 buffer shown 10x10", (seat.size(32), seat.client.scale(32)), ("40x40", 4))
+
 problems = []
 globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
 print("; ".join(problems) or "ok")
@@ -1130,6 +1178,10 @@ result=$(inproc synchronized)
 [[ $result == "ok" ]] || fail "a synchronized subsurface's frame shows only once its window commits" "$result"
 pass "a synchronized subsurface's frame shows only once its window commits"
 
+result=$(inproc limits)
+[[ $result == "ok" ]] || fail "a screenshot is at most 4096 pixels a side and 4 pixels per surface unit" "$result"
+pass "a screenshot is at most 4096 pixels a side and 4 pixels per surface unit"
+
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 
 python3 "$test_dir/app.py" "$socket" vanish "$broker"
@@ -1147,6 +1199,21 @@ for _ in {1..5}; do
 done
 stop_draw
 pass "an app shrinking its pool under a screenshot leaves the broker running"
+
+# Another app keeps being served while a large translucent window's
+# screenshot is composed.
+start_draw glass
+window=$(window_of glass)
+python3 "$test_dir/app.py" "$socket" latency >"$test_dir/latency.out" &
+latency_pid=$!
+for _ in {1..50}; do [[ -s $test_dir/latency.out ]] && break; sleep 0.1; done
+shot=$(run_broker omarchy-agent-seat-screenshot "$window" 2>&1) || fail "a large translucent window gets a screenshot" "$shot"
+wait "$latency_pid"
+slowest=$(tail -1 "$test_dir/latency.out")
+[[ $(python3 "$test_dir/pixels.py" "$shot" 0,0 1999,1999) == "2000x2000 7f8000 7f8000" ]] || fail "a large translucent window's screenshot is blended" "$(python3 "$test_dir/pixels.py" "$shot" 0,0)"
+(( slowest < 100 )) || fail "a large screenshot does not hold up other apps" "a round trip took ${slowest} ms"
+stop_draw
+pass "a large screenshot does not hold up other apps"
 
 # The scene: a red 40x30 window (surface 20) taking input on its left half,
 # a green 10x10 subsurface (21) at 5,5 and a blue 20x10 popup (22) at 30,25.
