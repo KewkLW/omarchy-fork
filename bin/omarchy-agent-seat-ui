@@ -520,20 +520,27 @@ def titled(window_title, page_title):
   return bool(page_title and window_title and (window_title == page_title or window_title.startswith(page_title + " - ")))
 
 
+# What shown_title says of a page that did not answer.
+UNKNOWN = object()
+
+
 def shown_title(target):
-  """A page's title when it is the tab its window shows, else None.
+  """A page's title when it is the tab its window shows, None when it is not,
+  and UNKNOWN when the page did not say.
 
   A browser can show several windows of many tabs, any of them titled alike,
   so a page's title alone does not place it in a window.
   """
   try:
-    devtools = DevTools(target["webSocketDebuggerUrl"], timeout=3)  # a frozen background tab never answers
+    devtools = DevTools(target["webSocketDebuggerUrl"], timeout=3)  # a frozen or busy tab may never answer
     try:
       shown, title = json.loads(devtools.call("Runtime.evaluate", {"expression": "JSON.stringify([document.visibilityState, document.title])", "returnByValue": True})["result"]["value"])
     finally:
       devtools.close()
   except (OSError, ValueError, RuntimeError, ConnectionError, KeyError, TypeError):
-    return None
+    # A page too busy to answer may still be the one shown: it stays a
+    # candidate, for the window's size or a refusal to settle.
+    return UNKNOWN
   return title if shown == "visible" else None
 
 
@@ -625,8 +632,10 @@ def cdp_target(port, title, size=None, page=None):
   # DevTools reports titles HTML-escaped ("Fun &amp; games"), the window has
   # them plain; the page's own title, read below, is plain too.
   candidates = [t for t in targets if titled(title, html.unescape(t.get("title") or ""))]
-  # Only the active tab of each window is visible.
-  candidates = [t for t in candidates if titled(title, shown_title(t))]
+  # Only the active tab of each window is visible; one that does not say
+  # whether it is stays in.
+  shown = {t["id"]: shown_title(t) for t in candidates}
+  candidates = [t for t in candidates if shown[t["id"]] is UNKNOWN or titled(title, shown[t["id"]])]
   if len(candidates) > 1 and size:
     sizes = window_sizes(port, candidates)
     fitting = [t for t in candidates if t["id"] in sizes and near(sizes[t["id"]], size)]
@@ -635,7 +644,7 @@ def cdp_target(port, title, size=None, page=None):
     return None
   # Numbered by target id, which stays the same from one call to the next.
   candidates.sort(key=lambda t: t["id"])
-  listing = "\n".join(f"{number}. {html.unescape(t.get('title') or '')} — {t.get('url', '')}" for number, t in enumerate(candidates, 1))
+  listing = "\n".join(f"{number}. {html.unescape(t.get('title') or '')} — {t.get('url', '')}{' (did not say whether it is shown)' if shown[t['id']] is UNKNOWN else ''}" for number, t in enumerate(candidates, 1))
   hint = "Rerun with --page N to pick one (its number above, or part of its URL)."
   chosen = candidates
   if page is not None:

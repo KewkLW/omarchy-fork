@@ -431,6 +431,8 @@ def serve(conn):
             message = json.loads(bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
             method, params = message["method"], message.get("params", {})
             if method == "Runtime.evaluate" and "document.title" in params["expression"]:
+                if page.get("busy"):
+                    continue  # a page too busy to answer
                 # The page's own title is plain.
                 result = {"result": {"type": "string", "value": json.dumps(["visible" if page["visible"] else "hidden", html.unescape(page["title"])])}}
             elif method == "Runtime.evaluate":
@@ -525,6 +527,8 @@ print(json.dumps({
   "windows": pick([{"id": "3", "title": "Twin", "visible": True, "window": [800, 600]}, {"id": "4", "title": "Twin", "visible": True, "window": [800, 600]}], [800, 600]),
   "sized": pick([{"id": "3", "title": "Twin", "visible": True, "window": [400, 600]}, {"id": "4", "title": "Twin", "visible": True, "window": [800, 600]}], [800, 600]),
   "hidden": pick([{"id": "3", "title": "Other", "visible": True, "window": [800, 600]}, {"id": "4", "title": "Twin", "visible": False, "window": [800, 600]}], [800, 600]),
+  "busy": pick([{"id": "3", "title": "Twin", "visible": True, "busy": True, "window": [800, 600]}, {"id": "4", "title": "Twin", "visible": True, "window": [800, 600]}], [800, 600]),
+  "busy_elsewhere": pick([{"id": "3", "title": "Twin", "visible": True, "busy": True, "window": [400, 600]}, {"id": "4", "title": "Twin", "visible": True, "window": [800, 600]}], [800, 600]),
 }))
 EOF
 ) || fail "ui picks between pages of the same title" "$twins"
@@ -536,6 +540,12 @@ pass "the DevTools route reads the page the window shows, among others of the sa
 [[ $(jq -r '.windows' <<<"$twins") == "refused: 2 pages are shown in windows titled 'Twin - Chromium'"* ]] || fail "the DevTools route refuses to guess between windows showing the same title" "$twins"
 jq -r '.windows' <<<"$twins" | grep -q "https://example.com/3" || fail "a refusal lists the pages it could not tell apart" "$twins"
 pass "the DevTools route refuses to guess between windows showing the same title, and lists them"
+# A page too busy to say whether it is shown may be the one the window shows:
+# it is no reason to read the other.
+busy=$(jq -r '.busy' <<<"$twins")
+[[ $busy == "refused: 2 pages are shown in windows titled 'Twin - Chromium'"* ]] && grep -q "^1\. Twin — https://example.com/3 (did not say whether it is shown)$" <<<"$busy" && grep -q "^2\. Twin — https://example.com/4$" <<<"$busy" || fail "the DevTools route refuses rather than skip a page that does not answer" "$twins"
+[[ $(jq -r '.busy_elsewhere' <<<"$twins") == */devtools/page/4 ]] || fail "the DevTools route tells a page that does not answer apart by its window's size" "$twins"
+pass "the DevTools route keeps a page that does not answer as a candidate, and lists it"
 
 # --page picks one of the pages a refusal numbers, in the order of their target
 # ids rather than the order DevTools lists them in, by its number or by part of
