@@ -47,6 +47,36 @@ missing=$(PYTHONPATH="$test_dir/no-gi" "$ROOT/bin/omarchy-agent-seat-ui" --atspi
 (( $? == 3 )) && [[ -z $missing ]] || fail "the AT-SPI reader reports a missing gi quietly" "$missing"
 pass "the AT-SPI reader reports a missing python-gobject without a traceback"
 
+# A menu is a window of its own, here 120x200 at scale 2, and may open outside
+# the 400x200 window: its items show within its own bounds, in the pixels of a
+# screenshot that starts at the menu when it opens above or left of the window.
+popups=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" <<'EOF'
+import importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("seat_ui", loader)
+ui = importlib.util.module_from_spec(spec)
+loader.exec_module(ui)
+
+def widget(role, name, extents, children=()):
+  return {"role": role, "name": name, "value": None, "states": [], "extents": extents, "children": list(children)}
+
+main = widget("frame", "Popup Test", [0, 0, 400, 200], [widget("push button", "Open", [10, 150, 80, 30]), widget("push button", "Away", [500, 10, 50, 20])])
+menu = widget("window", "", [0, 0, 120, 200], [widget("menu", "", [0, 0, 120, 200], [widget("menu item", "First", [4, 4, 112, 30]), widget("menu item", "Second", [4, 140, 112, 30])])])
+apps = [{"name": "test", "windows": [main, menu]}]
+
+def read(position, origin):
+  state = {"title": "Popup Test", "geometry": [0, 0, 400, 200], "surface": [400, 200], "scale": 2, "origin": origin, "popups": [{"position": position, "size": [120, 200]}]}
+  return {item["name"] or item["role"]: [item["x"], item["y"]] for item in ui.atspi_tree(state, apps, True)}
+
+print(json.dumps({"beside": read([400, 100], [0, 0, 2]), "above": read([-130, -50], [-130, -50, 2])}))
+EOF
+) || fail "ui reads a fake tree with a menu" "$popups"
+
+[[ $(jq -c '.beside' <<<"$popups") == '{"Popup Test":[400,200],"Open":[100,330],"window":[920,400],"First":[920,238],"Second":[920,510]}' ]] || fail "ui lists the items of a menu beside the window where they are" "$popups"
+pass "ui lists the items of a menu beside the window where they are"
+[[ $(jq -c '.above' <<<"$popups") == '{"Popup Test":[660,300],"Open":[360,430],"window":[120,200],"First":[120,38],"Second":[120,310]}' ]] || fail "ui places a window's controls and its menu above it in the screenshot's pixels" "$popups"
+pass "ui places a window's controls and its menu above it in the screenshot's pixels"
+
 if ! bwrap_works; then
   skip "bubblewrap cannot create a sandbox here; skipping the agent seat UI"
   exit 0
@@ -178,6 +208,67 @@ Gtk.main()
   grep -q 'button "Fill later"' <<<"$candidates" || fail "an ambiguous name lists the candidates" "$candidates"
   seat omarchy-agent-seat-click-ui "$window" "Nothing here" 2>/dev/null && fail "click-ui refuses a name that matches nothing"
   pass "click-ui matches exact, then by substring, and lists ambiguous candidates"
+
+  # Menus that open outside the window, below and above it, where the screenshot
+  # then starts.
+  program='
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk
+window = Gtk.Window(title="Seat Menu Test")
+window.set_default_size(400, 200)
+box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+entry = Gtk.Entry()
+quit_button = Gtk.Button(label="Quit")
+quit_button.connect("clicked", lambda _: Gtk.main_quit())
+def menu_button(label, widget_anchor, menu_anchor):
+  button = Gtk.Button(label=label)
+  menu = Gtk.Menu()
+  for name in ("First", "Second", "Third"):
+    item = Gtk.MenuItem(label=label + " " + name)
+    item.connect("activate", lambda item: entry.set_text("chose " + item.get_label()))
+    menu.append(item)
+  menu.show_all()
+  menu.set_property("anchor-hints", 0)
+  button.connect("clicked", lambda _: menu.popup_at_widget(button, widget_anchor, menu_anchor, None))
+  return button
+box.pack_start(menu_button("Above", Gdk.Gravity.NORTH_WEST, Gdk.Gravity.SOUTH_WEST), False, False, 0)
+box.pack_start(entry, False, False, 0)
+box.pack_start(quit_button, False, False, 0)
+box.pack_end(menu_button("Below", Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST), False, False, 0)
+window.add(box)
+window.connect("destroy", Gtk.main_quit)
+window.show_all()
+Gtk.main()
+'
+  menus=$(seat omarchy-agent-seat-run /usr/bin/python3 -c "$program") || fail "a GTK app with menus opens on the test seat" "$(cat "$runtime/omarchy/agent-seat/apps.log")"
+  for _ in {1..50}; do
+    seat omarchy-agent-seat-ui "$menus" --find Below >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  for side in Below Above; do
+    # The item furthest from the window, which a screenshot shows past its edge.
+    [[ $side == "Below" ]] && name="Below Third" || name="Above First"
+    seat omarchy-agent-seat-click-ui "$menus" "$side" >/dev/null || fail "click-ui opens the menu $side the window"
+    for _ in {1..50}; do
+      seat omarchy-agent-seat-ui "$menus" --find "$name" >/dev/null 2>&1 && break
+      sleep 0.1
+    done
+    seat omarchy-agent-seat-screenshot "$menus" >/dev/null || fail "a screenshot shows the menu $side the window"
+    item=$(seat omarchy-agent-seat-ui "$menus" --find "$name" --json)
+    state=$(seat omarchy-agent-seat-state "$menus" --json)
+    jq -e --arg side "$side" --argjson state "$state" '$state[0] as $s | if $side == "Below" then .box[1] >= $s.size[1] * $s.scale else $s.origin[1] < 0 and .box[1] + .box[3] <= -$s.origin[1] * $s.scale and .box[1] >= 0 end' <<<"$item" >/dev/null || fail "ui lists the items of a menu $side the window, outside it" "$item $state"
+    seat omarchy-agent-seat-click-ui "$menus" "$name" >/dev/null || fail "click-ui clicks an item of a menu $side the window"
+    for _ in {1..30}; do
+      value=$(seat omarchy-agent-seat-ui "$menus" --find text: --json | jq -r '.value')
+      [[ $value == "chose $name" ]] && break
+      sleep 0.1
+    done
+    [[ $value == "chose $name" ]] || fail "click-ui on an item of a menu $side the window activates it" "$value"
+  done
+  seat omarchy-agent-seat-click-ui "$menus" Quit >/dev/null
+  pass "ui lists and click-ui clicks the items of menus that open below and above the window"
 
   missing=$(PYTHONPATH="$test_dir/no-gi" seat omarchy-agent-seat-ui "$window" 2>&1)
   (( $? == 2 )) && [[ $missing == "Install python-gobject and at-spi2-core to read accessibility trees" ]] || fail "ui without python-gobject says what to install and exits 2" "$missing"

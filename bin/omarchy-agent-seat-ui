@@ -90,7 +90,11 @@ def window_state(window):
   # are multiples of 1/120.
   scale = round(min(shot["width"] / width, shot["height"] / height) * 120) / 120 if width and height else 1
   popups = [{"position": popup[:2], "size": popup[2:]} for popup in info.get("popups") or []]
-  return {**info, "popups": popups, "pid": None, "geometry": [0, 0, width, height], "surface": [width, height], "scale": scale, "origin": [0, 0, scale], "drawn": True}
+  # The screenshot starts at the window's corner, or at a popup's above or left
+  # of it (off by the popup's shadow, which this broker does not report).
+  left = min([0] + [popup["position"][0] for popup in popups])
+  top = min([0] + [popup["position"][1] for popup in popups])
+  return {**info, "popups": popups, "pid": None, "geometry": [0, 0, width, height], "surface": [width, height], "scale": scale, "origin": [left, top, scale], "drawn": True}
 
 
 def process_start_time(pid):
@@ -164,11 +168,13 @@ class Space:
 
   def __init__(self, state):
     self.left, self.top, self.scale = state["origin"]
-    self.width, self.height = (value * self.scale for value in state["geometry"][2:])
+    # The screenshot starts above or left of the window when a popup does.
+    self.window = self.box(0, 0, *state["geometry"][2:])
 
-  def visible(self, box):
-    """Whether a box in screenshot pixels overlaps the window; pages report what is scrolled away too."""
-    return box[0] < self.width and box[1] < self.height and box[0] + box[2] > 0 and box[1] + box[3] > 0
+  @staticmethod
+  def visible(box, bounds):
+    """Whether a box overlaps bounds, both in screenshot pixels; trees report what is scrolled away too."""
+    return box[0] < bounds[0] + bounds[2] and box[1] < bounds[1] + bounds[3] and box[0] + box[2] > bounds[0] and box[1] + box[3] > bounds[1]
 
   def box(self, x, y, width, height):
     return [round((x - self.left) * self.scale), round((y - self.top) * self.scale), round(width * self.scale), round(height * self.scale)]
@@ -290,29 +296,30 @@ def atspi_tree(state, apps, strict):
   fx, fy, fw, fh = main["extents"]
   offset = (gx, gy) if near((fw, fh), surface) and not near((fw, fh), (gw, gh)) else (fx, fy)
   nodes = []
-  flatten(main, offset, space, nodes, 0)
+  flatten(main, offset, space, space.window, nodes, 0)
 
   # Menus and other popups are windows of their own, placed where the broker
-  # says a popup of their size is.
+  # says a popup of their size is, and often outside the window: what they
+  # show is what lies within their own bounds.
   for popup in state.get("popups", []):
     position, size = popup["position"], popup["size"]
     for window in windows:
       if window is not main and window["role"] in POPUP_ROLES and near(window["extents"][2:], size):
-        flatten(window, (window["extents"][0] - position[0], window["extents"][1] - position[1]), space, nodes, 0)
+        flatten(window, (window["extents"][0] - position[0], window["extents"][1] - position[1]), space, space.box(*position, *size), nodes, 0)
         break
   return nodes
 
 
-def flatten(accessible, offset, space, nodes, depth, parent_name=None):
+def flatten(accessible, offset, space, bounds, nodes, depth, parent_name=None):
   x, y, width, height = accessible["extents"]
   named = (accessible["name"] and accessible["name"] != parent_name) or accessible["value"] not in (None, "")
   shown = width > 0 and height > 0 and x > -1000000 and y > -1000000
   box = space.box(x - offset[0], y - offset[1], width, height)
-  if shown and (named or accessible["role"] in ACTIONABLE or depth == 0) and (depth == 0 or space.visible(box)):
+  if shown and (named or accessible["role"] in ACTIONABLE or depth == 0) and (depth == 0 or space.visible(box, bounds)):
     nodes.append(node(accessible["role"], accessible["name"], accessible["value"], accessible["states"], box, depth))
     depth += 1
   for child in accessible["children"]:
-    flatten(child, offset, space, nodes, depth, accessible["name"] or parent_name)
+    flatten(child, offset, space, bounds, nodes, depth, accessible["name"] or parent_name)
 
 
 # Chrome DevTools protocol ---------------------------------------------------------
