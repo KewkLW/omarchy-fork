@@ -269,6 +269,19 @@ result=$(cat "$test_dir/out/fds" 2>/dev/null)
 grep -qx "fds: 0 1 2 3 " <<<"$result" || fail "the app inherits no descriptor the caller left open" "$result"
 pass "a descriptor the caller leaves open does not reach the app"
 
+# A file shared read-write is changed in place, and the files beside it stay
+# hidden.
+echo "draft" >"$test_dir/draft"
+run_headless --share "$test_dir/draft" /usr/bin/bash -c '
+  if [[ -e ${1%/*}/note ]]; then
+    echo "note visible" >>"$1"
+  else
+    echo "written" >>"$1"
+  fi' _ "$test_dir/draft" ||
+  fail "an app with a shared file runs" "$(cat "$seat/apps.log" 2>/dev/null)"
+[[ $(<"$test_dir/draft") == $'draft\nwritten' ]] || fail "a file shared read-write is written through, alone in its directory" "$(cat "$test_dir/draft")"
+pass "a file shared read-write is written through from the sandbox, and the files beside it stay hidden"
+
 # A launch that waits for its window keeps other launches from diffing the
 # window list until it has one, without holding up stop.
 "${on_seat[@]}" omarchy-agent-seat-run /usr/bin/sleep 30 >/dev/null 2>&1 &
