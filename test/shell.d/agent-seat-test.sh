@@ -1593,6 +1593,22 @@ start_broker
 echo "Allow once" >"$test_dir/menu-answer"
 gpu_socket=$(gpu_request | jq -r '.socket')
 [[ -S $gpu_socket ]] || fail "a restarted broker grants the GPU"
+
+# A GPU window's buffers are opaque to the broker, so its screenshot goes to
+# Hyprland through the capture helper, not to the broker's own composer; the
+# fake compositor offers no toplevel capture, so the helper's refusal shows it.
+coproc GPU_APP { python3 "$test_dir/app.py" "$gpu_socket" window; }
+read -r -t 5 ready <&"${GPU_APP[0]}"
+[[ $ready == "ready" ]] || fail "an app on a GPU socket maps a window"
+gpu_window=$(run_broker omarchy-agent-seat-state --json | jq -r '.[] | select(.gpu) | .window')
+[[ $gpu_window =~ ^[0-9]+$ ]] || fail "state marks a GPU window" "$(run_broker omarchy-agent-seat-state --json)"
+shot=$(run_broker omarchy-agent-seat-screenshot "$gpu_window" 2>&1) && fail "a GPU window's screenshot comes from Hyprland" "$shot"
+[[ $shot == *"Hyprland does not offer ext_foreign_toplevel_list_v1"* ]] || fail "a GPU window's screenshot goes to Hyprland's capture" "$shot"
+run_broker omarchy-agent-seat-status >/dev/null || fail "the broker answers after a GPU window's capture fails"
+pass "a GPU window's screenshot goes to Hyprland's capture, not the broker's composer"
+kill "$GPU_APP_PID" 2>/dev/null
+wait "$GPU_APP_PID" 2>/dev/null
+
 kill -KILL "$broker"
 wait "$broker_pid" 2>/dev/null
 [[ -S $socket && -S $gpu_socket ]] || fail "a killed broker leaves its sockets behind"
