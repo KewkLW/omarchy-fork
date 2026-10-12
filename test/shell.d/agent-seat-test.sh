@@ -851,7 +851,7 @@ broker = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.
 loader.exec_module(broker)
 
 SEAT, COMPOSITOR, WM, SHM, SUBCOMPOSITOR, DATA = 2, 3, 4, 5, 6, 7
-KEYBOARD, POINTER, DEVICE, SOURCE, VIEWPORTER, SINGLE_PIXEL = 8, 9, 10, 11, 12, 13
+KEYBOARD, POINTER, DEVICE, SOURCE, VIEWPORTER, SINGLE_PIXEL, ALPHA_MODIFIER = 8, 9, 10, 11, 12, 13, 14
 ARGB, XRGB = 0, 1
 
 class Seat:
@@ -865,7 +865,7 @@ class Seat:
         self.hyprland = listener.accept()[0]
         self.client.pid = 0
         self.broker.clients.append(self.client)
-        self.client.objects.update({SEAT: ("wl_seat", 7), COMPOSITOR: ("wl_compositor", 6), WM: ("xdg_wm_base", 6), SHM: ("wl_shm", 1), SUBCOMPOSITOR: ("wl_subcompositor", 1), DATA: ("wl_data_device_manager", 3), VIEWPORTER: ("wp_viewporter", 1), SINGLE_PIXEL: ("wp_single_pixel_buffer_manager_v1", 1)})
+        self.client.objects.update({SEAT: ("wl_seat", 7), COMPOSITOR: ("wl_compositor", 6), WM: ("xdg_wm_base", 6), SHM: ("wl_shm", 1), SUBCOMPOSITOR: ("wl_subcompositor", 1), DATA: ("wl_data_device_manager", 3), VIEWPORTER: ("wp_viewporter", 1), SINGLE_PIXEL: ("wp_single_pixel_buffer_manager_v1", 1), ALPHA_MODIFIER: ("wp_alpha_modifier_v1", 1)})
         self.next_pool = 1000
 
     def send(self, kind, object_id, name, *args):
@@ -1082,6 +1082,27 @@ def translucent(seat, problems):
     seat.request(20, "commit")
     check(problems, "a translucent subsurface over red", seat.pixel(22, 6, 6), "7f8000")
     check(problems, "the window beside it", seat.pixel(22, 1, 1), "ff0000")
+
+def alpha_modifier(seat, problems):
+    # A white 40x30 window under a red 10x10 subsurface at 5,5 whose alpha
+    # multiplier is set to one half, shown once the window commits; then
+    # its alpha modifier destroyed.
+    seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, WHITE)
+    seat.subsurface(23, 20, 5, 5)
+    seat.draw(23, 10, 10, RED)
+    seat.request(20, "commit")
+    seat.request(ALPHA_MODIFIER, "get_surface", 24, 23)
+    seat.request(24, "set_multiplier", 0x80000000)
+    check(problems, "a subsurface's alpha multiplier before it commits", seat.pixel(22, 7, 7), "ff0000")
+    seat.request(23, "commit")
+    check(problems, "a synchronized subsurface's alpha multiplier before its window commits", seat.pixel(22, 7, 7), "ff0000")
+    seat.request(20, "commit")
+    check(problems, "a subsurface at half opacity over white", (seat.pixel(22, 7, 7), seat.pixel(22, 1, 1)), ("ff7f7f", "ffffff"))
+    seat.request(24, "destroy")
+    seat.request(23, "commit")
+    seat.request(20, "commit")
+    check(problems, "a subsurface once its alpha modifier is destroyed", seat.pixel(22, 7, 7), "ff0000")
 
 def scales(seat, problems):
     # A scale 2 window, 40x30 logical, with a scale 1 popup of 20x10 at 10,10.
@@ -1395,6 +1416,10 @@ pass "the agent's drag keeps the pointer on the surface it pressed until the rel
 result=$(inproc translucent)
 [[ $result == "ok" ]] || fail "a screenshot blends a translucent layer over what is under it" "$result"
 pass "a screenshot blends a translucent layer over what is under it"
+
+result=$(inproc alpha_modifier)
+[[ $result == "ok" ]] || fail "a screenshot fades a surface by its alpha multiplier" "$result"
+pass "a screenshot fades a surface by its alpha multiplier"
 
 result=$(inproc scales)
 [[ $result == "ok" ]] || fail "a screenshot draws a popup of another scale at the window's scale" "$result"

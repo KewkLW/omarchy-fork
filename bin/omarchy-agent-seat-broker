@@ -538,6 +538,16 @@ def over(pixels, under):
   return total.to_bytes(2 * count, "little")[0::2]
 
 
+def faded(pixels, alpha):
+  """round(byte * alpha / 255) for every byte of premultiplied pixels: a
+  surface's wp_alpha_modifier_v1 multiplier, as Hyprland applies it. One
+  multiplication of the bytes in their 16-bit lanes, rounded as in over()."""
+  low, half, _ = lane_masks(len(pixels))
+  product = lanes(pixels) * alpha + half
+  product = ((product + ((product >> 8) & low)) >> 8) & low
+  return product.to_bytes(2 * len(pixels), "little")[0::2]
+
+
 def buffer_pixel(transform, x, y, width, height):
   """The pixel of a buffer shown at x, y once a wl_output transform turns
   the buffer to width x height, as wlroots maps a surface to its buffer:
@@ -592,9 +602,11 @@ def compose(plan, cancelled=None):
   width, height = plan.width, plan.height
   canvas = bytearray(width * height * 4)
 
-  for (buffer_width, buffer_height, source), (cx, cy, right, bottom, rx, ry), x, y, gx, gy, gw, gh, transform in plan.layers:
+  for (buffer_width, buffer_height, source), (cx, cy, right, bottom, rx, ry), x, y, gx, gy, gw, gh, transform, alpha in plan.layers:
     solid = isinstance(source, bytes)
     if not solid and source[3] not in (0, 1):  # ARGB8888 and XRGB8888, what apps draw with
+      continue
+    if alpha == 0:  # an alpha multiplier of 0 hides the layer on screen
       continue
     sx, sy = cx + gx * rx, cy + gy * ry
     dx, dy = round((x - left) * scale), round((y - top) * scale)
@@ -610,6 +622,8 @@ def compose(plan, cancelled=None):
       continue
     if solid:
       # One colour, stretched over the whole layer.
+      if alpha < 255:
+        source = faded(source, alpha)
       for row in range(len(rows)):
         blend(canvas, ((dy + row) * width + dx) * 4, source * len(columns))
       continue
@@ -641,7 +655,14 @@ def compose(plan, cancelled=None):
       if line is None:
         continue
       target = ((dy + row) * width + dx) * 4
-      if format == 0:
+      if alpha < 255:
+        # An alpha multiplier below 1 fades the layer over what is under it,
+        # XRGB8888 too: its pixels count as opaque until the multiplier.
+        if format == 1:
+          line = bytearray(line)
+          line[3::4] = b"\xff" * (len(line) // 4)
+        blend(canvas, target, faded(line, alpha))
+      elif format == 0:
         blend(canvas, target, line)
       else:
         canvas[target : target + len(line)] = line
@@ -1014,7 +1035,7 @@ class Client:
 
   def request_wl_compositor_create_surface(self, _, args):
     self.surfaces[args[0]] = {
-      "buffer": None, "scale": 1, "transform": 0, "viewport": None, "source": None, "input": None,
+      "buffer": None, "scale": 1, "transform": 0, "viewport": None, "source": None, "input": None, "alpha": 255,
       "pending": {}, "cached": {}, "sync": False, "stack": [args[0]], "parent": None, "position": (0, 0), "pixels": None,
     }
     return True
@@ -1259,6 +1280,25 @@ class Client:
   def request_wp_viewport_destroy(self, viewport, _):
     if self.roles.get(viewport) in self.surfaces:
       self.surfaces[self.roles[viewport]]["pending"].update(viewport=None, source=None)
+    return True
+
+  # An alpha multiplier fades the whole surface on screen, so screenshots
+  # fade it too. It is double buffered like the rest of the surface, kept
+  # as the 0-255 alpha a screenshot multiplies by, and back to 1 once the
+  # surface commits after its alpha modifier is destroyed.
+
+  def request_wp_alpha_modifier_v1_get_surface(self, _, args):
+    self.roles[args[0]] = args[1]
+    return True
+
+  def request_wp_alpha_modifier_surface_v1_set_multiplier(self, modifier, args):
+    if self.roles.get(modifier) in self.surfaces:
+      self.surfaces[self.roles[modifier]]["pending"]["alpha"] = round(args[0] * 255 / 0xFFFFFFFF)
+    return True
+
+  def request_wp_alpha_modifier_surface_v1_destroy(self, modifier, _):
+    if self.roles.get(modifier) in self.surfaces:
+      self.surfaces[self.roles[modifier]]["pending"]["alpha"] = 255
     return True
 
   def unparent(self, surface):
@@ -1563,7 +1603,7 @@ class Client:
         gx, gy, gw, gh = self.geometry(surface)
         x0, y0, x1, y1 = max(gx, 0), max(gy, 0), min(gx + gw, sw), min(gy + gh, sh)
         if x1 > x0 and y1 > y0:
-          layers.append((buffer, self.crop(surface), x + x0, y + y0, x0, y0, x1 - x0, y1 - y0, self.surfaces[surface]["transform"]))
+          layers.append((buffer, self.crop(surface), x + x0, y + y0, x0, y0, x1 - x0, y1 - y0, self.surfaces[surface]["transform"], self.surfaces[surface]["alpha"]))
     if not layers:
       raise ValueError("the window has not drawn anything yet")
 
