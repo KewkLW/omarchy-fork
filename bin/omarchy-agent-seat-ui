@@ -1016,9 +1016,9 @@ def main(args):
     found = find(nodes, query, substring=not exact)
     # A name that only contains the query ("Delete" in "Delete account") is
     # a guess, never acted on: the caller reruns with the full name.
-    near = [] if found or not exact else find(nodes, query)
-    if near:
-      fail(f"No control is named {query!r} in window {window}; {'this one contains' if len(near) == 1 else 'these contain'} it. Rerun with the full name:\n" + "\n".join("  " + describe(n) for n in near))
+    containing = [] if found or not exact else find(nodes, query)
+    if containing:
+      fail(f"No control is named {query!r} in window {window}; {'this one contains' if len(containing) == 1 else 'these contain'} it. Rerun with the full name:\n" + "\n".join("  " + describe(n) for n in containing))
     if len(found) != 1:
       fail(f"No control matches {query!r} in window {window}" if not found else f"{len(found)} controls match {query!r} in window {window}:\n" + "\n".join("  " + describe(n) for n in found))
     nodes = found

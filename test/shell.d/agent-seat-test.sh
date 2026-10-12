@@ -1117,6 +1117,38 @@ def transform(seat, problems):
     seat.draw(20, 40, 30, corner, transform=7)
     check(problems, "its top left corner flipped and turned 270 degrees", [seat.pixel(22, x, y) for x, y in ((25, 30), (29, 39), (24, 35), (27, 29), (27, 5))], ["00ff00", "00ff00", "ff0000", "ff0000", "ff0000"])
 
+def wide_buffer(seat, problems):
+    # A buffer 50 million pixels wide over a 1 MiB pool that is written
+    # nowhere near that far, shrunk by a viewport so that the first pixel
+    # shown lies inside the pool and the last far past it, turned and then
+    # not: a screenshot must read the pixels it shows, not the buffer's
+    # width, or each row would cost 200 MiB.
+    def peak():
+        with open("/proc/self/status") as status:
+            return next(int(line.split()[1]) for line in status if line.startswith("VmHWM:"))
+    width = 50_000_000
+    seat.window(20, 21, 22)
+    seat.request(VIEWPORTER, "get_viewport", 23, 20)
+    for transform in (1, 0):
+        pool, buffer = seat.next_pool + 1, seat.next_pool + 2
+        seat.next_pool += 2
+        memory = os.memfd_create("wide")
+        os.write(memory, RED * 262144)
+        seat.request(SHM, "create_pool", pool, memory, 1048576)
+        os.close(memory)
+        seat.request(pool, "create_buffer", buffer, 0, width, 2, width * 4, XRGB)
+        seat.request(23, "set_destination", *((10, 1024) if transform & 1 else (1024, 10)))
+        seat.request(20, "set_buffer_transform", transform)
+        seat.request(20, "attach", buffer, 0, 0)
+        seat.request(20, "commit")
+        before = peak()
+        # A pixel from the buffer's first row near its start is red, from
+        # inside the pool (turned 90 degrees, that row is the right column
+        # of a two pixel wide screenshot); the rest lie past the pool's end
+        # and stay black.
+        check(problems, f"a screenshot of a buffer {width} wide shrunk by a viewport, transform {transform}", (bool(seat.size(22)), seat.pixel(22, 1 if transform & 1 else 0, 0)), (True, "ff0000"))
+        check(problems, f"its cost in memory, transform {transform} (KiB)", peak() - before < 32 * 1024, True)
+
 def single_pixel(seat, problems):
     # A window that is one red pixel stretched to 40x30, under a subsurface
     # that is one half transparent green pixel stretched to 10x10 at 5,5.
@@ -1315,6 +1347,10 @@ pass "screenshots and clicks follow subsurfaces moved above or below each other 
 result=$(inproc transform)
 [[ $result == "ok" ]] || fail "a screenshot turns and flips a buffer by its transform" "$result"
 pass "a screenshot turns and flips a buffer by its transform"
+
+result=$(inproc wide_buffer)
+[[ $result == "ok" ]] || fail "a screenshot of a buffer made very wide and shrunk reads only the pixels it shows" "$result"
+pass "a screenshot of a buffer made very wide and shrunk reads only the pixels it shows"
 
 result=$(inproc single_pixel)
 [[ $result == "ok" ]] || fail "a screenshot draws single pixel buffers as their colour, stretched and blended" "$result"

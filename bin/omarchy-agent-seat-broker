@@ -113,6 +113,7 @@ GPU_GRANT_UNUSED_SECONDS = 300  # an allowed launch that never connects gives it
 GPU_GRANT_IDLE_SECONDS = 10  # and one whose app has gone, after a grace for apps that reconnect
 
 MAX_CAPTURE_SIZE = 4096  # pixels a side: a 4K screen, and at most 64 MiB of canvas
+RUN_GAP = 256  # buffer pixels between two needed ones that one read still spans
 MAX_CAPTURE_SCALE = 4  # screenshot pixels per surface unit, beyond any real output scale
 CAPTURE_SECONDS = 10  # to compose and write one screenshot
 MAX_CAPTURES = 2  # screenshots being taken at once
@@ -656,23 +657,60 @@ def words(indices):
   return lambda view, start: array.array("I", pick(view[start:])).tobytes()
 
 
+def pixel_runs(xs):
+  """The buffer columns to read together for these needed ones, in order:
+  each run holds needed columns and gaps of at most RUN_GAP between them.
+
+  A read never spans a buffer's whole width: an app can make a buffer as
+  wide as it likes over a pool that costs it nothing until written, and
+  shrink it through a viewport, so a read of the width between the first
+  and last needed column would cost the broker that much memory for each
+  row of a small screenshot. A run is (start, count, indices of the needed
+  columns within it, a picker of those or None when the run is all needed).
+  """
+  runs = []
+  for x in xs:
+    if runs and x - (runs[-1][0] + runs[-1][1]) <= RUN_GAP:
+      runs[-1][1] = max(runs[-1][1], x + 1 - runs[-1][0])
+    else:
+      runs.append([x, 1])
+  picks = []
+  for start, count in runs:
+    indices = [x - start for x in xs if start <= x < start + count]
+    picks.append((start, count, indices, None if indices == list(range(count)) else words(indices)))
+  return picks
+
+
+def read_runs(read, source, end, picks, pad):
+  """The needed pixels of one buffer row starting at source, run by run.
+  Past the pool's end they are black when pad is set, and left out otherwise."""
+  pieces = []
+  for start, count, indices, pick in picks:
+    at = source + start * 4
+    data = read(min(count * 4, end - at), at) if 0 <= at < end else b""
+    if len(data) == count * 4:
+      pieces.append(pick(memoryview(data).cast("I"), 0) if pick else data)
+    elif pad:
+      data = data.ljust(count * 4, b"\0")
+      pieces.append(pick(memoryview(data).cast("I"), 0) if pick else data)
+    else:
+      have = len(data) // 4  # the pool ends within the row
+      pieces.append(b"".join(data[index * 4 : (index + 1) * 4] for index in indices if index < have))
+      break
+  return b"".join(pieces)
+
+
 def straight_rows(read, offset, stride, end, columns):
   """For a buffer without a transform: a function from one of its rows to
   the pixels at the columns, or None when the row is past the pool's end."""
-  first, span = columns[0], columns[-1] + 1 - columns[0]
-  pick = words([column - first for column in columns]) if span != len(columns) else None
+  first = columns[0]
+  picks = pixel_runs(columns)
 
   def pixels(row):
-    source = offset + row * stride + first * 4
-    if not 0 <= source < end:
+    source = offset + row * stride
+    if not 0 <= source + first * 4 < end:
       return None
-    data = read(min(span * 4, end - source), source)
-    if not pick:
-      return data
-    if len(data) == span * 4:
-      return pick(memoryview(data).cast("I"), 0)
-    have = len(data) // 4  # the pool ends within the row
-    return b"".join(data[(column - first) * 4 : (column - first + 1) * 4] for column in columns if column - first < have)
+    return read_runs(read, source, end, picks, False)
 
   return pixels
 
@@ -691,17 +729,13 @@ def turned_rows(read, offset, stride, end, transform, buffer_width, buffer_heigh
   down = [buffer_pixel(transform, columns[0], row, width, height) for row in rows]
   xs = sorted({x for x, _ in across + down})
   ys = sorted({y for _, y in across + down})
-  left, span = xs[0], xs[-1] + 1 - xs[0]
-  pick = words([x - left for x in xs])
+  picks = pixel_runs(xs)
   # Only the pixels needed, a row of them for each buffer row: no larger
-  # than the screenshot however far a viewport shrinks the buffer. Missing
-  # ones stay black.
+  # than the screenshot however far a viewport shrinks the buffer, and read
+  # in runs no wider than that either. Missing ones stay black.
   block = bytearray(len(ys) * len(xs) * 4)
   for index, y in enumerate(ys):
-    source = offset + y * stride + left * 4
-    if 0 <= source < end:
-      data = read(min(span * 4, end - source), source).ljust(span * 4, b"\0")
-      block[index * len(xs) * 4 : (index + 1) * len(xs) * 4] = pick(memoryview(data).cast("I"), 0)
+    block[index * len(xs) * 4 : (index + 1) * len(xs) * 4] = read_runs(read, offset + y * stride, end, picks, True)
   column = {x: index for index, x in enumerate(xs)}
   line = {y: index * len(xs) for index, y in enumerate(ys)}
   if transform & 1:  # the buffer's column follows the turned row, its row the turned column
