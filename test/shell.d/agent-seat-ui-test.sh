@@ -111,6 +111,44 @@ EOF
 [[ $(jq -c '.' <<<"$partial") == '{"Scroll Test":[400,200],"Half right":[700,140],"Half below":[100,390]}' ]] || fail "ui places a control scrolled partly away on the part that shows, and leaves out a sliver" "$partial"
 pass "ui places a control scrolled partly away on the part that shows, and leaves out a sliver"
 
+# Scroll panes, viewports and tables hide what scrolls past their edges, and a
+# table the rows scrolled under its column header, as GTK reports them at
+# scale 1: a row under the header and one past the pane's bottom are clicked
+# on the part that shows, a button scrolled out of its viewport is left out.
+# A page tab is the size of its label, with its page under it, all shown.
+clipped=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" <<'EOF'
+import importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("seat_ui", loader)
+ui = importlib.util.module_from_spec(spec)
+loader.exec_module(ui)
+
+def widget(role, name, extents, children=()):
+  return {"role": role, "name": name, "value": None, "states": [], "extents": extents, "children": list(children)}
+
+table = widget("scroll pane", "", [0, 71, 400, 120], [widget("table", "", [0, 71, 400, 120], [
+  widget("table column header", "Header", [0, 71, 400, 25]),
+  widget("table cell", "Row 1", [2, 85, 396, 23]),
+  widget("table cell", "Row 2", [2, 110, 396, 23]),
+  widget("table cell", "Row 5", [2, 185, 396, 23]),
+])])
+items = widget("scroll pane", "", [0, 191, 400, 120], [widget("viewport", "", [0, 191, 400, 120], [widget("filler", "", [0, 141, 400, 680], [
+  widget("push button", "Item 1", [0, 175, 400, 34]),
+  widget("push button", "Item 2", [0, 209, 400, 34]),
+  widget("push button", "Item 5", [0, 311, 400, 34]),
+])])])
+pages = widget("page tab list", "", [0, 311, 400, 89], [widget("page tab", "First", [21, 315, 32, 30], [widget("filler", "", [1, 349, 398, 50], [widget("push button", "First action", [1, 349, 398, 34])])])])
+apps = [{"name": "test", "windows": [widget("frame", "Clip Test", [0, 0, 400, 400], [table, items, pages])]}]
+state = {"title": "Clip Test", "geometry": [0, 0, 400, 400], "surface": [400, 400], "scale": 1, "origin": [0, 0, 1], "popups": []}
+print(json.dumps({item["name"]: [item["x"], item["y"]] for item in ui.atspi_tree(state, apps, True)}))
+EOF
+) || fail "ui reads a fake tree with scroll panes and a table" "$clipped"
+
+[[ $(jq -c '[."Row 1", ."Row 2", ."Row 5"]' <<<"$clipped") == "[[200,102],[200,121],[200,188]]" ]] || fail "ui places a table's rows on the part that shows below its header and above its edge" "$clipped"
+[[ $(jq -c '[."Item 1", ."Item 2"]' <<<"$clipped") == "[[200,200],[200,226]]" && $(jq -r 'has("Item 5")' <<<"$clipped") == "false" ]] || fail "ui places a control on the part its viewport shows, and leaves out one scrolled out of it" "$clipped"
+[[ $(jq -c '."First action"' <<<"$clipped") == "[200,366]" ]] || fail "ui lists the page under a page tab the size of its label" "$clipped"
+pass "ui clips controls to the scroll panes, viewports and table headers above them"
+
 # An app can show two windows of the same title and size: the one the seat's
 # keyboard is in reports itself active. When that does not tell them apart,
 # ui refuses and numbers them, and --page picks one.
@@ -436,6 +474,12 @@ NODES = [
 ]
 BOXES = {1: [0, 0, 800, 600], 2: [10, 20, 100, 40], 3: [200, 20, 300, 40], 4: [20, 25, 80, 30], 5: [10, 5000, 100, 20], 6: [700, 100, 200, 20], 7: [10, 599, 100, 20]}
 
+def describe(backend, depth):
+    role = next(n["role"]["value"] for n in NODES if n["backendDOMNodeId"] == backend)
+    tag = {"link": "a", "button": "button", "textbox": "input", "StaticText": "span"}.get(role, "div")
+    children = [n["backendDOMNodeId"] for n in NODES if n.get("parentId") == str(backend)]
+    return {"backendNodeId": backend, "nodeType": 1, "nodeName": tag.upper(), "localName": tag, "attributes": ["id", f"n{backend}"], **({"children": [describe(child, depth - 1) for child in children]} if depth else {})}
+
 def frame(sock, text):
     data = text.encode()
     header = bytes([0x81]) + (bytes([len(data)]) if len(data) < 126 else bytes([126]) + struct.pack(">H", len(data)) if len(data) < 65536 else bytes([127]) + struct.pack(">Q", len(data)))
@@ -513,6 +557,18 @@ def serve(conn):
             elif method == "DOM.getBoxModel":
                 x, y, w, h = BOXES[params["backendNodeId"]]
                 result = {"model": {"border": [x, y, x + w, y, x + w, y + h, x, y + h]}}
+            elif method == "DOM.resolveNode":
+                result = {"object": {"type": "object", "objectId": f"node-{params['backendNodeId']}"}}
+            elif method == "Runtime.callFunctionOn" and params["objectId"].removeprefix("node-") in page.get("clips", {}):
+                # Where the overflow ancestors of a node let it show.
+                result = {"result": {"type": "object", "value": page["clips"][params["objectId"].removeprefix("node-")]}}
+            elif method == "DOM.getNodeForLocation":
+                # The innermost node there, unless the page puts another on top.
+                x, y = params["x"], params["y"]
+                under = [b for b, (bx, by, bw, bh) in BOXES.items() if bx <= x < bx + bw and by <= y < by + bh]
+                result = {"backendNodeId": page.get("cover") or min(under, key=lambda b: BOXES[b][2] * BOXES[b][3])}
+            elif method == "DOM.describeNode":
+                result = {"node": describe(params["backendNodeId"], params.get("depth", 1))}
             else:
                 result = {}
             frame(conn, json.dumps({"id": message["id"], "result": result}))
@@ -562,6 +618,23 @@ jq -r '.listing[]' <<<"$cdp" | grep -qx 'textbox "Message" = "hi" @525,60 \[focu
 pass "the DevTools route reports values and focus"
 [[ $(jq -r '.escaped' <<<"$cdp") == */devtools/page/2 ]] || fail "the DevTools route finds a tab whose title DevTools escapes" "$cdp"
 pass "the DevTools route finds a tab whose title DevTools escapes"
+
+# A scroll pane or any other element whose overflow is not visible hides what
+# lies past its edges: here the button shows only above CSS pixel 40, and the
+# text box not at all.
+echo '[{"id": "1", "title": "Fake page", "visible": true, "window": [800, 600], "clips": {"2": [10, 20, 0, 0, 800, 40], "3": [200, 20, 0, 0, 800, 10]}}]' >"$test_dir/pages.json"
+clipped=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" "$cdp_port" <<'EOF'
+import importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("seat_ui", loader)
+ui = importlib.util.module_from_spec(spec)
+loader.exec_module(ui)
+state = {"title": "Fake page - Chromium", "geometry": [0, 0, 800, 600], "origin": [0, 0, 1.5], "scale": 1.5}
+print(json.dumps({item["name"]: [item["x"], item["y"]] for item in ui.cdp_tree(state, int(sys.argv[2]))}))
+EOF
+) || fail "ui reads a page with overflow containers over DevTools" "$clipped"
+[[ $(jq -c '.Send' <<<"$clipped") == "[90,45]" && $(jq -r 'has("Message")' <<<"$clipped") == "false" ]] || fail "the DevTools route places a control on the part its overflow ancestors show, and leaves out one they hide" "$clipped"
+pass "the DevTools route places a control on the part its overflow ancestors show, and leaves out one they hide"
 
 # Tabs and windows alike can share a title: a page is the window's only when it
 # is the tab the window shows, in a window of the window's size, and never just
@@ -710,6 +783,17 @@ found=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-ui 3 --fi
 clicked=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-click-ui 3 sEND 2>&1)
 [[ $clicked == "Clicked button \"Send\" at 90,210" && $(<"$test_dir/placed/pointer.args") == "3 click 90 210" ]] || fail "click-ui clicks a full name in any case" "$clicked"
 pass "click-ui clicks only a full name, in any case, and lists a partial one as a candidate"
+
+# A sticky header or a dialog on top of a control would take the click: ui
+# asks the page what is at the control's centre, and click-ui refuses when it
+# is not the control or something inside it.
+echo '[{"id": "1", "title": "Fake page", "visible": true, "window": [800, 600], "inner": [800, 500], "cover": 5}]' >"$test_dir/pages.json"
+rm -f "$test_dir/placed/pointer.args"
+clicked=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-click-ui 3 Send 2>&1)
+(( $? == 1 )) && [[ $clicked == "Not clicking Send in window 3: another element, <a#n5>, is on top of it at its centre."* && ! -e $test_dir/placed/pointer.args ]] || fail "click-ui refuses a control another element covers" "$clicked"
+listed=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-ui 3 --find Send 2>&1)
+grep -q "^Window 3: another element, <a#n5>, is on top of it at its centre" <<<"$listed" && grep -q '^button "Send" @90,210$' <<<"$listed" || fail "ui --find says another element covers a control" "$listed"
+pass "click-ui refuses a control another element covers, and ui --find says so"
 
 # click-ui hands --page to ui and the rest to the pointer.
 mkdir -p "$test_dir/stubs"

@@ -51,6 +51,14 @@ if [[ -n $unverified ]]; then
   exit 1
 fi
 
+# In a browser page, ui asks what is at the control's centre: a sticky header
+# or a dialog on top of it would take the click.
+covered=$(jq -r '.covered // empty' <<<"$control")
+if [[ -n $covered ]]; then
+  echo "Not clicking $query in window $window: $covered. Close or scroll that away, or click by coordinates on omarchy agent seat screenshot $window." >&2
+  exit 1
+fi
+
 read -r x y < <(jq -r '"\(.x) \(.y)"' <<<"$control")
 omarchy-agent-seat-pointer "$window" click "$x" "$y" "${click[@]}" || exit
 jq -r '"Clicked \(.role) \(.name | @json) at \(.x),\(.y)"' <<<"$control"

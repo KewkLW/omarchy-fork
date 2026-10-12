@@ -16,6 +16,13 @@
 # rather than read the wrong one; --page picks one by that number, or a page
 # by part of its URL.
 #
+# A control is placed at the centre of the part of it that shows within the
+# scroll panes, viewports and tables around it, below a table's column header,
+# and in a page within every element whose overflow is not visible; one that
+# shows only a sliver is left out. In a page, --find also asks what is at that
+# centre, and marks the control covered when another element, a sticky header
+# or a dialog, would take a click there: click-ui refuses to click it.
+#
 # A browser page beside a side panel or above docked DevTools sits where
 # DevTools does not say: ui still lists it, warning that the positions are
 # unverified, and click-ui refuses to click there.
@@ -57,6 +64,13 @@ ACTIONABLE = {
   "option", "switch", "tab", "treeitem", "spinbutton", "listbox", "textarea",
 }
 POPUP_ROLES = {"window", "menu", "popup menu", "tool tip", "tooltip", "combo box", "list"}
+# Containers that show their children only within their own bounds: what
+# scrolls past their edges is hidden. A table also hides the rows scrolled
+# under its column headers.
+CLIPPING = {"scroll pane", "viewport", "page tab list", "table", "tree table", "tree", "list", "list box"}
+HEADERS = {"table column header", "column header"}
+# GTK reports a page tab at the size of its label, with its page under it.
+LABELLED = {"page tab"}
 STATES = ("focused", "checked", "pressed", "selected", "expanded", "collapsed", "editable", "active")
 
 
@@ -209,6 +223,12 @@ class Space:
 
   def box(self, x, y, width, height):
     return [round((x - self.left) * self.scale), round((y - self.top) * self.scale), round(width * self.scale), round(height * self.scale)]
+
+
+def intersect(a, b):
+  """The part two boxes share, empty (of no size) when they share none."""
+  left, top = max(a[0], b[0]), max(a[1], b[1])
+  return [left, top, max(0, min(a[0] + a[2], b[0] + b[2]) - left), max(0, min(a[1] + a[3], b[1] + b[3]) - top)]
 
 
 def node(role, name, value, states, box, depth, shown=None):
@@ -436,8 +456,23 @@ def flatten(accessible, offset, space, bounds, nodes, depth, parent_name=None, p
   if shown and (named or accessible["role"] in ACTIONABLE or depth == 0) and (depth == 0 or part):
     nodes.append(node(accessible["role"], accessible["name"], accessible["value"], accessible["states"], box, depth, part if depth else None))
     depth += 1
+
+  # What of the children shows: a scroll pane, viewport, list or table hides
+  # what scrolls past its edges, and a table's rows what scrolls under its
+  # column headers. Any other control smaller than a child hides the rest of
+  # it too, but for a page tab, which is the size of its label.
+  role, inner, headers = accessible["role"], bounds, None
+  if shown and role in CLIPPING:
+    inner = intersect(bounds, box)
+    bands = [space.box(c["extents"][0] - offset[0], c["extents"][1] - offset[1], *c["extents"][2:]) for c in accessible["children"] if c["role"] in HEADERS and min(c["extents"][2:]) > 0 and min(c["extents"][:2]) > -1000000]
+    headers = max((band[1] + band[3] for band in bands), default=None)
   for child in accessible["children"]:
-    flatten(child, offset, space, bounds, nodes, depth, accessible["name"] or parent_name, popups, claimed)
+    clip = inner
+    if shown and role not in LABELLED and (child["extents"][2] > width or child["extents"][3] > height):
+      clip = intersect(clip, box)
+    if headers is not None and child["role"] not in HEADERS and headers > clip[1]:
+      clip = intersect(clip, [clip[0], headers, clip[2], clip[1] + clip[3] - headers])
+    flatten(child, offset, space, clip, nodes, depth, accessible["name"] or parent_name, popups, claimed)
 
 
 # Chrome DevTools protocol ---------------------------------------------------------
@@ -685,6 +720,96 @@ def cdp_target(port, title, size=None, page=None):
   return chosen[0]
 
 
+# Where the part of a node its ancestors do not clip lies, in its frame's CSS
+# pixels, after where its own box is: [own left, own top, left, top, right,
+# bottom]. Only an ancestor that contains the node clips it, which for a node
+# placed absolutely or fixed is not its parent.
+CLIP = """function () {
+  const element = this.nodeType === 1 ? this : this.parentElement;
+  if (!element) return null;
+  let own;
+  if (this.nodeType === 1) {
+    own = this.getBoundingClientRect();
+  } else {
+    const range = element.ownerDocument.createRange();
+    range.selectNodeContents(this);
+    own = range.getBoundingClientRect();
+  }
+  const view = element.ownerDocument.defaultView;
+  const root = element.ownerDocument;
+  const up = (node) => node.parentElement || (node.parentNode && node.parentNode.host) || null;
+  const contains = (style) => style.transform !== "none" || style.perspective !== "none" || style.filter !== "none" || /paint|layout|strict|content/.test(style.contain) || /transform|perspective|filter/.test(style.willChange);
+  let [left, top, right, bottom] = [0, 0, view.innerWidth, view.innerHeight];
+  let position = view.getComputedStyle(element).position;
+  for (let node = up(element); node; node = up(node)) {
+    const style = view.getComputedStyle(node);
+    if (position === "fixed" ? !contains(style) : position === "absolute" ? style.position === "static" && !contains(style) : false) continue;
+    position = style.position;
+    if (node === root.documentElement || node === root.body) continue;
+    const clipsX = style.overflowX !== "visible", clipsY = style.overflowY !== "visible";
+    if (!clipsX && !clipsY) continue;
+    const rect = node.getBoundingClientRect();
+    const x = rect.left + node.clientLeft, y = rect.top + node.clientTop;
+    if (clipsX) { left = Math.max(left, x); right = Math.min(right, x + node.clientWidth); }
+    if (clipsY) { top = Math.max(top, y); bottom = Math.min(bottom, y + node.clientHeight); }
+  }
+  return [own.left, own.top, left, top, right, bottom];
+}"""
+
+
+def overflow_clips(devtools, backends):
+  """What CLIP says of each node of backends ({node id: backend DOM node id}), where the page says."""
+  group = "omarchy-agent-seat-ui"
+  resolved = {devtools.send("DOM.resolveNode", {"backendNodeId": backend, "objectGroup": group}): node_id for node_id, backend in backends.items()}
+  answers = devtools.collect(resolved)
+  calls = {}
+  for request, node_id in resolved.items():
+    object_id = ((answers[request].get("result") or {}).get("object") or {}).get("objectId")
+    if object_id:
+      calls[devtools.send("Runtime.callFunctionOn", {"objectId": object_id, "functionDeclaration": CLIP, "returnByValue": True})] = node_id
+  answers = devtools.collect(calls)
+  devtools.collect([devtools.send("Runtime.releaseObjectGroup", {"objectGroup": group})])
+  clips = {}
+  for request, node_id in calls.items():
+    value = ((answers[request].get("result") or {}).get("result") or {}).get("value")
+    if isinstance(value, list) and len(value) == 6 and all(isinstance(v, (int, float)) for v in value):
+      clips[node_id] = value
+  return clips
+
+
+def covered_at(devtools, backend, x, y):
+  """Why a click at x, y, in the page's CSS pixels, would not reach the node backend, or None when it would.
+
+  It reaches the node or any node inside it, and, for text, the element the
+  text is in.
+  """
+  try:
+    at = devtools.call("DOM.getNodeForLocation", {"x": round(x), "y": round(y), "includeUserAgentShadowDOM": False}).get("backendNodeId")
+    if at is None:
+      return "DevTools did not say what is at its centre"
+    target = devtools.call("DOM.describeNode", {"backendNodeId": backend, "depth": -1, "pierce": True})["node"]
+    inside, stack = set(), [target]
+    while stack:
+      item = stack.pop()
+      inside.add(item.get("backendNodeId"))
+      stack += item.get("children", []) + item.get("shadowRoots", []) + item.get("pseudoElements", []) + ([item["contentDocument"]] if item.get("contentDocument") else [])
+    if at in inside:
+      return None
+    hit = devtools.call("DOM.describeNode", {"backendNodeId": at, "depth": 1})["node"]
+    if target.get("nodeType") == 3 and backend in [child.get("backendNodeId") for child in hit.get("children", [])]:
+      return None
+  except (OSError, ValueError, RuntimeError, ConnectionError, KeyError, TypeError) as error:
+    return f"DevTools did not say what is at its centre ({error})"
+  attributes = dict(zip(hit.get("attributes", [])[0::2], hit.get("attributes", [])[1::2]))
+  label = (hit.get("localName") or hit.get("nodeName", "")).lower() + (f"#{attributes['id']}" if attributes.get("id") else "") + "".join(f".{name}" for name in attributes.get("class", "").split()[:3])
+  return f"another element, <{label}>, is on top of it at its centre"
+
+
+class Nodes(list):
+  """A window's controls, and for a page, covered(control): what would take a click at its centre instead."""
+  covered = None
+
+
 def cdp_tree(state, port, page=None):
   target = cdp_target(port, state.get("title", ""), state["geometry"][2:], page)
   if not target:
@@ -732,7 +857,8 @@ def cdp_tree(state, port, page=None):
   requests = {devtools.send("DOM.getBoxModel", {"backendNodeId": item["backendDOMNodeId"]}): item for item in wanted[:MAX_NODES]}
   answers = devtools.collect(requests)
 
-  nodes = []
+  # The box of each control some of which lies in the viewport, in CSS pixels.
+  boxes = {}
   for request, item in requests.items():
     model = answers[request].get("result", {}).get("model")
     if not model:
@@ -740,8 +866,12 @@ def cdp_tree(state, port, page=None):
     quad = model["border"]
     xs, ys = quad[0::2], quad[1::2]
     x, y, width, height = min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)
-    if width <= 0 or height <= 0:
-      continue
+    if width > 0 and height > 0 and space.shown(space.box(left + x * zoom, top + y * zoom, width * zoom, height * zoom), viewport):
+      boxes[item["nodeId"]] = (item, (x, y, width, height))
+  clips = overflow_clips(devtools, {node_id: item["backendDOMNodeId"] for node_id, (item, _) in boxes.items()})
+
+  nodes, backends = [], {}
+  for node_id, (item, (x, y, width, height)) in boxes.items():
     properties = {p["name"]: (p.get("value") or {}).get("value") for p in item.get("properties", [])}
     flags = [name for name in STATES if properties.get(name) in (True, "true", "mixed")]
     if properties.get("expanded") is False:
@@ -750,11 +880,20 @@ def cdp_tree(state, port, page=None):
       flags.append("disabled")
     role = item["role"]["value"]
     box = space.box(left + x * zoom, top + y * zoom, width * zoom, height * zoom)
-    part = space.shown(box, viewport)
+    # A scroll pane, or any other element whose overflow is not visible, hides
+    # what lies past its edges. The clip is in the coordinates of the control's
+    # own frame, its box in the page's.
+    bounds = viewport
+    if node_id in clips:
+      own_left, own_top, clip_left, clip_top, clip_right, clip_bottom = clips[node_id]
+      dx, dy = x - own_left, y - own_top
+      bounds = intersect(viewport, space.box(left + (clip_left + dx) * zoom, top + (clip_top + dy) * zoom, max(0, clip_right - clip_left) * zoom, max(0, clip_bottom - clip_top) * zoom))
+    part = space.shown(box, bounds)
     if not part:
       continue  # scrolled out of view, or all but a sliver
     value = (item.get("value") or {}).get("value")
     nodes.append({**node(role, (item.get("name") or {}).get("value", "") or "", value if role != "textbox" or not properties.get("protected") else None, flags, box, 0, part), "id": item["nodeId"]})
+    backends[id(nodes[-1])] = item["backendDOMNodeId"]
 
   # Indent by listed ancestors only, like the AT-SPI listing.
   listed = {item["id"] for item in nodes}
@@ -766,7 +905,13 @@ def cdp_tree(state, port, page=None):
     item["depth"] = level
     if unverified:
       item["unverified"] = unverified  # click-ui refuses a control marked so
-  return nodes
+
+  # What lies on top of a control, a sticky header or a dialog, is known only
+  # by asking the page what is at the point: the screenshot pixels back to CSS
+  # ones.
+  result = Nodes(nodes)
+  result.covered = lambda item: covered_at(devtools, backends[id(item)], ((item["x"] / (space.scale or 1) + space.left) - left) / zoom, ((item["y"] / (space.scale or 1) + space.top) - top) / zoom)
+  return result
 
 
 # Finding one control ---------------------------------------------------------------
@@ -865,6 +1010,7 @@ def main(args):
   if not nodes or len(nodes) < 2:
     fail(f"Window {window} has no accessibility tree to read (an app without one, like Wine, a game or a canvas, or Electron without --cdp). Use omarchy agent seat screenshot {window}.", 2)
 
+  listed = nodes
   if query is not None:
     found = find(nodes, query, substring=not exact)
     # A name that only contains the query ("Delete" in "Delete account") is
@@ -875,6 +1021,9 @@ def main(args):
     if len(found) != 1:
       fail(f"No control matches {query!r} in window {window}" if not found else f"{len(found)} controls match {query!r} in window {window}:\n" + "\n".join("  " + describe(n) for n in found))
     nodes = found
+    covered = listed.covered(nodes[0]) if getattr(listed, "covered", None) else None
+    if covered:
+      nodes[0] = {**nodes[0], "covered": covered}  # click-ui refuses a control marked so
 
   unverified = nodes[0].get("unverified")
   if as_json:
@@ -882,6 +1031,8 @@ def main(args):
   else:
     if unverified:
       print(f"Window {window}: {unverified}, so where the page sits in the window, and the positions below, are a guess that click-ui will not click. Close that, or click by coordinates on omarchy agent seat screenshot {window}.", file=sys.stderr)
+    if nodes[0].get("covered"):
+      print(f"Window {window}: {nodes[0]['covered']}, so click-ui will not click it there.", file=sys.stderr)
     for item in nodes:
       print("  " * (0 if query is not None else item["depth"]) + describe(item))
 
