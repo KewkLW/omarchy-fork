@@ -860,6 +860,15 @@ def modifiers(seat, problems):
     check(problems, "the user's key reaches the app", [name for name, _ in events][-1:], ["key"])
     check(problems, "the app's modifiers when the user's key arrives", [tuple(args[1:]) for name, args in events if name == "modifiers"][-1:], [held])
 
+def translucent(seat, problems):
+    # A red window under a green subsurface at half opacity, premultiplied.
+    seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, RED)
+    seat.subsurface(23, 20, 5, 5)
+    seat.draw(23, 10, 10, b"\x00\x80\x00\x80", ARGB)
+    check(problems, "a translucent subsurface over red", seat.pixel(22, 6, 6), "7f8000")
+    check(problems, "the window beside it", seat.pixel(22, 1, 1), "ff0000")
+
 problems = []
 globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
 print("; ".join(problems) or "ok")
@@ -877,6 +886,10 @@ pass "an app can't set the clipboard with the user's input from before the agent
 result=$(inproc modifiers)
 [[ $result == "ok" ]] || fail "a modifier the user holds through the agent's typing still applies to the user's next key" "$result"
 pass "a modifier the user holds through the agent's typing still applies to the user's next key"
+
+result=$(inproc translucent)
+[[ $result == "ok" ]] || fail "a screenshot blends a translucent layer over what is under it" "$result"
+pass "a screenshot blends a translucent layer over what is under it"
 
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 

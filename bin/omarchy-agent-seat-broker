@@ -427,6 +427,24 @@ def screenshot_path(path, caller):
   return os.path.join(folder, os.path.basename(path))
 
 
+def blend(canvas, target, pixels):
+  """Draw premultiplied ARGB8888 pixels over the canvas at target.
+
+  Opaque runs, and runs over nothing drawn yet, are copied; only translucent
+  pixels over something are blended one by one, so a translucent window on
+  its own costs no more than an opaque one.
+  """
+  pixels = pixels[: len(pixels) - len(pixels) % 4]
+  alphas = pixels[3::4]
+  for run in re.finditer(rb"\xff+|[^\xff]+", alphas):
+    start, end = run.start() * 4, run.end() * 4
+    under = canvas[target + start : target + end]
+    if alphas[run.start()] == 255 or under.count(0) == len(under):
+      canvas[target + start : target + end] = pixels[start:end]
+    else:
+      canvas[target + start : target + end] = bytes(min(255, pixels[start + i] + (under[i] * (255 - alphas[run.start() + i // 4]) + 127) // 255) for i in range(end - start))
+
+
 def write_png(path, canvas, width, height):
   rows, rgb = bytearray(), bytearray(width * 3)
   for y in range(height):
@@ -1002,7 +1020,8 @@ class Client:
         continue
       # Read rather than map: the app can shrink its pool at any moment, and
       # touching a mapping past the end of the file kills the broker with
-      # SIGBUS. Whatever is missing stays black.
+      # SIGBUS. Whatever is missing stays black. Translucent layers blend over
+      # what is under them; XRGB8888 has no alpha and covers it.
       end = min(pool.size, os.fstat(pool.fd).st_size)
       for row in range(rows):
         source = offset + (sy + row) * stride + sx * 4
@@ -1010,7 +1029,10 @@ class Client:
           continue
         pixels = os.pread(pool.fd, min(columns * 4, end - source), source)
         target = ((dy + row) * width + dx) * 4
-        canvas[target : target + len(pixels)] = pixels
+        if format == 0:
+          blend(canvas, target, pixels)
+        else:
+          canvas[target : target + len(pixels)] = pixels
 
     return canvas, width, height, (left, top, scale)
 
