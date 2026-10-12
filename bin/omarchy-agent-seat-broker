@@ -760,8 +760,12 @@ class Client:
     self.buffers[new_id] = (width, height, (self.pools[pool], offset, stride, format))
     return True
 
+  # A single pixel buffer is one colour, which the broker keeps as the
+  # premultiplied ARGB8888 pixel it draws.
+
   def request_wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(self, _, args):
-    self.buffers[args[0]] = (1, 1, None)
+    red, green, blue, alpha = (round(value * 255 / 0xFFFFFFFF) for value in args[1:5])
+    self.buffers[args[0]] = (1, 1, bytes((blue, green, red, alpha)))
     return True
 
   # GPU buffers are opaque to the broker, but their size still places the
@@ -1081,8 +1085,15 @@ class Client:
     return x, y, right, bottom, w / (width or 1), h / (height or 1)
 
   def scale(self, toplevel):
-    surface = self.xdg_surfaces[self.toplevels[toplevel]["xdg"]]["surface"]
-    return self.crop(surface)[4] if self.size(surface)[0] and self.surfaces[surface]["buffer"] else 1
+    """Screenshot pixels per surface unit: the window's buffer pixels per
+    unit, or when the window is one colour stretched, the most any of its
+    other layers has."""
+    xdg = self.toplevels[toplevel]["xdg"]
+    surface = self.xdg_surfaces[xdg]["surface"]
+    if self.size(surface)[0] and self.surfaces[surface]["buffer"] and not isinstance(self.surfaces[surface]["buffer"][2], bytes):
+      return self.crop(surface)[4]
+    drawn = [self.crop(layer)[4] for layer, _, _ in self.layers(xdg, 0, 0) if self.size(layer)[0] and self.surfaces[layer]["buffer"] and isinstance(self.surfaces[layer]["buffer"][2], tuple)]
+    return max(drawn, default=1)
 
   def capture(self, toplevel):
     """Compose the window, its subsurfaces and its popups from their shared memory buffers."""
@@ -1108,8 +1119,9 @@ class Client:
       raise ValueError(f"the window is {width}x{height} pixels, more than a screenshot can hold")
     canvas = bytearray(width * height * 4)
 
-    for (buffer_width, buffer_height, (pool, offset, stride, format)), (cx, cy, right, bottom, rx, ry), x, y, gx, gy, gw, gh, transform in layers:
-      if format not in (0, 1):  # ARGB8888 and XRGB8888, what apps draw with
+    for (buffer_width, buffer_height, source), (cx, cy, right, bottom, rx, ry), x, y, gx, gy, gw, gh, transform in layers:
+      solid = isinstance(source, bytes)
+      if not solid and source[3] not in (0, 1):  # ARGB8888 and XRGB8888, what apps draw with
         continue
       sx, sy = cx + gx * rx, cy + gy * ry
       dx, dy = round((x - left) * scale), round((y - top) * scale)
@@ -1123,6 +1135,12 @@ class Client:
       rows = [row for row in (int(sy + (i + 0.5) * ry / scale) for i in range(min(round(gh * scale), height - dy))) if row < bottom]
       if not columns or not rows:
         continue
+      if solid:
+        # One colour, stretched over the whole layer.
+        for row in range(len(rows)):
+          blend(canvas, ((dy + row) * width + dx) * 4, source * len(columns))
+        continue
+      pool, offset, stride, format = source
       first, span = columns[0], columns[-1] + 1 - columns[0]
       # Read rather than map: the app can shrink its pool at any moment, and
       # touching a mapping past the end of the file kills the broker with

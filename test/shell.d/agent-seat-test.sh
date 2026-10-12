@@ -760,7 +760,7 @@ broker = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.
 loader.exec_module(broker)
 
 SEAT, COMPOSITOR, WM, SHM, SUBCOMPOSITOR, DATA = 2, 3, 4, 5, 6, 7
-KEYBOARD, POINTER, DEVICE, SOURCE, VIEWPORTER = 8, 9, 10, 11, 12
+KEYBOARD, POINTER, DEVICE, SOURCE, VIEWPORTER, SINGLE_PIXEL = 8, 9, 10, 11, 12, 13
 ARGB, XRGB = 0, 1
 
 class Seat:
@@ -774,7 +774,7 @@ class Seat:
         self.hyprland = listener.accept()[0]
         self.client.pid = 0
         self.broker.clients.append(self.client)
-        self.client.objects.update({SEAT: ("wl_seat", 7), COMPOSITOR: ("wl_compositor", 6), WM: ("xdg_wm_base", 6), SHM: ("wl_shm", 1), SUBCOMPOSITOR: ("wl_subcompositor", 1), DATA: ("wl_data_device_manager", 3), VIEWPORTER: ("wp_viewporter", 1)})
+        self.client.objects.update({SEAT: ("wl_seat", 7), COMPOSITOR: ("wl_compositor", 6), WM: ("xdg_wm_base", 6), SHM: ("wl_shm", 1), SUBCOMPOSITOR: ("wl_subcompositor", 1), DATA: ("wl_data_device_manager", 3), VIEWPORTER: ("wp_viewporter", 1), SINGLE_PIXEL: ("wp_single_pixel_buffer_manager_v1", 1)})
         self.next_pool = 1000
 
     def send(self, kind, object_id, name, *args):
@@ -993,6 +993,30 @@ def transform(seat, problems):
     seat.draw(20, 40, 30, corner, transform=7)
     check(problems, "its top left corner flipped and turned 270 degrees", [seat.pixel(22, x, y) for x, y in ((25, 30), (29, 39), (24, 35), (27, 29), (27, 5))], ["00ff00", "00ff00", "ff0000", "ff0000", "ff0000"])
 
+def single_pixel(seat, problems):
+    # A window that is one red pixel stretched to 40x30, under a subsurface
+    # that is one half transparent green pixel stretched to 10x10 at 5,5.
+    full, half = 0xFFFFFFFF, 0x80000000
+    seat.window(20, 21, 22)
+    seat.request(VIEWPORTER, "get_viewport", 23, 20)
+    seat.request(23, "set_destination", 40, 30)
+    seat.request(SINGLE_PIXEL, "create_u32_rgba_buffer", 24, full, 0, 0, full)
+    seat.request(20, "attach", 24, 0, 0)
+    seat.request(20, "commit")
+    check(problems, "a window of one stretched pixel", (seat.size(22), seat.colours(22)), ("40x30", ["ff0000"]))
+    seat.subsurface(25, 20, 5, 5)
+    seat.request(VIEWPORTER, "get_viewport", 26, 25)
+    seat.request(26, "set_destination", 10, 10)
+    seat.request(SINGLE_PIXEL, "create_u32_rgba_buffer", 27, 0, half, 0, half)
+    seat.request(25, "attach", 27, 0, 0)
+    seat.request(25, "commit")
+    seat.request(20, "commit")
+    check(problems, "a half transparent green pixel over red", [seat.pixel(22, x, y) for x, y in ((5, 5), (14, 14), (15, 15), (4, 4))], ["7f8000", "7f8000", "ff0000", "ff0000"])
+    # Drawn in memory at scale 2, the subsurface sets the screenshot's scale.
+    seat.draw(25, 20, 20, GREEN, scale=2)
+    seat.request(20, "commit")
+    check(problems, "a one colour window with a scale 2 subsurface", (seat.size(22), seat.pixel(22, 9, 9), seat.pixel(22, 10, 10)), ("80x60", "ff0000", "00ff00"))
+
 problems = []
 globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
 print("; ".join(problems) or "ok")
@@ -1034,6 +1058,10 @@ pass "screenshots and clicks follow subsurfaces moved above or below each other 
 result=$(inproc transform)
 [[ $result == "ok" ]] || fail "a screenshot turns and flips a buffer by its transform" "$result"
 pass "a screenshot turns and flips a buffer by its transform"
+
+result=$(inproc single_pixel)
+[[ $result == "ok" ]] || fail "a screenshot draws single pixel buffers as their colour, stretched and blended" "$result"
+pass "a screenshot draws single pixel buffers as their colour, stretched and blended"
 
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 
