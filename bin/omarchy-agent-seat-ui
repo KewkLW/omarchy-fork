@@ -1,15 +1,18 @@
 #!/usr/bin/python3
 
 # omarchy:summary=Read the controls of an agent seat window by name, role and position
-# omarchy:args=<window> [--json] [--find <name> | --find <role>:<name>]
-# omarchy:examples=omarchy agent seat ui 1 | omarchy agent seat ui 1 --find button:Save --json
+# omarchy:args=<window> [--json] [--find <name> | --find <role>:<name>] [--page <selector>]
+# omarchy:examples=omarchy agent seat ui 1 | omarchy agent seat ui 1 --find button:Save --json | omarchy agent seat ui 1 --page 2
 
 # Lists what an app on the agent seat shows, from its accessibility tree rather
 # than its pixels: each control's role, name, value and state, and its centre
 # in the pixels omarchy agent seat pointer takes (those of the window's last
 # screenshot). GTK and Qt apps publish the tree on their sandbox's private bus;
 # Chromium and Electron apps launched with omarchy agent seat run --cdp are read
-# over the DevTools protocol instead, which knows the page far better.
+# over the DevTools protocol instead, which knows the page far better. When
+# several visible pages share the window's title and size, it refuses with
+# exit 1 and numbers them rather than read the wrong one; --page picks one by
+# that number or by part of its URL.
 #
 # --find resolves one control: an exact name, then a case-insensitive one, then
 # a unique substring, optionally narrowed by role ("button:Save"). Several
@@ -479,10 +482,12 @@ def window_sizes(port, targets):
   return sizes
 
 
-def cdp_target(port, title, size=None):
+def cdp_target(port, title, size=None, page=None):
   """The page the window titled title (of logical size size) shows, None when it shows none.
 
-  Raises Ambiguous when several shown pages fit the window equally well.
+  Raises Ambiguous when several shown pages fit the window equally well, or
+  when page, a number from the refusal's list or part of a URL, does not pick
+  exactly one of them.
   """
   with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5) as response:
     targets = [t for t in json.load(response) if t.get("type") == "page" and t.get("webSocketDebuggerUrl") and not t.get("url", "").startswith("devtools://")]
@@ -495,13 +500,29 @@ def cdp_target(port, title, size=None):
     sizes = window_sizes(port, candidates)
     fitting = [t for t in candidates if t["id"] in sizes and near(sizes[t["id"]], size)]
     candidates = fitting or candidates
-  if len(candidates) > 1:
-    raise Ambiguous(f"{len(candidates)} pages are shown in windows titled {title!r}, and DevTools cannot tell which is this one:\n" + "\n".join(f"  {html.unescape(t.get('title') or '')!r} {t.get('url', '')}" for t in candidates))
-  return candidates[0] if candidates else None
+  if not candidates:
+    return None
+  # Numbered by target id, which stays the same from one call to the next.
+  candidates.sort(key=lambda t: t["id"])
+  chosen = candidates
+  if page is not None:
+    if page.isdigit() and 1 <= int(page) <= len(candidates):
+      chosen = [candidates[int(page) - 1]]
+    else:
+      needle = page.lower()
+      chosen = [t for t in candidates if needle in t.get("url", "").lower() or needle in urllib.parse.unquote(t.get("url", "")).lower()]
+  if len(chosen) != 1:
+    if page is None:
+      reason = f"{len(candidates)} pages are shown in windows titled {title!r}, and DevTools cannot tell which is this one:"
+    else:
+      reason = f"--page {page!r} matches {len(chosen) or 'none'} of the {len(candidates)} pages shown in windows titled {title!r}:"
+    listing = "\n".join(f"{number}. {html.unescape(t.get('title') or '')} — {t.get('url', '')}" for number, t in enumerate(candidates, 1))
+    raise Ambiguous(f"{reason}\n{listing}\nRerun with --page N to pick one (its number above, or part of its URL).")
+  return chosen[0]
 
 
-def cdp_tree(state, port):
-  target = cdp_target(port, state.get("title", ""), state["geometry"][2:])
+def cdp_tree(state, port, page=None):
+  target = cdp_target(port, state.get("title", ""), state["geometry"][2:], page)
   if not target:
     return None
   devtools = DevTools(target["webSocketDebuggerUrl"])
@@ -612,17 +633,19 @@ def main(args):
     atspi_dump(args[1])
     return
 
-  as_json, query, positional = False, None, []
+  as_json, query, page, positional = False, None, None, []
   while args:
     arg = args.pop(0)
     if arg == "--json":
       as_json = True
     elif arg == "--find" and args:
       query = args.pop(0)
+    elif arg == "--page" and args:
+      page = args.pop(0)
     else:
       positional.append(arg)
   if len(positional) != 1 or not positional[0].isdigit():
-    fail("Usage: omarchy agent seat ui <window> [--json] [--find <name> | --find <role>:<name>]")
+    fail("Usage: omarchy agent seat ui <window> [--json] [--find <name> | --find <role>:<name>] [--page <selector>]")
   window = int(positional[0])
 
   state = window_state(window)
@@ -637,9 +660,9 @@ def main(args):
     port = cdp_port(candidate)
     if port:
       try:
-        nodes, source = cdp_tree(state, port), "cdp"
+        nodes, source = cdp_tree(state, port, page), "cdp"
       except Ambiguous as error:
-        fail(f"{error}\nClose the others, or use omarchy agent seat screenshot {window}.")
+        fail(str(error))
       except (OSError, ValueError, RuntimeError, ConnectionError, KeyError) as error:
         print(f"DevTools on port {port} did not answer: {error}", file=sys.stderr)
     if not nodes and bus_address(candidate):

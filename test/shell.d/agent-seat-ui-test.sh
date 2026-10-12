@@ -475,6 +475,67 @@ pass "the DevTools route reads the page the window shows, among others of the sa
 jq -r '.windows' <<<"$twins" | grep -q "https://example.com/3" || fail "a refusal lists the pages it could not tell apart" "$twins"
 pass "the DevTools route refuses to guess between windows showing the same title, and lists them"
 
+# --page picks one of the pages a refusal numbers, in the order of their target
+# ids rather than the order DevTools lists them in, by its number or by part of
+# its URL.
+picked=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" "$cdp_port" "$test_dir/pages.json" <<'EOF'
+import importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("seat_ui", loader)
+ui = importlib.util.module_from_spec(spec)
+loader.exec_module(ui)
+
+twins = [{"id": "7", "title": "Twin", "visible": True, "window": [800, 600]}, {"id": "5", "title": "Twin", "visible": True, "window": [800, 600]}]
+
+def pick(pages, page):
+  with open(sys.argv[3], "w") as pages_file:
+    json.dump(pages, pages_file)
+  try:
+    return (ui.cdp_target(int(sys.argv[2]), "Twin - Chromium", [800, 600], page) or {}).get("webSocketDebuggerUrl", "none")
+  except ui.Ambiguous as error:
+    return f"refused: {error}"
+
+print(json.dumps({
+  "refused": pick(twins, None),
+  "number": pick(twins, "2"),
+  "url": pick(twins, "COM/5"),
+  "nowhere": pick(twins, "nowhere"),
+  "single": pick(twins[:1], "1"),
+}))
+EOF
+) || fail "ui picks a page with --page" "$picked"
+
+refusal=$(jq -r '.refused' <<<"$picked")
+[[ $(sed -n 2,3p <<<"$refusal") == $'1. Twin — https://example.com/5\n2. Twin — https://example.com/7' ]] || fail "a refusal numbers the pages by their target ids" "$refusal"
+[[ $(tail -n 1 <<<"$refusal") == "Rerun with --page N to pick one (its number above, or part of its URL)." ]] || fail "a refusal ends by saying how to pick a page" "$refusal"
+pass "a refusal numbers the pages by their target ids and says how to pick one"
+[[ $(jq -r '.number' <<<"$picked") == */devtools/page/7 ]] || fail "--page picks a page by its number" "$picked"
+pass "--page picks a page by its number"
+[[ $(jq -r '.url' <<<"$picked") == */devtools/page/5 ]] || fail "--page picks a page by part of its URL, in any case" "$picked"
+pass "--page picks a page by part of its URL, in any case"
+nowhere=$(jq -r '.nowhere' <<<"$picked")
+[[ $nowhere == "refused: --page 'nowhere' matches none"* ]] && grep -q "^1\. Twin — https://example.com/5$" <<<"$nowhere" && grep -q "^2\. Twin — https://example.com/7$" <<<"$nowhere" || fail "--page matching no page refuses and lists the pages" "$nowhere"
+pass "--page matching no page refuses and lists the pages"
+[[ $(jq -r '.single' <<<"$picked") == */devtools/page/7 ]] || fail "--page 1 reads the only page" "$picked"
+pass "--page 1 reads the only page shown"
+
+# click-ui hands --page to ui and the rest to the pointer.
+mkdir -p "$test_dir/stubs"
+cat >"$test_dir/stubs/omarchy-agent-seat-ui" <<EOF
+#!/bin/bash
+echo "\$*" >"$test_dir/stubs/ui.args"
+echo '{"role": "button", "name": "Send", "x": 1, "y": 2}'
+EOF
+cat >"$test_dir/stubs/omarchy-agent-seat-pointer" <<EOF
+#!/bin/bash
+echo "\$*" >"$test_dir/stubs/pointer.args"
+EOF
+chmod +x "$test_dir/stubs/omarchy-agent-seat-ui" "$test_dir/stubs/omarchy-agent-seat-pointer"
+clicked=$(PATH="$test_dir/stubs:$ROOT/bin:$PATH" omarchy-agent-seat-click-ui 3 Send --page 2 --double 2>&1) || fail "click-ui runs with --page" "$clicked"
+[[ $(<"$test_dir/stubs/ui.args") == "3 --find Send --json --page 2" ]] || fail "click-ui hands --page to ui" "$(<"$test_dir/stubs/ui.args")"
+[[ $(<"$test_dir/stubs/pointer.args") == "3 click 1 2 --double" ]] || fail "click-ui keeps --page from the pointer" "$(<"$test_dir/stubs/pointer.args")"
+pass "click-ui hands --page to ui and the other options to the pointer"
+
 # Stopping ----------------------------------------------------------------------------
 
 seat omarchy-agent-seat-stop >/dev/null
