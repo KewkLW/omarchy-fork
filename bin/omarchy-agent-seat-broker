@@ -116,6 +116,8 @@ MAX_CAPTURE_SIZE = 4096  # pixels a side: a 4K screen, and at most 64 MiB of can
 MAX_CAPTURE_SCALE = 4  # screenshot pixels per surface unit, beyond any real output scale
 CAPTURE_SECONDS = 10  # to compose and write one screenshot
 MAX_CAPTURES = 2  # screenshots being taken at once
+SNAPSHOT_SECONDS = 2  # after a screenshot, how long an app's commits keep a copy of their pixels
+SNAPSHOT_BYTES = 64 << 20  # and at most how much one app keeps
 
 BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112}
 XDG_STATE_ACTIVATED = 4
@@ -569,7 +571,7 @@ class Plan:
 
   def __init__(self, layers, origin, width, height):
     self.layers, self.origin, self.width, self.height = layers, origin, width, height
-    self.pools = [buffer[2][0] for buffer, *_ in layers if isinstance(buffer[2], tuple)]
+    self.pools = [buffer[2][0] for buffer, *_ in layers if isinstance(buffer[2], tuple) and isinstance(buffer[2][0], Pool)]
     for pool in self.pools:
       pool.hold()
 
@@ -614,11 +616,18 @@ def compose(plan, cancelled=None):
     # Read rather than map: the app can shrink its pool at any moment, and
     # touching a mapping past the end of the file kills the broker with
     # SIGBUS. Whatever is missing stays black. Translucent layers blend over
-    # what is under them; XRGB8888 has no alpha and covers it.
-    end = min(pool.size, os.fstat(pool.fd).st_size)
+    # what is under them; XRGB8888 has no alpha and covers it. A copy of the
+    # pixels taken when the buffer was committed stands in for the pool.
+    if isinstance(pool, Pool):
+      end = min(pool.size, os.fstat(pool.fd).st_size)
 
-    def read(length, position, fd=pool.fd):
-      return os.pread(fd, length, position)
+      def read(length, position, fd=pool.fd):
+        return os.pread(fd, length, position)
+    else:
+      end = offset + len(pool)
+
+      def read(length, position, copy=pool, start=offset):
+        return copy[position - start : position - start + length]
 
     if transform:
       pixels = turned_rows(read, offset, stride, end, transform, buffer_width, buffer_height, columns, rows)
@@ -759,6 +768,7 @@ class Client:
     self.up = Channel(upstream)
     self.objects = {1: ("wl_display", 1)}
     self.pid, self.sandbox = 0, None  # the app's, once accepted
+    self.snapshots_until = 0  # commits copy their pixels until then (time.monotonic)
     self.advertised = {}
     self.params = {}  # GPU buffer params -> the size of the buffer they will create
     self.pointers, self.keyboards = {}, {}  # object -> the surface this app believes it is focused on
@@ -965,7 +975,7 @@ class Client:
   def request_wl_compositor_create_surface(self, _, args):
     self.surfaces[args[0]] = {
       "buffer": None, "scale": 1, "transform": 0, "viewport": None, "source": None, "input": None,
-      "pending": {}, "cached": {}, "sync": False, "stack": [args[0]], "parent": None, "position": (0, 0),
+      "pending": {}, "cached": {}, "sync": False, "stack": [args[0]], "parent": None, "position": (0, 0), "pixels": None,
     }
     return True
 
@@ -986,8 +996,17 @@ class Client:
   # A surface's buffer, scale, transform, viewport and input region change
   # together when it commits, and so do where its subsurfaces sit and how
   # they stack. A synchronized subsurface's commit only goes into a cache,
-  # shown when its parent's state is, as Hyprland shows it: the agent sees no
-  # frame the user can't.
+  # shown when its parent's state is, as Hyprland shows it, so a screenshot
+  # and the agent's clicks follow the layout the user sees.
+  #
+  # The pixels are another matter: they live in the app's shared memory,
+  # which it can write again without committing, and copying every frame
+  # would cost too much. So for SNAPSHOT_SECONDS after a screenshot, and
+  # while one is being taken, each commit keeps a copy of its buffer's
+  # pixels, and the next screenshot draws those: what the app last
+  # committed. Otherwise, as for an agent's first look in a while, a
+  # screenshot reads the pool as it is then, which can hold drawing the app
+  # has not committed and the user does not see yet.
 
   def request_wl_surface_attach(self, surface, args):
     self.surfaces[surface]["pending"]["buffer"] = self.buffers.get(args[0], (0, 0, None)) if args[0] else None
@@ -995,6 +1014,10 @@ class Client:
 
   def request_wl_surface_commit(self, surface, _):
     state = self.surfaces[surface]
+    pending = state["pending"]
+    buffer = pending["buffer"] if "buffer" in pending else state["cached"].get("buffer", state["buffer"])
+    # A copy of an earlier commit's pixels never outlives a later commit.
+    pending["pixels"] = self.snapshot(surface, buffer) if time.monotonic() < self.snapshots_until else None
     positions = state["pending"].pop("positions", {})
     state["cached"].update(state["pending"])
     state["cached"].setdefault("positions", {}).update(positions)  # one commit's moves add to an earlier one's
@@ -1002,6 +1025,23 @@ class Client:
     if not self.synchronized(surface):
       self.apply(surface)
     return True
+
+  def snapshot(self, surface, buffer):
+    """A copy of a shared memory buffer's pixels, or None when there is
+    nothing to copy or the app's copies would pass SNAPSHOT_BYTES."""
+    if not buffer or not isinstance(buffer[2], tuple):
+      return None
+    width, height, (pool, offset, stride, _) = buffer
+    if width <= 0 or height <= 0 or stride < 0 or offset < 0 or pool.fd < 0:
+      return None
+    length = stride * (height - 1) + width * 4
+    # Shown copies, and committed ones not shown yet but this surface's,
+    # which this one replaces.
+    kept = sum(len(state["pixels"] or b"") + (len(state["cached"].get("pixels") or b"") if other != surface else 0) for other, state in self.surfaces.items())
+    if kept + length > SNAPSHOT_BYTES:
+      return None
+    end = min(pool.size, os.fstat(pool.fd).st_size)
+    return os.pread(pool.fd, min(length, end - offset), offset) if offset < end else b""
 
   def synchronized(self, surface):
     """Whether a surface's commits wait for its parent's: a subsurface in sync mode, or under one."""
@@ -1441,10 +1481,14 @@ class Client:
   def capture_plan(self, toplevel):
     """What a screenshot of the window draws, taken from the app's state now
     so a thread can compose it while the app goes on changing that state."""
+    self.snapshots_until = time.monotonic() + SNAPSHOT_SECONDS
     scale = self.scale(toplevel)
     layers = []
     for surface, x, y in self.layers(self.toplevels[toplevel]["xdg"], 0, 0):
       buffer = self.surfaces[surface]["buffer"]
+      pixels = self.surfaces[surface]["pixels"]
+      if pixels is not None and isinstance(buffer[2], tuple):
+        buffer = (buffer[0], buffer[1], (pixels, *buffer[2][1:]))  # as committed
       if buffer and buffer[2]:
         # Only the part of the window geometry the surface really covers: the
         # app declares the geometry and could make it any size.
@@ -2018,6 +2062,7 @@ class Broker:
     os.close(shot.finished)
     self.shots.remove(shot)
     shot.plan.release()
+    shot.client.snapshots_until = time.monotonic() + SNAPSHOT_SECONDS  # counted from the end of a long screenshot too
     if shot.result and self.windows.get(shot.window) == (shot.client, shot.toplevel):
       self.captures[shot.window] = shot.plan.origin
     self.answer_shot(shot, shot.result, shot.error)

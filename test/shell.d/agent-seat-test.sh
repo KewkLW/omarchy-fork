@@ -1224,6 +1224,25 @@ def ancestry(seat, problems):
         child.kill()
         child.wait()
 
+def uncommitted(seat, problems):
+    # A window committed blue, a screenshot, then red committed, and green
+    # written over it without a commit; then the green committed.
+    seat.window(20, 21, 22)
+    memory = os.memfd_create("pixels")
+    os.write(memory, BLUE * 40 * 30)
+    seat.request(SHM, "create_pool", 100, memory, 40 * 30 * 4)
+    seat.request(100, "create_buffer", 101, 0, 40, 30, 40 * 4, XRGB)
+    seat.request(20, "attach", 101, 0, 0)
+    seat.request(20, "commit")
+    check(problems, "the first screenshot", seat.pixel(22, 1, 1), "0000ff")
+    os.pwrite(memory, RED * 40 * 30, 0)
+    seat.request(20, "commit")
+    os.pwrite(memory, GREEN * 40 * 30, 0)
+    check(problems, "a screenshot after green is drawn but red was committed", seat.colours(22), ["ff0000"])
+    seat.request(20, "commit")
+    check(problems, "a screenshot once green is committed", seat.colours(22), ["00ff00"])
+    os.close(memory)
+
 def limits(seat, problems):
     # A window one pixel wider than a screenshot can hold, one exactly as
     # wide, and a 400x400 buffer shown 10x10 through a viewport, which would
@@ -1308,6 +1327,10 @@ pass "a subsurface without a buffer, and what is under it, takes no clicks"
 result=$(inproc ancestry)
 [[ $result == "ok" ]] || fail "an app is counted against the sandbox whose supervisor it runs under" "$result"
 pass "an app is counted against the sandbox whose supervisor it runs under"
+
+result=$(inproc uncommitted)
+[[ $result == "ok" ]] || fail "a screenshot soon after another shows what the app committed, not what it drew since" "$result"
+pass "a screenshot soon after another shows what the app committed, not what it drew since"
 
 result=$(inproc limits)
 [[ $result == "ok" ]] || fail "a screenshot is at most 4096 pixels a side and 4 pixels per surface unit" "$result"
