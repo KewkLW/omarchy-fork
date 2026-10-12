@@ -8,7 +8,8 @@
 # agent seat broker. It gets no Hyprland IPC, no user Wayland or X11 socket, no
 # user D-Bus (only a private bus of its own, so no keyring and no portals), no
 # /dev/uinput, no GPU and its own home, so it can neither drive nor read the
-# user's seat.
+# user's seat. That home is one directory shared by every app on the seat and
+# kept across stop, so logins and cookies made in it persist.
 #
 # It does share the host's network: besides the internet it reaches every
 # service listening on the host's localhost (databases, dev servers, browser
