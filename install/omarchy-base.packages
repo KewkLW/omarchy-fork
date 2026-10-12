@@ -134,6 +134,7 @@ ufw-docker
 unzip
 usage
 uwsm
+wayland-protocols
 whois
 wireless-regdb
 wireplumber

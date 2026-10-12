@@ -24,7 +24,7 @@ omarchy agent seat type "$window" "hello" --key enter
 omarchy agent seat stop
 ```
 
-Python and bash only, no Hyprland plugin, no Hyprland changes, and no new packages: `bubblewrap`, Python and libxkbcommon are already on every install.
+Python and bash only, no Hyprland plugin and no Hyprland changes. Python and libxkbcommon are already on every install, and so are `bubblewrap` (glycin and webkit2gtk depend on it) and `wayland-protocols`, whose XMLs the broker reads at startup (Hyprland and aquamarine depend on it), in practice; both join the base package list, with a migration, so the seat no longer relies on them arriving as dependencies.
 
 ## Rejected approaches
 
