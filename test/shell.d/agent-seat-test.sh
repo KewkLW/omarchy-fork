@@ -666,6 +666,11 @@ windows=$(run_broker omarchy-agent-seat-windows)
 [[ $(jq -r '.[0].app_id' <<<"$windows") == "foot" ]] || fail "windows lists the agent window" "$windows"
 pass "windows lists the agent window"
 
+# A launcher matches a window to the sandbox it started by the app's pid.
+pid=$(jq -r '.[0].pid' <<<"$windows")
+[[ $pid =~ ^[0-9]+$ && $(tr '\0' ' ' <"/proc/$pid/cmdline") == *"app.py $socket window"* ]] || fail "windows lists the app's pid" "$windows"
+pass "windows lists the app's pid"
+
 read -r -t 5 typed <&"${APP[0]}"
 [[ $typed == "user:30:1:focused user:30:0:focused" ]] || fail "the user's keys reach agent apps" "$typed"
 pass "the user's keys reach agent apps"

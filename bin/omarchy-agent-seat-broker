@@ -1548,7 +1548,7 @@ class Broker:
       xdg = client.xdg_surfaces.get(info["xdg"])
       geometry = (xdg["geometry"] or (0, 0, *client.size(xdg["surface"]))) if xdg else None
       popups = [[round(v) for v in (x, y, *client.size(surface))] for surface, x, y in client.layers(info["xdg"], 0, 0)[1:] if client.surfaces[surface]["buffer"] and self.is_popup(client, surface)] if xdg else []
-      windows.append({"window": window, "app_id": info["app_id"], "title": info["title"], "size": [round(v) for v in geometry[2:]] if geometry else None, "popups": popups, **hyprland.get(window, {})})
+      windows.append({"window": window, "app_id": info["app_id"], "title": info["title"], "pid": client.pid, "size": [round(v) for v in geometry[2:]] if geometry else None, "popups": popups, **hyprland.get(window, {})})
     return {"windows": windows}
 
   @staticmethod
