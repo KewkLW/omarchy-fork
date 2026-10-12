@@ -346,10 +346,34 @@ broker_answers() {
   timeout 3 omarchy-agent-seat-broker call '{"command":"status"}' >/dev/null 2>&1
 }
 
+# The processes listening on a Unix socket bound at a path: the socket's
+# inode from /proc/net/unix, then every descriptor open on it. A copy of
+# socket_listeners in omarchy-agent-seat-stop, so a broker this launch refuses
+# to replace is exactly one that stop finds and ends.
+socket_listeners() {
+  local flags inode path
+
+  # Flags 00010000 marks a listening socket; accepted connections show the
+  # bound path too.
+  while read -r _ _ _ flags _ _ inode path; do
+    [[ $flags == "00010000" && $path == "$1" ]] || continue
+    find /proc/[0-9]*/fd -lname "socket:\[$inode\]" 2>/dev/null | cut -d/ -f3
+  done </proc/net/unix | sort -u
+}
+
 # A broker that died leaves its sockets behind, so the seat is ready only once
 # a broker answers. A new broker replaces both sockets before it answers on
 # control, so the wayland-0 bound below is then its own, never a dead one.
 if ! broker_answers; then
+  # A broker that still listens but did not answer is alive, only hung or
+  # slow, and its apps stay connected to it. A new broker over its sockets
+  # would leave those apps out of every seat command and hand their window
+  # numbers to new apps, so input meant for one could reach another. Only
+  # stop ends it, together with its apps.
+  if [[ -n $(socket_listeners "$runtime/control") ]]; then
+    echo "The agent seat broker is running but did not answer within 3 seconds; end it and its apps with: omarchy agent seat stop" >&2
+    exit 1
+  fi
   # The broker outlives this launch, so it gets none of the pinned files.
   (
     unpin

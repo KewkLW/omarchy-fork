@@ -634,11 +634,13 @@ for _ in {1..50}; do [[ -s $test_dir/out/restarted ]] && break; sleep 0.1; done
 rm -f "$test_dir/slow-broker/pid"
 pass "a launch over a dead broker's sockets starts a new broker and reaches it"
 
-# A broker that accepts the connection and never answers is no broker to
-# launch on: the launch gives up within its deadline instead of waiting on
-# it forever. The shim's serve starts nothing, so nothing replaces it.
+# A broker that accepts the connection and never answers is alive, only hung,
+# and its apps are still connected to it: the launch neither waits on it
+# forever nor starts a second broker over its sockets, which would orphan
+# those apps and reuse their window numbers. It fails and names stop. The
+# shim's serve only records that it ran.
 mkdir -p "$test_dir/silent-broker"
-printf '#!/bin/bash\n[[ $1 == "serve" ]] && exit 1\nexec "%s/bin/omarchy-agent-seat-broker" "$@"\n' "$ROOT" >"$test_dir/silent-broker/omarchy-agent-seat-broker"
+printf '#!/bin/bash\nif [[ $1 == "serve" ]]; then\n  echo started >>"%s/silent-broker/served"\n  exit 1\nfi\nexec "%s/bin/omarchy-agent-seat-broker" "$@"\n' "$test_dir" "$ROOT" >"$test_dir/silent-broker/omarchy-agent-seat-broker"
 chmod +x "$test_dir/silent-broker/omarchy-agent-seat-broker"
 rm -f "$seat/control"
 python3 -c '
@@ -653,14 +655,18 @@ while True:
 silent_pid=$!
 for _ in {1..50}; do [[ -S $seat/control ]] && break; sleep 0.1; done
 [[ -S $seat/control ]] || fail "the silent broker listens on the control socket"
+control_inode=$(stat -c %i "$seat/control")
 start=$SECONDS
 code=0
 output=$(timeout 30 "${on_seat[@]}" PATH="$test_dir/silent-broker:$test_dir/bin:$ROOT/bin:$PATH" omarchy-agent-seat-run --no-wait /usr/bin/true 2>&1) || code=$?
 ((code != 124)) || fail "a launch gives up on a broker that never answers"
 ((code != 0)) || fail "a launch fails when the broker never answers" "$output"
-[[ $output == "The agent seat broker did not start within 10 seconds"* ]] || fail "a launch on a silent broker says the broker did not start" "$output"
-((SECONDS - start <= 20)) || fail "a launch gives up on a silent broker near its deadline" "$((SECONDS - start)) seconds"
+[[ $output == *"did not answer"*"omarchy agent seat stop"* ]] || fail "a launch on a silent broker names stop as the way to end it" "$output"
+((SECONDS - start <= 10)) || fail "a launch gives up on a silent broker within its deadline" "$((SECONDS - start)) seconds"
+[[ ! -e $test_dir/silent-broker/served ]] || fail "a launch starts no second broker over a live one's sockets"
+kill -0 "$silent_pid" 2>/dev/null || fail "a launch leaves a silent broker running"
+[[ $(stat -c %i "$seat/control" 2>/dev/null) == "$control_inode" ]] || fail "a launch leaves a silent broker's control socket in place"
 kill "$silent_pid" 2>/dev/null
 wait "$silent_pid" 2>/dev/null
 silent_pid=
-pass "a launch gives up on a broker that never answers"
+pass "a launch on a broker that never answers fails, names stop and starts no second broker"

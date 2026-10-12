@@ -195,6 +195,8 @@ Agent apps share your network namespace, so besides the internet they reach ever
 
 **An eleventh review found `stop` waiting on a silent broker.** A broker holding its socket open without answering kept `stop` waiting forever with the sandbox lock held, so apps kept running and later launches blocked too, and the launcher's own check of the broker had the same unbounded call. `stop` now gives the broker three seconds, then ends the processes listening on the control socket, found by the socket's inode rather than by name, and goes on to the sandbox cleanup; the launcher bounds its checks so its ten-second deadline fires. The same review found the page-side clip mixing an overflow container's displayed position with its unscaled layout size, so a container enlarged by a CSS transform hid the controls in its second half; the container's client box is scaled into displayed coordinates before clipping, and the suite runs that script in headless Chromium.
 
+**A twelfth review found `run` replacing a live broker.** With its check bounded, a launch over a broker that was alive but silent for three seconds started a second broker over the same sockets, stranding the first one's apps and reusing their window numbers. `run` now starts a broker only when nothing listens on the control socket, and otherwise fails naming `stop`.
+
 ## What it does not do
 
 - **One agent lane.** The seat has one agent identity. Several agents can use it at once, but it doesn't tell them apart (see the FAQ).
@@ -247,7 +249,7 @@ Agent apps share your network namespace, so besides the internet they reach ever
 
 **How do I stop everything?** `omarchy agent seat stop`, or _Trigger > Agents > Stop Agent Seat_. It ends the broker and every process in every sandbox.
 
-**What happens if the broker dies?** Agent apps lose their display, and most exit with it; their sandboxes end when they do. Anything in a sandbox that doesn't need the display keeps running until `omarchy agent seat stop`, which works from the lifecycle records without a broker. The next `run` starts a new broker over the old sockets and launches its app only once that broker answers, so the app never gets the dead broker's socket; if no broker answers within 10 seconds, `run` fails and points at `broker.log`.
+**What happens if the broker dies?** Agent apps lose their display, and most exit with it; their sandboxes end when they do. Anything in a sandbox that doesn't need the display keeps running until `omarchy agent seat stop`, which works from the lifecycle records without a broker. The next `run` starts a new broker over the old sockets and launches its app only once that broker answers, so the app never gets the dead broker's socket; if no broker answers within 10 seconds, `run` fails and points at `broker.log`. A broker that is alive but does not answer within three seconds is never replaced: `run` fails and names `omarchy agent seat stop`, which ends it and its apps, so running apps keep their broker and their window numbers.
 
 **How do I test it?** See below. Sandbox checks skip where bubblewrap can't make a sandbox, and the GTK check skips without a compositor.
 
