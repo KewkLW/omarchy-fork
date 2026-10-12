@@ -13,7 +13,7 @@ require_command busctl
 
 test_dir=$(mktemp -d)
 runtime="$test_dir/runtime"
-mkdir -p "$test_dir/bin" "$test_dir/share" "$runtime"
+mkdir -p "$test_dir/bin" "$test_dir/share" "$test_dir/home" "$runtime"
 
 # The live session's compositor, if there is one, as an absolute path: the
 # test seat keeps its own runtime directory but draws real windows.
@@ -23,8 +23,10 @@ if compositor_reachable; then
   [[ $compositor == /* ]] || compositor="$XDG_RUNTIME_DIR/$compositor"
 fi
 
+# A home of the test's own: a launch makes the seat's home under it, and moves
+# one it finds at the old place, which must never be the developer's own.
 seat() {
-  XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="${compositor:-$test_dir/no-compositor}" PATH="$test_dir/bin:$ROOT/bin:$PATH" "$@"
+  HOME="$test_dir/home" XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="${compositor:-$test_dir/no-compositor}" PATH="$test_dir/bin:$ROOT/bin:$PATH" "$@"
 }
 
 cleanup() {
