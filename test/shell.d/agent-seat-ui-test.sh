@@ -376,7 +376,7 @@ fi
 # The DevTools route, against a fake DevTools endpoint ------------------------------------
 
 cat >"$test_dir/cdp.py" <<'EOF'
-import base64, hashlib, html, json, socket, struct, sys
+import base64, hashlib, html, json, socket, struct, sys, threading
 
 server = socket.socket()
 server.bind(("127.0.0.1", 0))
@@ -408,8 +408,9 @@ def read(sock, buffer, count):
         buffer += chunk
     return buffer[:count], buffer[count:]
 
-while True:
-    conn, _ = server.accept()
+# Each connection on its own thread: the reader holds a page's open while it
+# asks the browser and DevTools frontends about its window.
+def serve(conn):
     request = b""
     while b"\r\n\r\n" not in request:
         request += conn.recv(65536)
@@ -421,13 +422,13 @@ while True:
         PAGES = json.load(pages_file)
     if lines[0].startswith("GET /json/list") or lines[0].startswith("GET /json/version"):
         if lines[0].startswith("GET /json/list"):
-            body = [{"type": "page", "id": page["id"], "title": page["title"], "url": f"https://example.com/{page['id']}", "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/{page['id']}"} for page in PAGES]
+            body = [{"type": "page", "id": page["id"], "title": page["title"], "url": page.get("url", f"https://example.com/{page['id']}"), "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/{page['id']}"} for page in PAGES]
         else:
             body = {"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/fake"}
         body = json.dumps(body).encode()
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
         conn.close()
-        continue
+        return
     page = next((page for page in PAGES if lines[0].split()[1] == f"/devtools/page/{page['id']}"), None)
     key = next(line.split(":", 1)[1].strip() for line in lines if line.lower().startswith("sec-websocket-key"))
     accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
@@ -447,13 +448,22 @@ while True:
             payload, buffer = read(conn, buffer, length)
             message = json.loads(bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
             method, params = message["method"], message.get("params", {})
-            if method == "Runtime.evaluate" and "visibilityState" in params["expression"]:
+            if method == "Runtime.evaluate" and "document.title" in params["expression"]:
                 # The page's own title is plain.
                 result = {"result": {"type": "string", "value": json.dumps(["visible" if page["visible"] else "hidden", html.unescape(page["title"])])}}
             elif method == "Runtime.evaluate":
-                result = {"result": {"type": "string", "value": json.dumps([800, 600, float(sys.argv[1])])}}
+                # Its viewport, and the browser window around it; a DevTools
+                # docked in a window spans the page's part of it too.
+                inner, outer = page.get("inner", [800, 600]), page.get("outer") or page["window"]
+                values = [*inner, float(sys.argv[1])] + ([*outer, "visible" if page["visible"] else "hidden"] if "outerWidth" in params["expression"] else [])
+                result = {"result": {"type": "string", "value": json.dumps(values)}}
             elif method == "Browser.getWindowForTarget":
-                width, height = next(page["window"] for page in PAGES if page["id"] == params["targetId"])
+                window = next(page["window"] for page in PAGES if page["id"] == params["targetId"])
+                if not window:
+                    # Docked DevTools has no window of its own.
+                    frame(conn, json.dumps({"id": message["id"], "error": {"code": -32000, "message": "Browser window not found"}}))
+                    continue
+                width, height = window
                 result = {"windowId": width, "bounds": {"left": 0, "top": 0, "width": width, "height": height}}
             elif method == "Accessibility.getFullAXTree":
                 result = {"nodes": NODES}
@@ -465,6 +475,9 @@ while True:
             frame(conn, json.dumps({"id": message["id"], "result": result}))
     except (ConnectionError, OSError):
         conn.close()
+
+while True:
+    threading.Thread(target=serve, args=(server.accept()[0],), daemon=True).start()
 EOF
 
 # DevTools escapes titles as HTML; the window's title is plain.
@@ -590,6 +603,50 @@ outside=$(jq -r '.outside' <<<"$picked")
 pass "a --page number outside the list refuses and lists the pages, even when a URL holds it"
 [[ $(jq -r '.single' <<<"$picked") == */devtools/page/7 ]] || fail "--page 1 reads the only page" "$picked"
 pass "--page 1 reads the only page shown"
+
+# DevTools tells a page's size but not where it sits in its window. A page as
+# wide as its 800x600 window, here under a 100 pixel toolbar, sits at its
+# bottom; beside a side panel, or above docked DevTools, ui lists it as
+# unverified and click-ui refuses to click there. An undocked DevTools, or a
+# frame of it the size of the page, changes nothing.
+cat >"$test_dir/placed.py" <<EOF
+import importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("seat_ui", "$ROOT/bin/omarchy-agent-seat-ui")
+spec = importlib.util.spec_from_loader("seat_ui", loader)
+ui = importlib.util.module_from_spec(spec)
+loader.exec_module(ui)
+ui.window_state = lambda window: {"window": window, "title": "Fake page - Chromium", "pid": 1, "drawn": True, "geometry": [0, 0, 800, 600], "origin": [0, 0, 1.5], "scale": 1.5}
+ui.sandbox_of = lambda pid: "$test_dir/placed"
+ui.main(sys.argv[1:])
+EOF
+mkdir -p "$test_dir/placed/bin"
+echo "$cdp_port" >"$test_dir/placed/cdp-port"
+printf '#!/bin/bash\nexec python3 "%s" "$@"\n' "$test_dir/placed.py" >"$test_dir/placed/bin/omarchy-agent-seat-ui"
+printf '#!/bin/bash\necho "$*" >"%s"\n' "$test_dir/placed/pointer.args" >"$test_dir/placed/bin/omarchy-agent-seat-pointer"
+chmod +x "$test_dir/placed/bin/"*
+
+place() {
+  echo "$1" >"$test_dir/pages.json"
+  rm -f "$test_dir/placed/pointer.args"
+  listed=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-ui 3 2>&1)
+  clicked=$(PATH="$test_dir/placed/bin:$ROOT/bin:$PATH" omarchy-agent-seat-click-ui 3 Send 2>&1)
+}
+
+undocked='{"id": "8", "title": "DevTools", "url": "devtools://devtools/bundled/devtools_app.html", "visible": true, "window": [800, 400], "inner": [800, 400]}'
+frame='{"id": "9", "title": "", "url": "devtools://devtools/bundled/device_mode_emulation_frame.html", "visible": true, "window": null, "outer": [800, 600], "inner": [800, 500]}'
+place '[{"id": "1", "title": "Fake page", "visible": true, "window": [800, 600], "inner": [800, 500]}, '"$undocked, $frame"']'
+[[ $clicked == "Clicked button \"Send\" at 90,210" && $(<"$test_dir/placed/pointer.args") == "3 click 90 210" ]] && ! grep -q "guess" <<<"$listed" || fail "click-ui clicks a page under its browser's toolbar where it is" "$listed / $clicked"
+pass "click-ui clicks a page under its browser's toolbar where it is"
+
+place '[{"id": "1", "title": "Fake page", "visible": true, "window": [800, 600], "inner": [500, 500]}]'
+[[ $clicked == "Not clicking Send in window 3: the page is narrower than its window, beside a side panel or docked DevTools, so where its controls are is a guess."* && ! -e $test_dir/placed/pointer.args ]] || fail "click-ui refuses to click a page beside a side panel" "$clicked"
+grep -q "^Window 3: the page is narrower than its window, beside a side panel or docked DevTools, so where the page sits in the window, and the positions below, are a guess" <<<"$listed" && grep -q '^  button "Send"' <<<"$listed" || fail "ui lists a page beside a side panel, warning that its positions are a guess" "$listed"
+pass "ui lists a page beside a side panel with a warning, and click-ui refuses to click it"
+
+docked='{"id": "8", "title": "DevTools", "url": "devtools://devtools/bundled/devtools_app.html", "visible": true, "window": null, "outer": [800, 600], "inner": [800, 500]}'
+place '[{"id": "1", "title": "Fake page", "visible": true, "window": [800, 600], "inner": [800, 350]}, '"$docked"']'
+[[ $clicked == "Not clicking Send in window 3: DevTools is docked below the page"* && ! -e $test_dir/placed/pointer.args ]] || fail "click-ui refuses to click a page above docked DevTools" "$clicked"
+pass "click-ui refuses to click a page above docked DevTools"
 
 # click-ui hands --page to ui and the rest to the pointer.
 mkdir -p "$test_dir/stubs"

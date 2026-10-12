@@ -16,6 +16,10 @@
 # rather than read the wrong one; --page picks one by that number, or a page
 # by part of its URL.
 #
+# A browser page beside a side panel or above docked DevTools sits where
+# DevTools does not say: ui still lists it, warning that the positions are
+# unverified, and click-ui refuses to click there.
+#
 # --find resolves one control: an exact name, then a case-insensitive one, then
 # a unique substring, optionally narrowed by role ("button:Save"). Several
 # matches list the candidates and exit 1.
@@ -550,6 +554,65 @@ def window_sizes(port, targets):
   return sizes
 
 
+METRICS = "JSON.stringify([innerWidth, innerHeight, devicePixelRatio, outerWidth, outerHeight, document.visibilityState])"
+
+
+def docked_devtools(port, page_metrics, scale):
+  """Whether DevTools is shown docked in the window of a page with page_metrics.
+
+  Docked, its frontend has no browser window of its own and spans the page's
+  and its own part of the window, in a window as large as the page's.
+  """
+  with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5) as response:
+    frontends = [t for t in json.load(response) if t.get("type") == "page" and t.get("webSocketDebuggerUrl") and t.get("url", "").startswith("devtools://")]
+  if not frontends:
+    return False
+  with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=5) as response:
+    browser = DevTools(json.load(response)["webSocketDebuggerUrl"])
+  docked = []
+  try:
+    for frontend in frontends:
+      try:
+        browser.call("Browser.getWindowForTarget", {"targetId": frontend["id"]})  # undocked, in a window of its own
+      except RuntimeError:
+        docked.append(frontend)
+  finally:
+    browser.close()
+
+  width, height, ratio, outer_width, outer_height, _ = page_metrics
+  for frontend in docked:
+    devtools = DevTools(frontend["webSocketDebuggerUrl"], timeout=3)
+    try:
+      own = json.loads(devtools.call("Runtime.evaluate", {"expression": METRICS, "returnByValue": True})["result"]["value"])
+    finally:
+      devtools.close()
+    if own[5] == "visible" and own[3:5] == [outer_width, outer_height] and (own[0] * own[2] > width * ratio + 2 * scale or own[1] * own[2] > height * ratio + 2 * scale):
+      return True
+  return False
+
+
+def placement_doubt(port, metrics, scale, size):
+  """Why where a page sits in its window of logical size size is unknown, or None.
+
+  DevTools tells a page's size but not where it sits in its window: on Wayland
+  screenX and screenY are 0, and no method reports the offset. A page as wide
+  as its window, with nothing docked below it, sits under the browser's
+  toolbar or fills an app's window; anything else is a guess.
+  """
+  width, height, ratio = metrics[:3]
+  zoom = ratio / scale
+  if abs(width * zoom - size[0]) > 2:
+    return "the page is narrower than its window, beside a side panel or docked DevTools"
+  if height * zoom > size[1] + 2 or size[1] - height * zoom > size[1] / 2:
+    return "the page's height does not fit under a toolbar in its window"
+  try:
+    if docked_devtools(port, metrics, scale):
+      return "DevTools is docked below the page"
+  except (OSError, ValueError, RuntimeError, ConnectionError, KeyError, TypeError, IndexError) as error:
+    return f"DevTools did not say whether it is docked below the page ({error})"
+  return None
+
+
 def cdp_target(port, title, size=None, page=None):
   """The page the window titled title (of logical size size) shows, None when it shows none.
 
@@ -601,12 +664,14 @@ def cdp_tree(state, port, page=None):
   devtools = DevTools(target["webSocketDebuggerUrl"])
   space = Space(state)
   gx, gy, gw, gh = state["geometry"]
-  metrics = json.loads(devtools.call("Runtime.evaluate", {"expression": "JSON.stringify([innerWidth, innerHeight, devicePixelRatio])", "returnByValue": True})["result"]["value"])
-  inner_width, inner_height, ratio = metrics
+  metrics = json.loads(devtools.call("Runtime.evaluate", {"expression": METRICS, "returnByValue": True})["result"]["value"])
+  inner_width, inner_height, ratio = metrics[:3]
 
   # CSS pixels to logical ones, and where the page sits in the window: browser
-  # chrome goes above it, an Electron app's page fills the window.
+  # chrome goes above it, an Electron app's page fills the window. When that
+  # cannot be checked, the positions are listed as unverified.
   zoom = ratio / space.scale if space.scale else 1
+  unverified = placement_doubt(port, metrics, space.scale or 1, (gw, gh))
   top = max(0, gh - inner_height * zoom)
   left = max(0, (gw - inner_width * zoom) / 2)
   viewport = space.box(left, top, inner_width * zoom, inner_height * zoom)
@@ -671,6 +736,8 @@ def cdp_tree(state, port, page=None):
       level += parent["nodeId"] in listed
       parent = by_id.get(parent.get("parentId"))
     item["depth"] = level
+    if unverified:
+      item["unverified"] = unverified  # click-ui refuses a control marked so
   return nodes
 
 
@@ -768,9 +835,12 @@ def main(args):
       fail(f"No control matches {query!r} in window {window}" if not found else f"{len(found)} controls match {query!r} in window {window}:\n" + "\n".join("  " + describe(n) for n in found))
     nodes = found
 
+  unverified = nodes[0].get("unverified")
   if as_json:
-    print(json.dumps(nodes[0] if query is not None else {"window": window, "source": source, "size": [round(v * state["scale"]) for v in state["geometry"][2:]], "nodes": nodes}))
+    print(json.dumps(nodes[0] if query is not None else {"window": window, "source": source, "size": [round(v * state["scale"]) for v in state["geometry"][2:]], **({"unverified": unverified} if unverified else {}), "nodes": nodes}))
   else:
+    if unverified:
+      print(f"Window {window}: {unverified}, so where the page sits in the window, and the positions below, are a guess that click-ui will not click. Close that, or click by coordinates on omarchy agent seat screenshot {window}.", file=sys.stderr)
     for item in nodes:
       print("  " * (0 if query is not None else item["depth"]) + describe(item))
 
