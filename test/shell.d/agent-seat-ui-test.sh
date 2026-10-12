@@ -64,11 +64,19 @@ main = widget("frame", "Popup Test", [0, 0, 400, 200], [widget("push button", "O
 menu = widget("window", "", [0, 0, 120, 200], [widget("menu", "", [0, 0, 120, 200], [widget("menu item", "First", [4, 4, 112, 30]), widget("menu item", "Second", [4, 140, 112, 30])])])
 apps = [{"name": "test", "windows": [main, menu]}]
 
-def read(position, origin):
-  state = {"title": "Popup Test", "geometry": [0, 0, 400, 200], "surface": [400, 200], "scale": 2, "origin": origin, "popups": [{"position": position, "size": [120, 200]}]}
+def read(position, origin, apps=apps, size=(120, 200)):
+  state = {"title": "Popup Test", "geometry": [0, 0, 400, 200], "surface": [400, 200], "scale": 2, "origin": origin, "popups": [{"position": position, "size": list(size)}]}
   return {item["name"] or item["role"]: [item["x"], item["y"]] for item in ui.atspi_tree(state, apps, True)}
 
-print(json.dumps({"beside": read([400, 100], [0, 0, 2]), "above": read([-130, -50], [-130, -50, 2])}))
+# GTK lists the items of a menu button's menu under the button instead, in the
+# menu's coordinates; their screen coordinates place the menu (here 6 by 5
+# inside its shadow) in the window.
+def item(name, extents, screen):
+  return {**widget("menu item", name, extents), "screen": screen}
+button = widget("toggle button", "Choose", [0, 170, 400, 30], [item("Pick One", [6, 9, 115, 27], [6, 164]), item("Pick Two", [6, 36, 115, 27], [6, 191])])
+attached = [{"name": "test", "windows": [widget("frame", "Popup Test", [0, 0, 400, 200], [button])]}]
+
+print(json.dumps({"beside": read([400, 100], [0, 0, 2]), "above": read([-130, -50], [-130, -50, 2]), "attached": read([-6, 150], [-6, 0, 2], attached, (127, 128))}))
 EOF
 ) || fail "ui reads a fake tree with a menu" "$popups"
 
@@ -76,6 +84,8 @@ EOF
 pass "ui lists the items of a menu beside the window where they are"
 [[ $(jq -c '.above' <<<"$popups") == '{"Popup Test":[660,300],"Open":[360,430],"window":[120,200],"First":[120,38],"Second":[120,310]}' ]] || fail "ui places a window's controls and its menu above it in the screenshot's pixels" "$popups"
 pass "ui places a window's controls and its menu above it in the screenshot's pixels"
+[[ $(jq -c '.attached' <<<"$popups") == '{"Popup Test":[412,200],"Choose":[412,370],"Pick One":[127,345],"Pick Two":[127,399]}' ]] || fail "ui places the items of a menu listed under its button in the menu" "$popups"
+pass "ui places the items of a menu listed under its button in the menu"
 
 if ! bwrap_works; then
   skip "bubblewrap cannot create a sandbox here; skipping the agent seat UI"
@@ -235,6 +245,16 @@ def menu_button(label, widget_anchor, menu_anchor):
   return button
 box.pack_start(menu_button("Above", Gdk.Gravity.NORTH_WEST, Gdk.Gravity.SOUTH_WEST), False, False, 0)
 box.pack_start(entry, False, False, 0)
+attached = Gtk.Menu()
+for name in ("Choose First", "Choose Second", "Choose Third"):
+  item = Gtk.MenuItem(label=name)
+  item.connect("activate", lambda item: entry.set_text("chose " + item.get_label()))
+  attached.append(item)
+attached.show_all()
+choose = Gtk.MenuButton(label="Choose")
+choose.set_use_popover(False)
+choose.set_popup(attached)
+box.pack_start(choose, False, False, 0)
 box.pack_start(quit_button, False, False, 0)
 box.pack_end(menu_button("Below", Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST), False, False, 0)
 window.add(box)
@@ -250,7 +270,7 @@ Gtk.main()
   for side in Below Above; do
     # The item furthest from the window, which a screenshot shows past its edge.
     [[ $side == "Below" ]] && name="Below Third" || name="Above First"
-    seat omarchy-agent-seat-click-ui "$menus" "$side" >/dev/null || fail "click-ui opens the menu $side the window"
+    seat omarchy-agent-seat-click-ui "$menus" "button:$side" >/dev/null || fail "click-ui opens the menu $side the window"
     for _ in {1..50}; do
       seat omarchy-agent-seat-ui "$menus" --find "$name" >/dev/null 2>&1 && break
       sleep 0.1
@@ -267,6 +287,22 @@ Gtk.main()
     done
     [[ $value == "chose $name" ]] || fail "click-ui on an item of a menu $side the window activates it" "$value"
   done
+
+  seat omarchy-agent-seat-click-ui "$menus" "toggle button:Choose" >/dev/null || fail "click-ui opens a menu button's menu"
+  for _ in {1..50}; do
+    seat omarchy-agent-seat-ui "$menus" --find "Choose Second" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  sleep 0.5  # GTK ignores a click on a menu that has only just opened
+  seat omarchy-agent-seat-click-ui "$menus" "Choose Second" >/dev/null || fail "click-ui clicks an item of a menu button's menu"
+  for _ in {1..30}; do
+    value=$(seat omarchy-agent-seat-ui "$menus" --find text: --json | jq -r '.value')
+    [[ $value == "chose Choose Second" ]] && break
+    sleep 0.1
+  done
+  [[ $value == "chose Choose Second" ]] || fail "click-ui on an item of a menu button's menu activates it" "$value"
+  pass "click-ui clicks the items of a menu GTK lists under its button"
+
   seat omarchy-agent-seat-click-ui "$menus" Quit >/dev/null
   pass "ui lists and click-ui clicks the items of menus that open below and above the window"
 

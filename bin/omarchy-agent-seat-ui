@@ -213,6 +213,9 @@ def atspi_dump(address):
       if not states.contains(Atspi.StateType.SHOWING):
         return None
       extents = accessible.get_extents(Atspi.CoordType.WINDOW)
+      # Relative to the window it is drawn in, and, on Wayland, to the main
+      # window: they differ for a menu the tree lists under its button.
+      screen = accessible.get_extents(Atspi.CoordType.SCREEN)
       role = accessible.get_role_name()
       interfaces = accessible.get_interfaces()
       value = None
@@ -235,7 +238,7 @@ def atspi_dump(address):
           dumped = dump(child)
           if dumped:
             children.append(dumped)
-      return {"role": role, "name": accessible.get_name() or "", "value": value, "states": flags, "extents": [extents.x, extents.y, extents.width, extents.height], "children": children}
+      return {"role": role, "name": accessible.get_name() or "", "value": value, "states": flags, "extents": [extents.x, extents.y, extents.width, extents.height], "screen": [screen.x, screen.y], "children": children}
     except Exception:
       return None
 
@@ -295,22 +298,43 @@ def atspi_tree(state, apps, strict):
   # corner sits inside that.
   fx, fy, fw, fh = main["extents"]
   offset = (gx, gy) if near((fw, fh), surface) and not near((fw, fh), (gw, gh)) else (fx, fy)
-  nodes = []
-  flatten(main, offset, space, space.window, nodes, 0)
+  nodes, popups = [], state.get("popups", [])
+  claimed = set()
+  flatten(main, offset, space, space.window, nodes, 0, popups=popups, claimed=claimed)
 
   # Menus and other popups are windows of their own, placed where the broker
   # says a popup of their size is, and often outside the window: what they
   # show is what lies within their own bounds.
-  for popup in state.get("popups", []):
+  for index, popup in enumerate(popups):
     position, size = popup["position"], popup["size"]
-    for window in windows:
+    for window in windows if index not in claimed else []:
       if window is not main and window["role"] in POPUP_ROLES and near(window["extents"][2:], size):
         flatten(window, (window["extents"][0] - position[0], window["extents"][1] - position[1]), space, space.box(*position, *size), nodes, 0)
         break
   return nodes
 
 
-def flatten(accessible, offset, space, bounds, nodes, depth, parent_name=None):
+def popup_of(accessible, popups):
+  """The popup a control of the main window's tree is drawn in, if not the main window.
+
+  GTK lists a menu's items under its button, in the menu's own coordinates;
+  their screen coordinates put the menu's corner (without its shadow) where
+  the main window's tree has it.
+  """
+  x, y = accessible["extents"][:2]
+  sx, sy = accessible.get("screen") or (x, y)
+  if (sx, sy) == (x, y) or min(x, y, sx, sy) <= -1000000:
+    return None
+  close = [index for index, popup in enumerate(popups) if near(popup["position"], (sx - x, sy - y), 64)]
+  return min(close, key=lambda index: abs(popups[index]["position"][0] - (sx - x)) + abs(popups[index]["position"][1] - (sy - y)), default=None)
+
+
+def flatten(accessible, offset, space, bounds, nodes, depth, parent_name=None, popups=(), claimed=None):
+  index = popup_of(accessible, popups) if popups else None
+  if index is not None:
+    position, size = popups[index]["position"], popups[index]["size"]
+    offset, bounds, popups = (-position[0], -position[1]), space.box(*position, *size), ()
+    claimed.add(index)
   x, y, width, height = accessible["extents"]
   named = (accessible["name"] and accessible["name"] != parent_name) or accessible["value"] not in (None, "")
   shown = width > 0 and height > 0 and x > -1000000 and y > -1000000
@@ -319,7 +343,7 @@ def flatten(accessible, offset, space, bounds, nodes, depth, parent_name=None):
     nodes.append(node(accessible["role"], accessible["name"], accessible["value"], accessible["states"], box, depth))
     depth += 1
   for child in accessible["children"]:
-    flatten(child, offset, space, bounds, nodes, depth, accessible["name"] or parent_name)
+    flatten(child, offset, space, bounds, nodes, depth, accessible["name"] or parent_name, popups, claimed)
 
 
 # Chrome DevTools protocol ---------------------------------------------------------
