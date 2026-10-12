@@ -38,6 +38,8 @@ cleanup() {
   done
   [[ -n ${launcher_pid:-} ]] && kill "$launcher_pid" 2>/dev/null
   [[ -n ${broker_pid:-} ]] && kill "$broker_pid" 2>/dev/null
+  # A broker a launch started; the shim execs it, so its pid is the broker's.
+  [[ -s $test_dir/slow-broker/pid ]] && kill "$(<"$test_dir/slow-broker/pid")" 2>/dev/null
   wait 2>/dev/null
   rm -rf "$test_dir"
 }
@@ -180,3 +182,41 @@ for _ in {1..50}; do kill -0 "$second_pid" 2>/dev/null || break; sleep 0.1; done
 kill -0 "$second_pid" 2>/dev/null && fail "the second launch goes ahead once the first is done"
 wait "$second_pid" || fail "the second launch succeeds"
 pass "launches find their windows one at a time, and stop is not held up"
+
+# Reports whether the sandbox's wayland-0 has a broker behind it.
+cat >"$test_dir/connect" <<'EOF_CONNECT'
+#!/bin/bash
+if python3 -c 'import os, socket; socket.socket(socket.AF_UNIX).connect(os.environ["XDG_RUNTIME_DIR"] + "/wayland-0")' 2>/dev/null; then
+  echo "connected" >"$1"
+else
+  echo "refused" >"$1"
+fi
+EOF_CONNECT
+chmod +x "$test_dir/connect"
+
+# A broker that dies leaves its sockets behind.
+kill -KILL "$broker_pid"
+wait "$broker_pid" 2>/dev/null
+broker_pid=
+[[ -S $seat/control && -S $seat/wayland-0 ]] || fail "a killed broker leaves its sockets behind"
+
+output=$("${on_seat[@]}" PATH="$test_dir/no-broker:$ROOT/bin:$PATH" omarchy-agent-seat-run --no-wait --share "$test_dir/out" "$test_dir/connect" "$test_dir/out/dead" 2>&1) &&
+  fail "a launch over a dead broker's sockets fails while no broker answers" "$output"
+[[ $output == "The agent seat broker did not start within 10 seconds"* ]] || fail "a launch with no broker says so" "$output"
+sleep 0.5
+[[ ! -e $test_dir/out/dead ]] || fail "no app starts over a dead broker's sockets" "$(cat "$test_dir/out/dead")"
+pass "a launch over a dead broker's sockets fails clearly while no broker answers"
+
+# The launch starts a broker over the dead one's sockets and hands the app the
+# new wayland-0, not the dead one, even when that broker is slow to start.
+mkdir -p "$test_dir/slow-broker"
+printf '#!/bin/bash\nif [[ $1 == "serve" ]]; then\n  echo $$ >"%s/slow-broker/pid"\n  sleep 1\nfi\nexec "%s/bin/omarchy-agent-seat-broker" "$@"\n' "$test_dir" "$ROOT" >"$test_dir/slow-broker/omarchy-agent-seat-broker"
+chmod +x "$test_dir/slow-broker/omarchy-agent-seat-broker"
+"${on_seat[@]}" PATH="$test_dir/slow-broker:$test_dir/bin:$ROOT/bin:$PATH" omarchy-agent-seat-run --no-wait --share "$test_dir/out" "$test_dir/connect" "$test_dir/out/restarted" ||
+  fail "a launch over a dead broker's sockets starts a new broker" "$(cat "$seat/broker.log" 2>/dev/null)"
+for _ in {1..50}; do [[ -s $test_dir/out/restarted ]] && break; sleep 0.1; done
+[[ $(cat "$test_dir/out/restarted" 2>/dev/null) == "connected" ]] ||
+  fail "an app launched over a dead broker's sockets reaches the new broker" "$(cat "$test_dir/out/restarted" 2>/dev/null) $(cat "$seat/apps.log" 2>/dev/null)"
+"${on_seat[@]}" omarchy-agent-seat-stop >/dev/null || fail "stop ends the restarted broker"
+rm -f "$test_dir/slow-broker/pid"
+pass "a launch over a dead broker's sockets starts a new broker and reaches it"

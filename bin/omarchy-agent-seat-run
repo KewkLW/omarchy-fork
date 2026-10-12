@@ -159,10 +159,21 @@ flock 8
 exec 9>"$runtime/sandboxes.lock"
 flock 9
 
-if ! omarchy-agent-seat-broker call '{"command":"windows"}' >/dev/null 2>&1; then
+broker_answers() {
+  omarchy-agent-seat-broker call '{"command":"windows"}' >/dev/null 2>&1
+}
+
+# A broker that died leaves its sockets behind, so the seat is ready only once
+# a broker answers. A new broker replaces both sockets before it answers on
+# control, so the wayland-0 bound below is then its own, never a dead one.
+if ! broker_answers; then
   setsid -f omarchy-agent-seat-broker serve >>"$runtime/broker.log" 2>&1 8>&- 9>&-
-  for _ in {1..50}; do
-    [[ -S $runtime/control ]] && break
+  deadline=$((SECONDS + 10))
+  until broker_answers; do
+    if ((SECONDS >= deadline)); then
+      echo "The agent seat broker did not start within 10 seconds (see $runtime/broker.log)" >&2
+      exit 1
+    fi
     sleep 0.1
   done
 fi
