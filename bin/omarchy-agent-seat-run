@@ -28,7 +28,8 @@
 # the sandbox are refused: the root, the user's home or /tmp as a whole, the
 # X11 sockets, $XDG_RUNTIME_DIR and /run/user (Hyprland, D-Bus, the keyring),
 # /proc and /dev, any directory holding one of those, and anything inside
-# ~/.config, ~/.ssh, ~/.gnupg or ~/.local/share/keyrings.
+# ~/.config, ~/.ssh, ~/.gnupg or ~/.local/share/keyrings, or wherever one of
+# those links to.
 
 home=$(realpath -m -- "$HOME")
 runtime_dir=$(realpath -m -- "$XDG_RUNTIME_DIR")
@@ -36,6 +37,15 @@ runtime_dir=$(realpath -m -- "$XDG_RUNTIME_DIR")
 broad=("$home" /tmp)
 # Refused when a path is one of these, lies inside one, or holds one.
 private=("$home/.config" "$home/.ssh" "$home/.gnupg" "$home/.local/share/keyrings" "$runtime_dir" /run/user /tmp/.X11-unix /proc /dev)
+
+# Shares are compared resolved, so a root that is a link (~/.ssh pointing into
+# ~/vault, say) is refused at its target as well as at its own path.
+for root in "${broad[@]}"; do
+  broad+=("$(realpath -m -- "$root")")
+done
+for root in "${private[@]}"; do
+  private+=("$(realpath -m -- "$root")")
+done
 
 # Prints what a resolved path would expose to an agent app, if anything.
 exposes() {

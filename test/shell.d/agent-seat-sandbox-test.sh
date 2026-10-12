@@ -19,8 +19,10 @@ test_dir=$(mktemp -d)
 home="$test_dir/home"
 runtime="$test_dir/runtime"
 seat="$runtime/omarchy/agent-seat"
-mkdir -p "$test_dir/bin" "$test_dir/out" "$test_dir/scratch" "$runtime" \
-  "$home/.ssh" "$home/.gnupg" "$home/.config/app" "$home/.local/share/keyrings"
+mkdir -p "$test_dir/bin" "$test_dir/out" "$test_dir/scratch" "$runtime" "$home/vault/ssh" \
+  "$home/.gnupg" "$home/.config/app" "$home/.local/share/keyrings"
+# A private directory kept elsewhere and linked into place.
+ln -s vault/ssh "$home/.ssh"
 echo "canary" >"$home/canary"
 echo "scratch" >"$test_dir/scratch/file"
 echo "secret" >"$test_dir/secret"
@@ -67,6 +69,12 @@ for path in / "$home" /tmp "$runtime" "$real_runtime" "$home/.ssh" "$home/.gnupg
 done
 [[ ! -e $seat ]] || fail "a refused share starts nothing"
 pass "shares of the root, home, /tmp, runtime directories, /proc, /dev and private config are refused"
+
+for path in "$home/.ssh" "$home/.ssh/" "$home/vault/ssh" "$home/vault"; do
+  refused --share "$path" || fail "a linked private directory is refused: $path"
+  refused --share-ro "$path" || fail "a linked private directory is refused read-only: $path"
+done
+pass "a linked private directory is refused by its link, its target and the directory holding it"
 
 printf '#!/bin/bash\n' >"$home/.config/app/tool"
 chmod +x "$home/.config/app/tool"

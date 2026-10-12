@@ -43,7 +43,7 @@ Screenshots of a GPU app come from Hyprland rather than the app's own buffers, s
 
 ## Your files
 
-The sandbox sees none of the user's files unless you share them: `--share <path>` read-write, `--share-ro <path>` read-only, repeatable, each at the same path inside. `omarchy agent seat run --gpu --share ~/Projects/game ~/Projects/game/Editor`. The seat asks nothing about this itself; sharing is part of your command, so your own permission rules decide it, the same as for files you touch directly. Share only what the app needs. The seat refuses shares that would undo the sandbox: `/`, the user's home or `/tmp` as a whole, `$XDG_RUNTIME_DIR` and `/run/user`, `/proc`, `/dev`, any directory holding one of those, and anything inside `~/.config`, `~/.ssh`, `~/.gnupg` or `~/.local/share/keyrings`.
+The sandbox sees none of the user's files unless you share them: `--share <path>` read-write, `--share-ro <path>` read-only, repeatable, each at the same path inside. `omarchy agent seat run --gpu --share ~/Projects/game ~/Projects/game/Editor`. The seat asks nothing about this itself; sharing is part of your command, so your own permission rules decide it, the same as for files you touch directly. Share only what the app needs. The seat refuses shares that would undo the sandbox: `/`, the user's home or `/tmp` as a whole, `$XDG_RUNTIME_DIR` and `/run/user`, `/proc`, `/dev`, any directory holding one of those, and anything inside `~/.config`, `~/.ssh`, `~/.gnupg` or `~/.local/share/keyrings`, including where those link to.
 
 ## Limits
 
