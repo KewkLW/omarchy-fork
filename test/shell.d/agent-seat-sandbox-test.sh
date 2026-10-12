@@ -127,10 +127,18 @@ output=$("${on_seat[@]}" PATH="$test_dir/no-broker:$ROOT/bin:$PATH" omarchy-agen
 [[ $output == "Refusing "* ]] || fail "a program inside ~/.config is refused" "$output"
 pass "a program inside ~/.config is refused"
 
+output=$("${on_seat[@]}" omarchy-agent-seat-windows 2>/dev/null) && fail "windows fails while no broker runs" "$output"
+[[ -z $output ]] || fail "windows prints nothing while no broker runs" "$output"
+pass "windows fails while no broker runs"
+
 "${on_seat[@]}" omarchy-agent-seat-broker serve 2>"$test_dir/broker.log" &
 broker_pid=$!
 for _ in {1..50}; do [[ -S $seat/wayland-0 ]] && break; sleep 0.1; done
 [[ -S $seat/wayland-0 ]] || fail "the broker starts" "$(cat "$test_dir/broker.log")"
+
+output=$("${on_seat[@]}" omarchy-agent-seat-windows) || fail "windows succeeds on a seat with no apps" "$output"
+[[ $(jq -c . <<<"$output") == "[]" ]] || fail "windows lists no windows on a seat with no apps" "$output"
+pass "windows lists no windows on a seat with no apps"
 
 # Runs a headless command on the seat and waits for its sandbox to end.
 run_headless() {
