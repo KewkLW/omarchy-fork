@@ -473,6 +473,8 @@ class Client:
     self.toplevels = {}  # xdg_toplevel -> {"xdg", "window", "title", "app_id"}
     self.popups = {}  # xdg_popup -> {"xdg", "parent", "position"}
     self.user_keyboard = None  # where the user's seat has keyboard focus in this app
+    self.user_modifiers = (0, 0, 0, 0)  # depressed, latched, locked and group of the user's keyboard
+    self.agent_modifiers = set()  # keyboards whose modifier state the broker set rather than the user
     self.user_pointer = None  # (surface, x, y) of the user's pointer in this app
     self.last_actor = None  # "user" or "agent": whose input this app saw last
     # Recent serials of the user's input to this app. Only these can set the
@@ -831,6 +833,7 @@ class Client:
 
   def event_wl_keyboard_leave(self, keyboard, args):
     self.user_keyboard = None
+    self.user_modifiers = (0, 0, 0, 0)
     if self.keyboards.get(keyboard) != args[1]:
       return False
     self.keyboards[keyboard] = None
@@ -841,10 +844,24 @@ class Client:
     self.last_actor = "user"
     if self.user_keyboard:
       self.focus_keyboard(keyboard, self.user_keyboard)
-    return self.keyboards.get(keyboard) is not None
+    if self.keyboards.get(keyboard) is None:
+      return False
+    # The agent's typing replaced the app's modifiers, and Hyprland only sends
+    # the user's again when they change: a Ctrl the user still holds would be
+    # lost on this key.
+    if keyboard in self.agent_modifiers:
+      self.agent_modifiers.discard(keyboard)
+      self.send_event(keyboard, "modifiers", self.broker.next_serial(), *self.user_modifiers)
+    return True
 
   def event_wl_keyboard_modifiers(self, keyboard, args):
+    self.user_modifiers = tuple(args[1:5])
     return self.event_wl_keyboard_key(keyboard, args)
+
+  def set_modifiers(self, keyboard, depressed):
+    """Give a keyboard the agent's modifiers; the user's come back with their next key."""
+    self.send_event(keyboard, "modifiers", self.broker.next_serial(), depressed, 0, 0, 0)
+    self.agent_modifiers.add(keyboard)
 
   def event_wl_pointer_enter(self, pointer, args):
     self.user_serial(args[0])
@@ -880,6 +897,7 @@ class Client:
     self.keyboards[keyboard] = surface if surface in self.surfaces else None
     if self.keyboards[keyboard]:
       self.send_event(keyboard, "enter", serial or self.broker.next_serial(), surface, b"")
+      self.agent_modifiers.add(keyboard)  # an enter leaves them for the app to guess
 
   def focus_pointer(self, pointer, surface, x, y, serial=None):
     """Move one pointer's focus to surface; True when it had to enter."""
@@ -1542,7 +1560,7 @@ class Broker:
     for keyboard in client.keyboards:
       if client.keyboards[keyboard] != surface:
         client.focus_keyboard(keyboard, surface)
-        client.send_event(keyboard, "modifiers", self.next_serial(), 0, 0, 0, 0)
+        client.set_modifiers(keyboard, 0)
     return client
 
   def pointer_frame(self, client):
@@ -1609,7 +1627,7 @@ class Broker:
 
   def send_modifiers(self, client, mask):
     for keyboard in client.keyboards:
-      client.send_event(keyboard, "modifiers", self.next_serial(), mask, 0, 0, 0)
+      client.set_modifiers(keyboard, mask)
 
   def tap(self, client, key, mask):
     self.send_modifiers(client, mask)

@@ -845,6 +845,21 @@ def clipboard(seat, problems):
     seat.request(DEVICE, "set_selection", SOURCE, 902)
     check(problems, "the user's next keypress sets the clipboard again", forwarded(seat, "set_selection"), [[SOURCE, 902]])
 
+def modifiers(seat, problems):
+    # The user holds Ctrl and Caps Lock is on, the agent types, and the user
+    # presses C without letting go of Ctrl.
+    held = (seat.broker.keymap.modifiers["ctrl"], 0, 2, 0)
+    seat.request(SEAT, "get_keyboard", KEYBOARD)
+    window = seat.window(20, 21, 22)
+    seat.event(KEYBOARD, "enter", 900, 20, b"")
+    seat.event(KEYBOARD, "modifiers", 901, *held)
+    seat.broker.do_type(window, "x")
+    seat.queued("events")
+    seat.event(KEYBOARD, "key", 902, 0, 46, 1)
+    events = [(name, args) for object_id, name, args in seat.queued("events") if object_id == KEYBOARD]
+    check(problems, "the user's key reaches the app", [name for name, _ in events][-1:], ["key"])
+    check(problems, "the app's modifiers when the user's key arrives", [tuple(args[1:]) for name, args in events if name == "modifiers"][-1:], [held])
+
 problems = []
 globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
 print("; ".join(problems) or "ok")
@@ -858,6 +873,10 @@ inproc() {
 result=$(inproc clipboard)
 [[ $result == "ok" ]] || fail "an app can't set the clipboard with the user's input from before the agent acted" "$result"
 pass "an app can't set the clipboard with the user's input from before the agent acted"
+
+result=$(inproc modifiers)
+[[ $result == "ok" ]] || fail "a modifier the user holds through the agent's typing still applies to the user's next key" "$result"
+pass "a modifier the user holds through the agent's typing still applies to the user's next key"
 
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 
