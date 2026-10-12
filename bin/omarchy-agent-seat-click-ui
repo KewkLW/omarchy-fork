@@ -12,7 +12,8 @@
 # moves exactly as it would for a click by coordinates. Several matches list
 # the candidates and exit 1; narrow them with a role. --page goes to
 # omarchy agent seat ui, to pick one of several pages a browser window could
-# show; the other options go to the pointer.
+# show, or of several windows of an app that look alike; the other options go
+# to the pointer.
 
 usage() {
   echo "Usage: omarchy agent seat click-ui <window> <name>|<role>:<name> [--page <selector>] [--button left|right|middle] [--double]" >&2

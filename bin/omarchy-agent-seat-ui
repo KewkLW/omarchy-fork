@@ -10,9 +10,11 @@
 # screenshot). GTK and Qt apps publish the tree on their sandbox's private bus;
 # Chromium and Electron apps launched with omarchy agent seat run --cdp are read
 # over the DevTools protocol instead, which knows the page far better. When
-# several visible pages share the window's title and size, it refuses with
-# exit 1 and numbers them rather than read the wrong one; --page picks one by
-# that number or by part of its URL.
+# several visible pages, or several windows of one app, share the window's
+# title and size and nothing else tells them apart (a window's keyboard focus
+# against the one the seat reports), it refuses with exit 1 and numbers them
+# rather than read the wrong one; --page picks one by that number, or a page
+# by part of its URL.
 #
 # --find resolves one control: an exact name, then a case-insensitive one, then
 # a unique substring, optionally narrowed by role ("button:Save"). Several
@@ -49,7 +51,7 @@ ACTIONABLE = {
   "option", "switch", "tab", "treeitem", "spinbutton", "listbox", "textarea",
 }
 POPUP_ROLES = {"window", "menu", "popup menu", "tool tip", "tooltip", "combo box", "list"}
-STATES = ("focused", "checked", "pressed", "selected", "expanded", "collapsed", "editable")
+STATES = ("focused", "checked", "pressed", "selected", "expanded", "collapsed", "editable", "active")
 
 
 # How the AT-SPI reader says python-gobject or the Atspi typelib is missing.
@@ -284,8 +286,56 @@ def near(a, b, slack=2):
   return abs(a[0] - b[0]) <= slack and abs(a[1] - b[1]) <= slack
 
 
-def atspi_tree(state, apps, strict):
-  """The window's nodes, or None when no app on the bus shows a matching window."""
+def controls(accessible, count=4):
+  """The first few named controls in a window, to tell windows apart by."""
+  found = []
+  for child in accessible["children"]:
+    if len(found) >= count:
+      break
+    if child["name"] and child["role"] in ACTIONABLE:
+      found.append(f"{child['role']} {json.dumps(child['name'])}")
+    found += controls(child, count - len(found))
+  return found[:count]
+
+
+def atspi_window(candidates, state, page=None):
+  """The one of several windows of the window's title and size that is the window.
+
+  Agent windows all look activated to their apps, but only the one the seat's
+  keyboard is in reports the active state. Raises Ambiguous when that does not
+  leave one, or when page, a number from the refusal's list, picks none.
+  """
+  title = state.get("title")
+  focus = state.get("focus") or {}
+  if len(candidates) > 1 and "keyboard" in focus:
+    focused = bool(focus["keyboard"] or focus.get("user_keyboard"))
+    candidates = [window for window in candidates if ("active" in window["states"]) == focused] or candidates
+  if len(candidates) == 1 and page is None:
+    return candidates[0]
+
+  # Numbered in the order the app lists its windows, which stays the same from
+  # one call to the next.
+  def summary(window):
+    states = f" [{', '.join(window['states'])}]" if window["states"] else ""
+    return f"{window['role']} {json.dumps(window['name'])} {window['extents'][2]}x{window['extents'][3]}{states}: {', '.join(controls(window)) or 'no named controls'}"
+
+  listing = "\n".join(f"{number}. {summary(window)}" for number, window in enumerate(candidates, 1))
+  hint = "Rerun with --page N to pick one (its number above)."
+  if page is None:
+    raise Ambiguous(f"{len(candidates)} windows titled {title!r} look alike, and the accessibility tree cannot tell which is this one:\n{listing}\n{hint}")
+  if not page.isdigit():
+    raise Ambiguous(f"--page {page!r}: a window read over the accessibility tree is picked by its number:\n{listing}\n{hint}")
+  if not 1 <= int(page) <= len(candidates):
+    only = "there is only 1 window" if len(candidates) == 1 else f"there are only {len(candidates)} windows"
+    raise Ambiguous(f"--page {page}: {only} titled {title!r}:\n{listing}\n{hint}")
+  return candidates[int(page) - 1]
+
+
+def atspi_tree(state, apps, strict, page=None):
+  """The window's nodes, or None when no app on the bus shows a matching window.
+
+  Raises Ambiguous when several windows of the bus could be the window.
+  """
   space = Space(state)
   gx, gy, gw, gh = state["geometry"]
   surface = state.get("surface") or [gw, gh]
@@ -296,12 +346,20 @@ def atspi_tree(state, apps, strict):
   def matches(window):
     return window["extents"][2:] and (near(window["extents"][2:], (gw, gh)) or near(window["extents"][2:], surface))
 
-  # Without the app's pid every sandbox is a candidate, so only the title counts.
-  main = next((w for w in windows if w["name"] == state.get("title") and matches(w)), None) or next((w for w in windows if w["name"] == state.get("title")), None)
-  if not main and not strict:
-    main = next((w for w in windows if matches(w)), None)
-  if not main:
+  titled = [w for w in windows if w["name"] == state.get("title")]
+  candidates = [w for w in titled if matches(w)] or titled
+  if candidates:
+    main = atspi_window(candidates, state, page)
+  elif strict:
     return None
+  else:
+    # Without the app's pid every sandbox is a candidate, so only the title
+    # counts: a window of the right size but another title is read only when
+    # it is the only one.
+    sized = [w for w in windows if matches(w)]
+    if len(sized) != 1:
+      return None
+    main = sized[0]
 
   # Coordinates are relative to the app's own surface. Toolkits that report the
   # window at the surface's size include the shadow around it; the geometry's
@@ -685,7 +743,10 @@ def main(args):
       except (OSError, ValueError, RuntimeError, ConnectionError, KeyError) as error:
         print(f"DevTools on port {port} did not answer: {error}", file=sys.stderr)
     if not nodes and bus_address(candidate):
-      nodes, source = atspi_tree(state, atspi_apps(bus_address(candidate)), not directory), "atspi"
+      try:
+        nodes, source = atspi_tree(state, atspi_apps(bus_address(candidate)), not directory, page), "atspi"
+      except Ambiguous as error:
+        fail(str(error))
     if nodes:
       found.append((nodes, source))
 

@@ -109,6 +109,46 @@ EOF
 [[ $(jq -c '.' <<<"$partial") == '{"Scroll Test":[400,200],"Half right":[700,140],"Half below":[100,390]}' ]] || fail "ui places a control scrolled partly away on the part that shows, and leaves out a sliver" "$partial"
 pass "ui places a control scrolled partly away on the part that shows, and leaves out a sliver"
 
+# An app can show two windows of the same title and size: the one the seat's
+# keyboard is in reports itself active. When that does not tell them apart,
+# ui refuses and numbers them, and --page picks one.
+twins=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" <<'EOF'
+import importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("seat_ui", loader)
+ui = importlib.util.module_from_spec(spec)
+loader.exec_module(ui)
+
+def frame(label, states):
+  button = {"role": "push button", "name": label, "value": None, "states": [], "extents": [10, 10, 80, 30], "children": []}
+  return {"role": "frame", "name": "Twin", "value": None, "states": states, "extents": [0, 0, 400, 200], "children": [button]}
+
+def read(windows, keyboard, page=None):
+  state = {"title": "Twin", "geometry": [0, 0, 400, 200], "surface": [400, 200], "scale": 1, "origin": [0, 0, 1], "popups": [], "focus": {"owner": "agent", "keyboard": keyboard, "user_keyboard": False}}
+  try:
+    return [item["name"] for item in ui.atspi_tree(state, [{"name": "twin", "windows": windows}], True, *([page] if page else []))][1]
+  except ui.Ambiguous as error:
+    return f"refused: {error}"
+
+print(json.dumps({
+  "focused": read([frame("Alpha", []), frame("Beta", ["active"])], True),
+  "unfocused": read([frame("Beta", ["active"]), frame("Alpha", [])], False),
+  "both": read([frame("Alpha", ["active"]), frame("Beta", ["active"])], True),
+  "second": read([frame("Alpha", ["active"]), frame("Beta", ["active"])], True, "2"),
+  "outside": read([frame("Alpha", ["active"]), frame("Beta", ["active"])], True, "3"),
+}))
+EOF
+) || fail "ui reads a fake app with two windows of the same title" "$twins"
+
+[[ $(jq -r '.focused' <<<"$twins") == "Beta" && $(jq -r '.unfocused' <<<"$twins") == "Alpha" ]] || fail "ui reads the window of two alike that has the seat's keyboard focus, or the one that has not" "$twins"
+pass "ui reads the window of two alike that has the seat's keyboard focus, or the one that has not"
+both=$(jq -r '.both' <<<"$twins")
+[[ $both == "refused: 2 windows titled 'Twin' look alike"* ]] && grep -qx '1\. frame "Twin" 400x200 \[active\]: push button "Alpha"' <<<"$both" && grep -qx '2\. frame "Twin" 400x200 \[active\]: push button "Beta"' <<<"$both" && [[ $(tail -n 1 <<<"$both") == "Rerun with --page N to pick one (its number above)." ]] || fail "ui refuses to guess between windows alike, and numbers them" "$both"
+pass "ui refuses to guess between windows alike, and numbers them"
+[[ $(jq -r '.second' <<<"$twins") == "Beta" ]] || fail "--page picks one of the windows alike by its number" "$twins"
+[[ $(jq -r '.outside' <<<"$twins") == "refused: --page 3: there are only 2 windows titled 'Twin'"* ]] || fail "a --page number outside the windows alike refuses" "$twins"
+pass "--page picks one of the windows alike by its number"
+
 if ! bwrap_works; then
   skip "bubblewrap cannot create a sandbox here; skipping the agent seat UI"
   exit 0
