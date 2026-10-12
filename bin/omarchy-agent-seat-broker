@@ -17,8 +17,9 @@
 # - Only an allowlist of globals is advertised. Agent apps cannot inject
 #   input, capture the screen, list windows, draw overlays or steal focus, and
 #   binding a hidden global disconnects the app.
-# - The clipboard is the user's. An app reads it only when the user pastes into
-#   it and sets it only from the user's own input, never the agent's.
+# - The clipboard is the user's. An app reads it only while the user's keyboard
+#   is in it and the user acted last, and sets it only from the user's own
+#   input since the agent last acted in it, never the agent's.
 # - Every agent window gets the class "agent-<n>.<app id>", so Hyprland rules
 #   can put it on the agent seat's workspace and outline it.
 # - Apps get no GPU unless the user allows it. An agent asks for it per launch;
@@ -478,6 +479,10 @@ class Client:
     # clipboard or start a grab: Hyprland's serials are sequential, so one
     # seen by any other app is easy to guess.
     self.user_serials = collections.deque(maxlen=256)
+    # The part of those since the agent last acted in this app. Only these can
+    # set the clipboard: an older one would let the app replay the user's
+    # keypress from before the agent took over.
+    self.clipboard_serials = collections.deque(maxlen=256)
 
   # Plumbing
 
@@ -553,17 +558,29 @@ class Client:
 
   # The clipboard is the user's. An app reads it only while the user's keyboard
   # is in it and the user acted last, so the agent can't paste it out, and it
-  # only sets it (or starts a drag) from the user's own input, so the agent
-  # can't overwrite it.
+  # only sets it (or starts a drag) while the user acted last and from the
+  # user's input since the agent last acted, so the agent can't overwrite it.
 
   def request_wl_data_offer_receive(self, _, args):
     return self.user_keyboard is not None and self.last_actor == "user"
 
   def request_wl_data_device_set_selection(self, _, args):
-    return args[1] in self.user_serials
+    return self.user_owns(args[1])
 
   def request_wl_data_device_start_drag(self, _, args):
-    return args[3] in self.user_serials
+    return self.user_owns(args[3])
+
+  def user_owns(self, serial):
+    return self.last_actor == "user" and serial in self.clipboard_serials
+
+  def user_serial(self, serial):
+    self.user_serials.append(serial)
+    self.clipboard_serials.append(serial)
+
+  def agent_acts(self):
+    """The agent takes the app over: the user's earlier input no longer sets the clipboard."""
+    self.last_actor = "agent"
+    self.clipboard_serials.clear()
 
   def request_wl_seat_get_pointer(self, _, args):
     self.pointers[args[0]] = None
@@ -806,7 +823,7 @@ class Client:
     return True
 
   def event_wl_keyboard_enter(self, keyboard, args):
-    self.user_serials.append(args[0])
+    self.user_serial(args[0])
     self.user_keyboard = args[1]
     self.last_actor = "user"
     self.focus_keyboard(keyboard, args[1], args[0])
@@ -820,7 +837,7 @@ class Client:
     return True
 
   def event_wl_keyboard_key(self, keyboard, args):
-    self.user_serials.append(args[0])
+    self.user_serial(args[0])
     self.last_actor = "user"
     if self.user_keyboard:
       self.focus_keyboard(keyboard, self.user_keyboard)
@@ -830,7 +847,7 @@ class Client:
     return self.event_wl_keyboard_key(keyboard, args)
 
   def event_wl_pointer_enter(self, pointer, args):
-    self.user_serials.append(args[0])
+    self.user_serial(args[0])
     self.user_pointer = (args[1], args[2], args[3])
     self.focus_pointer(pointer, *self.user_pointer, args[0])
     return False
@@ -849,7 +866,7 @@ class Client:
     return True
 
   def event_wl_pointer_button(self, _, args):
-    self.user_serials.append(args[0])
+    self.user_serial(args[0])
     self.last_actor = "user"
     return True
 
@@ -1520,7 +1537,7 @@ class Broker:
 
   def focus(self, window):
     client, toplevel = self.window(window)
-    client.last_actor = "agent"
+    client.agent_acts()
     surface = client.xdg_surfaces[client.toplevels[toplevel]["xdg"]]["surface"]
     for keyboard in client.keyboards:
       if client.keyboards[keyboard] != surface:
@@ -1540,7 +1557,7 @@ class Broker:
 
   def move(self, window, x, y):
     client, toplevel = self.window(window)
-    client.last_actor = "agent"
+    client.agent_acts()
     target = client.hit(toplevel, x, y)
     if not target:
       raise ValueError(f"nothing to point at there in window {window}")

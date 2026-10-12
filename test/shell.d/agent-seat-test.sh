@@ -711,6 +711,154 @@ EOF
 (( growth < 4096 )) || fail "building keymaps does not leak" "${growth} kB"
 pass "building keymaps does not leak"
 
+# Drives one app connection inside a broker loaded in-process: requests as the
+# app sends them, events as Hyprland sends them, and what the broker queued for
+# each side since last asked. Each case prints "ok" or what went wrong.
+cat >"$test_dir/inproc.py" <<'EOF'
+import importlib.machinery, importlib.util, os, socket, struct, sys
+
+loader = importlib.machinery.SourceFileLoader("broker", sys.argv[1])
+broker = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(broker)
+
+SEAT, COMPOSITOR, WM, SHM, SUBCOMPOSITOR, DATA = 2, 3, 4, 5, 6, 7
+KEYBOARD, POINTER, DEVICE, SOURCE = 8, 9, 10, 11
+ARGB, XRGB = 0, 1
+
+class Seat:
+    def __init__(self, path):
+        self.broker = broker.Broker()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen(1)
+        self.app, down = socket.socketpair()
+        self.client = broker.Client(self.broker, down, path)
+        self.hyprland = listener.accept()[0]
+        self.client.pid = 0
+        self.broker.clients.append(self.client)
+        self.client.objects.update({SEAT: ("wl_seat", 7), COMPOSITOR: ("wl_compositor", 6), WM: ("xdg_wm_base", 6), SHM: ("wl_shm", 1), SUBCOMPOSITOR: ("wl_subcompositor", 1), DATA: ("wl_data_device_manager", 3)})
+        self.next_pool = 1000
+
+    def send(self, kind, object_id, name, *args):
+        table = broker.PROTOCOLS[self.client.objects[object_id][0]][kind]
+        opcode = next(i for i, m in enumerate(table) if m[0] == name)
+        data, fds = broker.encode(object_id, opcode, table[opcode][1], args)
+        if kind == "requests":
+            self.client.down.infds.extend(os.dup(fd) for fd in fds)
+            self.client.request(object_id, opcode, data)
+        else:
+            self.client.up.infds.extend(os.dup(fd) for fd in fds)
+            self.client.event(object_id, opcode, data)
+
+    def request(self, object_id, name, *args):
+        self.send("requests", object_id, name, *args)
+
+    def event(self, object_id, name, *args):
+        self.send("events", object_id, name, *args)
+
+    def queued(self, kind):
+        """(object, name, args) of every request ("requests") or event ("events") the broker queued."""
+        channel = self.client.up if kind == "requests" else self.client.down
+        found = []
+        for data, fds in channel.out:
+            object_id, word = struct.unpack_from("<II", data)
+            name, signature, _ = broker.PROTOCOLS[self.client.objects[object_id][0]][kind][word & 0xFFFF]
+            found.append((object_id, name, broker.decode(signature, data[8:], list(fds))))
+        channel.out.clear()
+        channel.pending = 0
+        return found
+
+    def window(self, surface, xdg, toplevel):
+        self.request(COMPOSITOR, "create_surface", surface)
+        self.request(WM, "get_xdg_surface", xdg, surface)
+        self.request(xdg, "get_toplevel", toplevel)
+        return self.client.toplevels[toplevel]["window"]
+
+    def popup(self, surface, xdg, popup, parent, x, y):
+        positioner = self.next_pool = self.next_pool + 1
+        self.request(COMPOSITOR, "create_surface", surface)
+        self.request(WM, "create_positioner", positioner)
+        self.request(WM, "get_xdg_surface", xdg, surface)
+        self.request(xdg, "get_popup", popup, parent, positioner)
+        self.event(popup, "configure", x, y, 1, 1)
+
+    def subsurface(self, surface, parent, x, y):
+        role = self.next_pool = self.next_pool + 1
+        self.request(COMPOSITOR, "create_surface", surface)
+        self.request(SUBCOMPOSITOR, "get_subsurface", role, surface, parent)
+        self.request(role, "set_position", x, y)
+
+    def draw(self, surface, width, height, pixel, format=XRGB, scale=1):
+        """Fill a surface with one 4-byte pixel, as a buffer of width x height at a buffer scale."""
+        pool, buffer = self.next_pool + 1, self.next_pool + 2
+        self.next_pool += 2
+        memory = os.memfd_create("pixels")
+        os.write(memory, pixel * width * height)
+        self.request(SHM, "create_pool", pool, memory, width * height * 4)
+        os.close(memory)
+        self.request(pool, "create_buffer", buffer, 0, width, height, width * 4, format)
+        self.request(surface, "set_buffer_scale", scale)
+        self.request(surface, "attach", buffer, 0, 0)
+        self.request(surface, "commit")
+
+    def pixel(self, toplevel, x, y):
+        canvas, width, height, _ = self.client.capture(toplevel)
+        return bytes(canvas[(y * width + x) * 4 : (y * width + x) * 4 + 3][::-1]).hex()
+
+    def size(self, toplevel):
+        _, width, height, _ = self.client.capture(toplevel)
+        return f"{width}x{height}"
+
+RED, GREEN, BLUE = b"\x00\x00\xff\xff", b"\x00\xff\x00\xff", b"\xff\x00\x00\xff"
+
+def check(problems, what, got, want):
+    if got != want:
+        problems.append(f"{what}: got {got!r}, want {want!r}")
+
+def forwarded(seat, *names):
+    """The arguments of each named request the broker passed on to Hyprland, by name."""
+    queued = seat.queued("requests")
+    found = [[args for _, request, args in queued if request == name] for name in names]
+    return found if len(names) > 1 else found[0]
+
+def clipboard(seat, problems):
+    # The user types into the app, the agent clicks in it, and the app replays
+    # the serial of the user's keypress to replace the clipboard.
+    seat.request(SEAT, "get_keyboard", KEYBOARD)
+    seat.request(SEAT, "get_pointer", POINTER)
+    seat.request(DATA, "get_data_device", DEVICE, SEAT)
+    seat.request(DATA, "create_data_source", SOURCE)
+    window = seat.window(20, 21, 22)
+    seat.draw(20, 40, 30, RED)
+    seat.event(KEYBOARD, "enter", 900, 20, b"")
+    seat.event(KEYBOARD, "key", 901, 0, 30, 1)
+    seat.queued("requests")
+    seat.request(DEVICE, "set_selection", SOURCE, 901)
+    check(problems, "the user's own keypress sets the clipboard", forwarded(seat, "set_selection"), [[SOURCE, 901]])
+    seat.broker.do_click(window, 1, 1)
+    seat.request(DEVICE, "set_selection", SOURCE, 901)
+    seat.request(DEVICE, "start_drag", SOURCE, 20, 0, 901)
+    selection, drag = forwarded(seat, "set_selection", "start_drag")
+    check(problems, "a keypress from before the agent clicked sets the clipboard", selection, [])
+    check(problems, "a keypress from before the agent clicked starts a drag", drag, [])
+    seat.event(KEYBOARD, "key", 902, 0, 30, 0)
+    seat.request(DEVICE, "set_selection", SOURCE, 902)
+    check(problems, "the user's next keypress sets the clipboard again", forwarded(seat, "set_selection"), [[SOURCE, 902]])
+
+problems = []
+globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
+print("; ".join(problems) or "ok")
+EOF
+
+inproc() {
+  rm -f "$test_dir/runtime/inproc"
+  run_broker python3 "$test_dir/inproc.py" "$ROOT/bin/omarchy-agent-seat-broker" "$test_dir/runtime/inproc" "$1" 2>&1
+}
+
+result=$(inproc clipboard)
+[[ $result == "ok" ]] || fail "an app can't set the clipboard with the user's input from before the agent acted" "$result"
+pass "an app can't set the clipboard with the user's input from before the agent acted"
+
 broker=$(run_broker omarchy-agent-seat-status --json | jq -r '.pid')
 
 python3 "$test_dir/app.py" "$socket" vanish "$broker"
