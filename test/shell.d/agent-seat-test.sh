@@ -711,6 +711,26 @@ EOF
 (( growth < 4096 )) || fail "building keymaps does not leak" "${growth} kB"
 pass "building keymaps does not leak"
 
+# Without Wayland's protocol descriptions the broker says what is missing and
+# where it comes from, while call still answers.
+mkdir -p "$test_dir/empty-share" "$test_dir/no-protocols"
+no_protocols=$(XDG_RUNTIME_DIR="$test_dir/no-protocols" WAYLAND_DISPLAY=compositor timeout 10 python3 - "$ROOT/bin/omarchy-agent-seat-broker" "$test_dir/empty-share" 2>&1 <<'EOF'
+import importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("broker", sys.argv[1])
+broker = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+loader.exec_module(broker)
+broker.PROTOCOLS = broker.load_protocols(sys.argv[2])
+for run in (lambda: broker.call(json.dumps({"command": "status"})), lambda: broker.Broker().serve()):
+    try:
+        run()
+    except SystemExit as exit:
+        print(f"exit {exit.code}", flush=True)
+EOF
+)
+[[ $no_protocols == *"not running"*"exit 1"*"wl_display in /usr/share/wayland (install the wayland package)"*"xdg_wm_base in /usr/share/wayland-protocols (install the wayland-protocols package)"*"exit 1" ]] || fail "a broker without protocol descriptions names what is missing" "$no_protocols"
+[[ ! -e $test_dir/no-protocols/omarchy ]] || fail "a broker without protocol descriptions does not start serving"
+pass "a broker without protocol descriptions names what is missing, and call still answers"
+
 # Drives one app connection inside a broker loaded in-process: requests as the
 # app sends them, events as Hyprland sends them, and what the broker queued for
 # each side since last asked. Each case prints "ok" or what went wrong.

@@ -117,13 +117,21 @@ def log(message):
 # Wayland wire format ---------------------------------------------------------
 
 
-def load_protocols():
+# Interfaces the broker cannot run without, and where their descriptions come
+# from: the directory under the share root and the package that installs it.
+REQUIRED_PROTOCOLS = {
+  "wl_display": ("wayland", "wayland"),
+  "xdg_wm_base": ("wayland-protocols", "wayland-protocols"),
+}
+
+
+def load_protocols(share="/usr/share"):
   interfaces = {}
   # Old unstable protocols reuse interface names (xdg-shell v5 has its own
   # xdg_surface), so load them first and let staging and stable win.
-  protocols = "/usr/share/wayland-protocols"
+  protocols = f"{share}/wayland-protocols"
   paths = [path for kind in ("unstable", "staging", "stable") for path in sorted(glob.glob(f"{protocols}/{kind}/**/*.xml", recursive=True))]
-  paths += glob.glob("/usr/share/wayland/*.xml")
+  paths += glob.glob(f"{share}/wayland/*.xml")
 
   for path in paths:
     try:
@@ -147,6 +155,16 @@ def load_protocols():
 
 
 PROTOCOLS = load_protocols()
+
+
+def missing_protocols(protocols, share="/usr/share"):
+  """Why the broker can't serve with these protocol descriptions, or None when it can."""
+  missing = [name for name in REQUIRED_PROTOCOLS if name not in protocols]
+  if not missing:
+    return None
+  return "The agent seat broker can't start: no Wayland protocol description of " + ", ".join(
+    f"{name} in {share}/{REQUIRED_PROTOCOLS[name][0]} (install the {REQUIRED_PROTOCOLS[name][1]} package)" for name in missing
+  )
 
 
 def fd_count(signature):
@@ -1124,6 +1142,12 @@ class Broker:
     return sock
 
   def serve(self):
+    # Checked here rather than on import, so call still works and the launcher
+    # can ask why the broker is not running.
+    problem = missing_protocols(PROTOCOLS)
+    if problem:
+      log(problem)
+      sys.exit(1)
     os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
     os.chmod(RUNTIME_DIR, 0o700)
     for path in glob.glob(os.path.join(RUNTIME_DIR, "gpu-*")):
