@@ -10,10 +10,18 @@ require_command jq
 require_command xkbcli
 
 test_dir=$(mktemp -d)
-mkdir -p "$test_dir/bin" "$test_dir/runtime"
+mkdir -p "$test_dir/bin" "$test_dir/runtime" "$test_dir/home"
+
+# Everything the suite launches gets a home of its own; the user's seat home
+# and state must come out of it untouched. Only their top level is compared:
+# the user's own seat apps write inside them at any time.
+real_seat_dirs() {
+  find "$HOME/.local/share/omarchy/agent-seat" "$HOME/.local/state/omarchy/agent-seat" -maxdepth 1 -printf '%i %p\n' 2>/dev/null | sort
+}
+real_seat_before=$(real_seat_dirs)
 
 cleanup() {
-  XDG_RUNTIME_DIR="$test_dir/runtime" PATH="$test_dir/bin:$ROOT/bin:$PATH" "$ROOT/bin/omarchy-agent-seat-stop" >/dev/null 2>&1 || true
+  HOME="$test_dir/home" XDG_RUNTIME_DIR="$test_dir/runtime" PATH="$test_dir/bin:$ROOT/bin:$PATH" "$ROOT/bin/omarchy-agent-seat-stop" >/dev/null 2>&1 || true
   # The broker runs under a subshell of run_broker, so end it by parent too.
   [[ -n ${broker_pid:-} ]] && pkill -P "$broker_pid" 2>/dev/null && kill "$broker_pid" 2>/dev/null
   [[ -n ${compositor_pid:-} ]] && kill "$compositor_pid" 2>/dev/null
@@ -673,7 +681,7 @@ window_of() {
 }
 
 run_broker() {
-  XDG_RUNTIME_DIR="$test_dir/runtime" WAYLAND_DISPLAY=compositor PATH="$test_dir/bin:$ROOT/bin:$PATH" "$@"
+  HOME="$test_dir/home" XDG_RUNTIME_DIR="$test_dir/runtime" WAYLAND_DISPLAY=compositor PATH="$test_dir/bin:$ROOT/bin:$PATH" "$@"
 }
 
 python3 "$test_dir/compositor.py" "$test_dir/runtime/compositor" "$test_dir/compositor.log" &
@@ -1451,7 +1459,7 @@ time.sleep(3)
 ' "$test_dir/runtime/omarchy/agent-seat/control")
 stalled_pid=$!
 read -r -t 5 line <&"$stalled"
-timeout 1 bash -c "XDG_RUNTIME_DIR='$test_dir/runtime' PATH='$test_dir/bin:$ROOT/bin:$PATH' omarchy-agent-seat-status" >/dev/null || fail "a caller that never finishes its request does not hold up the broker"
+timeout 1 bash -c "HOME='$test_dir/home' XDG_RUNTIME_DIR='$test_dir/runtime' PATH='$test_dir/bin:$ROOT/bin:$PATH' omarchy-agent-seat-status" >/dev/null || fail "a caller that never finishes its request does not hold up the broker"
 exec {stalled}<&-
 kill "$stalled_pid" 2>/dev/null
 oversized=$(python3 -c '
@@ -1469,7 +1477,7 @@ echo 1 >"$test_dir/hyprctl-delay"
 run_broker omarchy-agent-seat-windows >"$test_dir/slow-windows.json" &
 slow_windows=$!
 sleep 0.3
-timeout 1 bash -c "XDG_RUNTIME_DIR='$test_dir/runtime' PATH='$test_dir/bin:$ROOT/bin:$PATH' omarchy-agent-seat-status" >/dev/null || fail "a slow Hyprland does not hold up the broker"
+timeout 1 bash -c "HOME='$test_dir/home' XDG_RUNTIME_DIR='$test_dir/runtime' PATH='$test_dir/bin:$ROOT/bin:$PATH' omarchy-agent-seat-status" >/dev/null || fail "a slow Hyprland does not hold up the broker"
 wait "$slow_windows" || fail "windows answers once Hyprland does"
 rm "$test_dir/hyprctl-delay"
 jq -e 'type == "array"' "$test_dir/slow-windows.json" >/dev/null || fail "windows answers once Hyprland does" "$(cat "$test_dir/slow-windows.json")"
@@ -1626,3 +1634,5 @@ run_broker omarchy-agent-seat-status >/dev/null || fail "a broker out of file de
 pass "a broker out of file descriptors waits instead of spinning, then recovers"
 run_broker omarchy-agent-seat-stop >/dev/null
 wait "$broker_pid" 2>/dev/null
+
+[[ $(real_seat_dirs) == "$real_seat_before" ]] || fail "the suite leaves the user's own seat home and state alone" "$(diff <(echo "$real_seat_before") <(real_seat_dirs))"
