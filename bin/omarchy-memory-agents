@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 # omarchy:summary=Show which AI agents are using the memory, charged per agent
 # omarchy:args=[--json]
+# omarchy:examples=omarchy memory agents | omarchy memory agents --json
 
 # Every process is charged to the nearest AI agent above it in the process tree,
 # so a build or headless editor an agent started counts against that agent.
@@ -18,11 +19,6 @@ import shutil
 import sys
 import time
 
-AGENT_NAMES = {
-    "claude", "codex", "cursor-agent", "opencode", "crush", "agy", "gemini", "grok",
-    "pi", "omp", "ori", "hermes", "muse", "copilot", "openclaw", "aider", "goose",
-}
-
 CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 # Claude Code's session and subagent files are not a published interface, so
 # everything read from them is optional. A subagent counts as active while its
@@ -35,18 +31,11 @@ loader.exec_module(top)
 
 
 def agent_kind(pid):
-    """The agent this process is, if any. Node-hosted agents show up as `node
-    .../bin/<agent>`, so the first two argv words are checked, not just comm."""
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            argv = f.read().split(b"\0")[:2]
+            return top.agent_kind(f.read().split(b"\0"))
     except OSError:
         return None
-    for word in argv:
-        base = os.path.basename(word.decode(errors="replace"))
-        if base in AGENT_NAMES:
-            return base
-    return None
 
 
 def parent(pid):

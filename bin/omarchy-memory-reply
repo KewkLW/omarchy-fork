@@ -12,5 +12,10 @@ approve | standdown | resolved) ;;
   ;;
 esac
 
-mkdir -p "$HOME/.local/state/omarchy/memory-watch"
-echo "$1" >"$HOME/.local/state/omarchy/memory-watch/reply"
+state=$HOME/.local/state/omarchy/memory-watch
+mkdir -p "$state"
+echo "$1" >"$state/reply"
+# The watcher reads this too: no more pauses and no more responders until
+# memory has recovered, even once this ask is over.
+[[ $1 == standdown ]] && touch "$state/standdown"
+exit 0

@@ -1,0 +1,157 @@
+#!/usr/bin/python3
+# omarchy:summary=Signal one process for the memory responder, refusing anything it must never touch
+# omarchy:args=<pid> [TERM|KILL|STOP|CONT]
+# omarchy:examples=omarchy memory kill 4242 | omarchy memory kill 4242 STOP
+# omarchy:hidden=true
+
+# The memory-emergency skill sends every signal through here, so its hard rules
+# hold in code and not only in a prompt. Refused: other users' processes, this
+# command's own ancestors (the responder itself), anything omarchy-memory-top
+# protects (the compositor and session, systemd, audio, dbus, terminals, AI
+# agent sessions, the watchdog and responder), and games with everything
+# running under them (Steam, Proton, Wine).
+#
+# The signal goes through a pidfd opened before the checks, so a pid reused in
+# between can't receive it. A stopped process gets SIGCONT before SIGTERM,
+# since a stopped process only acts on SIGTERM once it runs again. SIGSTOP is
+# recorded in frozen.tsv (source responder when run from the responder's unit,
+# user otherwise) so omarchy-memory-resume can undo it; every signal is logged
+# to watch.log.
+
+import fcntl
+import importlib.machinery
+import importlib.util
+import os
+import re
+import shutil
+import signal
+import sys
+import time
+
+STATE = os.path.expanduser("~/.local/state/omarchy/memory-watch")
+SIGNALS = {"TERM": signal.SIGTERM, "KILL": signal.SIGKILL, "STOP": signal.SIGSTOP, "CONT": signal.SIGCONT}
+GAME = re.compile(r"^(steam.*|gamescope.*|wine.*|.*\.exe)$")
+
+loader = importlib.machinery.SourceFileLoader("top", shutil.which("omarchy-memory-top"))
+top = importlib.util.module_from_spec(importlib.util.spec_from_loader("top", loader))
+loader.exec_module(top)
+
+
+def proc(pid):
+    """name, cmdline words, uid, state, ppid, pgid, start, cgroup, kB of RAM + swap."""
+    status = top.read(f"/proc/{pid}/status")
+    stat = top.read(f"/proc/{pid}/stat")
+    raw = top.read(f"/proc/{pid}/cmdline", "rb")
+    cgroup = top.read(f"/proc/{pid}/cgroup").strip().split("::")[-1]
+    fields = dict(l.split(":", 1) for l in status.splitlines() if ":" in l)
+    rest = stat[stat.rindex(")") + 2:].split()
+    kb = lambda k: int(fields.get(k, "0 kB").split()[0])
+    return {
+        "pid": pid, "name": re.sub(r"\s", " ", fields["Name"].strip()), "argv": raw.split(b"\0"),
+        "cmd": raw.replace(b"\0", b" ").decode(errors="replace").strip(),
+        "uid": int(fields["Uid"].split()[0]), "state": rest[0], "ppid": int(rest[1]),
+        "pgid": int(rest[2]), "start": rest[19], "cgroup": cgroup, "kb": kb("VmRSS") + kb("VmSwap"),
+    }
+
+
+def ancestors(pid):
+    seen = 0
+    while pid > 1 and seen < 64:
+        try:
+            pid = proc(pid)["ppid"]
+        except (OSError, KeyError, ValueError, IndexError):
+            return
+        seen += 1
+        yield pid
+
+
+def refusal(p):
+    if p["uid"] != os.getuid():
+        return "it belongs to another user"
+    if p["pid"] <= 1 or p["pid"] == os.getpid() or p["pid"] in ancestors(os.getpid()):
+        return "it is the responder itself or one of its parents"
+    if top.PROTECT.match(p["name"]) or top.PROTECT_CMD.search(p["cmd"]):
+        return "it is protected (session, compositor, audio, dbus, terminal, or game)"
+    if "omarchy-memory" in p["cgroup"]:
+        return "it is the memory watchdog or its responder"
+    if top.agent_kind(p["argv"]):
+        return "it is an AI agent session; message it instead"
+    for pid in ancestors(p["pid"]):
+        try:
+            a = proc(pid)
+        except (OSError, KeyError, ValueError, IndexError):
+            break
+        if GAME.match(a["name"]) or top.PROTECT_CMD.search(a["cmd"]):
+            return f"it runs under a game ({a['name']} {a['pid']})"
+    return None
+
+
+def source():
+    try:
+        return "responder" if "omarchy-memory-agent" in top.read("/proc/self/cgroup") else "user"
+    except OSError:
+        return "user"
+
+
+def log(line):
+    os.makedirs(STATE, exist_ok=True)
+    with open(os.path.join(STATE, "watch.log"), "a") as f:
+        f.write(f"{time.strftime('%F %T')} {line}\n")
+
+
+def record_pause(p, who):
+    os.makedirs(STATE, exist_ok=True)
+    with open(os.path.join(STATE, "frozen.lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with open(os.path.join(STATE, "frozen.tsv"), "a") as f:
+            key = f"{p['cgroup']}#{p['pgid']}@{p['pid']}"
+            f.write("\t".join([time.strftime("%F %T"), who, key, str(p["kb"] // 1024),
+                               p["name"], str(p["pid"]), p["start"]]) + "\n")
+
+
+def main():
+    args = sys.argv[1:]
+    if not 1 <= len(args) <= 2 or not args[0].isdigit():
+        print("Usage: omarchy-memory-kill <pid> [TERM|KILL|STOP|CONT]", file=sys.stderr)
+        return 2
+    pid = int(args[0])
+    name = (args[1] if len(args) == 2 else "TERM").upper().removeprefix("SIG")
+    if name not in SIGNALS:
+        print(f"Refusing SIG{name}: only TERM, KILL, STOP and CONT", file=sys.stderr)
+        return 2
+
+    try:
+        pidfd = os.pidfd_open(pid)
+        p = proc(pid)
+    except (OSError, KeyError, ValueError, IndexError):
+        print(f"No process {pid} (it may have exited)", file=sys.stderr)
+        return 1
+
+    who = source()
+    why = refusal(p)
+    if why:
+        log(f"kill: {who} refused SIG{name} to {p['name']} ({pid}): {why}")
+        print(f"Refusing to signal {p['name']} ({pid}): {why}", file=sys.stderr)
+        return 1
+
+    try:
+        # SIGTERM to a stopped process waits until it runs again.
+        if name == "TERM" and p["state"] in "Tt":
+            signal.pidfd_send_signal(pidfd, signal.SIGCONT)
+        signal.pidfd_send_signal(pidfd, SIGNALS[name])
+    except OSError as e:
+        log(f"kill: {who} could not send SIG{name} to {p['name']} ({pid}): {e.strerror}")
+        print(f"Could not signal {p['name']} ({pid}): {e.strerror}", file=sys.stderr)
+        return 1
+    finally:
+        os.close(pidfd)
+
+    if name == "STOP":
+        record_pause(p, who)
+    log(f"kill: {who} sent SIG{name} to {p['name']} ({pid}, {p['kb'] // 1024}M): {p['cmd'][:120]}")
+    print(f"Sent SIG{name} to {p['name']} ({pid}, {p['kb'] // 1024}M)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

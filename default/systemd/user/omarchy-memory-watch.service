@@ -1,8 +1,10 @@
 [Unit]
-Description=Head off out-of-memory session kills: pause runaway processes and hand the emergency to an AI agent
-# Needs the session bus to notify, and the default agent's environment.
-After=graphical-session.target
+Description=Warn before systemd-oomd kills an app, pause the runaway, and hand the emergency to an AI agent
+# Needs the session bus to notify, and OMARCHY_PATH, which UWSM imports, for
+# the commands it runs.
+After=graphical-session.target wayland-session-waitenv.service
 PartOf=graphical-session.target
+ConditionEnvironment=OMARCHY_PATH
 ConditionEnvironment=WAYLAND_DISPLAY
 # Opt-in, set by omarchy-toggle-memory-watch.
 ConditionPathExists=%h/.local/state/omarchy/toggles/memory-watch-on
@@ -12,8 +14,10 @@ Type=simple
 ExecStart=/usr/bin/omarchy-memory-watch
 Restart=always
 RestartSec=3
-# Ask systemd-oomd to kill something else first: this is what stops the kill.
-ManagedOOMPreference=avoid
+# A user service lands in app.slice by default, which is exactly what
+# systemd-oomd picks from. Beside the compositor, it is never a candidate and
+# is still running to report the kill.
+Slice=session.slice
 CPUWeight=1000
 
 [Install]

@@ -4,22 +4,53 @@
 # omarchy:args=[name-regex]
 # omarchy:examples=omarchy memory resume | omarchy memory resume clang
 
+# frozen.tsv has one line per pause: time, who paused it (brake, responder,
+# user), key, total_mb, name, pids, and the pids' start times. A pid only gets
+# SIGCONT while it still has the start time recorded for it, so a process
+# that has since exited and had its pid reused is left alone. The file is
+# rewritten under frozen.lock, which everything that writes it takes.
+#
+# A job paused in a terminal with Ctrl+Z is not here; `fg` in that terminal
+# brings it back.
+
 set -uo pipefail
 
-frozen=$HOME/.local/state/omarchy/memory-watch/frozen.tsv
+state=$HOME/.local/state/omarchy/memory-watch
+frozen=$state/frozen.tsv
+
+start_time() {
+  local stat
+  { stat=$(<"/proc/$1/stat"); } 2>/dev/null || return 1
+  stat=${stat##*) }
+  read -ra stat <<<"$stat"
+  echo "${stat[19]}"
+}
 
 if [[ ! -s $frozen ]]; then
   echo "Nothing is paused"
   exit 0
 fi
 
-kept=$(mktemp)
-while IFS=$'\t' read -r paused_at key mb name pids; do
+exec 9>"$state/frozen.lock"
+flock -w 10 9 || {
+  echo "frozen.tsv is busy; try again" >&2
+  exit 1
+}
+
+kept=$(mktemp "$frozen.XXXXXX")
+while IFS=$'\t' read -r paused_at source key mb name pids starts; do
   if [[ -z ${1:-} || $name =~ $1 ]]; then
-    kill -CONT ${pids//,/ } 2>/dev/null
-    echo "Resumed $name (${mb}M, paused $paused_at)"
+    IFS=, read -ra pid_list <<<"$pids"
+    IFS=, read -ra start_list <<<"$starts"
+    resumed=0
+    for i in "${!pid_list[@]}"; do
+      if [[ -n ${start_list[i]:-} && $(start_time "${pid_list[i]}") == "${start_list[i]}" ]] && kill -CONT "${pid_list[i]}" 2>/dev/null; then
+        ((resumed++))
+      fi
+    done
+    echo "Resumed $name (${mb}M, $resumed of ${#pid_list[@]} processes still there, paused by $source at $paused_at)"
   else
-    printf '%s\t%s\t%s\t%s\t%s\n' "$paused_at" "$key" "$mb" "$name" "$pids" >>"$kept"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$paused_at" "$source" "$key" "$mb" "$name" "$pids" "$starts" >>"$kept"
   fi
 done <"$frozen"
 mv "$kept" "$frozen"

@@ -1,21 +1,39 @@
 #!/bin/bash
 
-# omarchy:summary=Toggle the memory watchdog that heads off out-of-memory session kills
+# omarchy:summary=Toggle the memory watchdog that warns before systemd-oomd kills an app
+# omarchy:args=[toggle|on|off]
+# omarchy:examples=omarchy toggle memory-watch | omarchy toggle memory-watch off
 
-# Off by default: when memory runs out it runs the default agent unattended, with
-# permission prompts skipped, so that is the user's call to make.
+# Off by default: when memory runs out it pauses processes on its own and runs
+# the default agent unattended, approving its own actions (Codex even without
+# its sandbox), so that is the user's call to make.
 
 # nf-md-memory, escaped so this file reads without a Nerd Font.
 readonly MEMORY_GLYPH=$'\U000f035b'
 
-omarchy-toggle memory-watch-on
+unit_name=omarchy-memory-watch.service
+unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit_name"
+unit_source="$OMARCHY_PATH/default/systemd/user/$unit_name"
 
-# The unit checks the same flag with ConditionPathExists, so an enabled unit stays
-# inert after the flag is removed, even across logins.
+omarchy-toggle memory-watch-on "${1:-toggle}" || exit 1
+
+# Not shipped in /usr/lib/systemd/user, so the unit is only on machines that
+# asked for it. Copied each time it is turned on, so a changed unit is only
+# picked up by turning it off and on again. The unit also checks the flag with
+# ConditionPathExists, so a stale enable without the flag stays inert.
 if omarchy-toggle-enabled memory-watch-on; then
-  systemctl --user enable --now omarchy-memory-watch.service
+  install -Dm644 "$unit_source" "$unit"
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$unit_name"
   omarchy-notification-send -g "$MEMORY_GLYPH" "Memory watchdog enabled"
 else
-  systemctl --user disable --now omarchy-memory-watch.service
+  systemctl --user disable --now "$unit_name"
+  # A responder already running would carry on with nothing to stop it.
+  systemctl --user stop omarchy-memory-agent.service 2>/dev/null
+  # Nothing would be left to say what it paused, or to resume it.
+  omarchy-memory-resume >/dev/null
+  rm -f "$HOME/.local/state/omarchy/memory-watch/standdown"
+  rm -f "$unit"
+  systemctl --user daemon-reload
   omarchy-notification-send -g "$MEMORY_GLYPH" "Memory watchdog disabled"
 fi

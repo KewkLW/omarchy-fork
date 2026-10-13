@@ -33,8 +33,7 @@ within the skill's rules.
 ${OMARCHY_MEMORY_DRILL:+
 DRILL: $OMARCHY_MEMORY_DRILL
 }
-Use the memory-emergency skill. If your harness has no skill mechanism, read the
-skill file directly and follow it:
+Read the memory-emergency skill and follow it:
 
   $skill
 PROMPT
@@ -42,13 +41,54 @@ PROMPT
 
 agent=$(omarchy-default-agent)
 
-# Only agents with an unattended one-shot mode that may signal other processes.
+# Only agents with an unattended one-shot mode. Neither the user's settings
+# nor their MCP servers load: the responder reads other agents' notes and
+# transcripts, and must not act on them with everything the user has
+# connected. Signals are meant to go through omarchy-memory-kill, which
+# refuses what must never be touched; the limits below keep the agent from
+# going around it where the harness can enforce that.
 case "$agent" in
 claude)
-  command=(claude -p --permission-mode bypassPermissions "$prompt")
+  # omarchy-agent's auto mode, restricted: file tools confined to the state
+  # directory (writable) and the skill and Claude's transcripts (read only),
+  # raw signals, deletes and service control denied outright, and the
+  # skill's own commands allowed without review. Anything else still goes
+  # through auto mode's classifier.
+  claude_home=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+  skill_dir=${skill%/*}
+  read_dirs=("$skill_dir")
+  [[ -d $claude_home/projects ]] && read_dirs+=("$claude_home/projects")
+  settings=$(jq -cn --arg state "$state" --args '{permissions: {
+    allow: [
+      "Bash(omarchy-memory-*)", "Bash(omarchy memory *)", "Bash(omarchy-notification-send *)",
+      "Bash(free*)", "Bash(ps *)", "Bash(cat /proc/*)", "Bash(journalctl *)",
+      "Bash(systemd-cgtop *)", "Bash(sleep *)", "Bash(tail *)",
+      "Edit(/\($state)/**)", "Read", "ToolSearch", "SendMessage", "ListAgents"
+    ],
+    deny: ([
+      "Bash(kill:*)", "Bash(pkill:*)", "Bash(killall:*)", "Bash(rm:*)", "Bash(systemctl:*)",
+      "Bash(loginctl:*)", "Bash(hyprctl:*)", "Bash(sudo:*)", "Bash(omarchy agent:*)",
+      "Bash(omarchy-agent:*)"
+    ] + [$ARGS.positional[] | "Edit(/\(.)/**)"])
+  }}' "${read_dirs[@]}")
+  command=(claude -p --permission-mode auto --restricted
+    --tools Bash,Read,Write,ToolSearch,SendMessage,ListAgents --settings "$settings")
+  for dir in "${read_dirs[@]}"; do
+    command+=(--add-dir "$dir")
+  done
+  command+=(--strict-mcp-config -- "$prompt")
   ;;
 codex)
-  command=(codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$prompt")
+  # Codex's workspace-write sandbox, which --approve-for-me implies, runs
+  # commands in their own pid namespace, where no other process can be seen
+  # or signalled. So no sandbox, with --approve-for-me's approval settings
+  # (on-request, reviewed automatically). Codex offers no way to forbid
+  # commands here (execpolicy rules are not loaded without the user's
+  # config), so it relies on the skill and omarchy-memory-kill's refusals.
+  # --ignore-user-config leaves out config.toml and its MCP servers; auth
+  # still comes from CODEX_HOME.
+  command=(codex exec --sandbox danger-full-access -c 'approval_policy="on-request"'
+    -c 'approvals_reviewer="auto_review"' --ignore-user-config --skip-git-repo-check -- "$prompt")
   ;;
 *)
   omarchy-notification-send --urgency critical --glyph "$MEMORY_GLYPH" \
@@ -60,4 +100,5 @@ codex)
 esac
 
 cd "$state"
-"${command[@]}" >"$state/reports/$stamp.agent.log" 2>&1
+# Codex waits for more input on an open stdin.
+"${command[@]}" >"$state/reports/$stamp.agent.log" 2>&1 </dev/null
