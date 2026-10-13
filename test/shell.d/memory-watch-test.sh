@@ -208,17 +208,17 @@ pass "memory top lists process groups"
 # The responder reads how much of the used RAM no process of this user's
 # holds, since no kill can free that.
 # zram's share is a process's too: swapped-out pages, compressed, still in RAM.
-printf 'MemTotal: 1000000 kB\nMemAvailable: 100000 kB\n' >"$fake/meminfo"
+printf 'MemTotal: 1000000 kB\nMemAvailable: 100000 kB\nShmem: 51200 kB\n' >"$fake/meminfo"
 mkdir -p "$fake/block/zram0" "$fake/block/sda"
 printf '0 0 104857600 0 0 0 0 0 0\n' >"$fake/block/zram0/mm_stat"
 line=$(run env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" OMARCHY_MEMORY_SYS_BLOCK="$fake/block" "$ROOT/bin/omarchy-memory-top")
 line=${line%%$'\n'*}
-[[ $line == "RAM used 878M of 976M; this user's processes hold "*"M, other users' "*"M, zram 100M; unaccounted "*"M ("*"% of RAM)" ]] ||
-  fail "memory top leads with used RAM against what processes and zram hold" "$line"
+[[ $line == "RAM used 878M of 976M; this user's processes hold "*"M, other users' "*"M, zram 100M, tmpfs 50M; unaccounted "*"M ("*"% of RAM)" ]] ||
+  fail "memory top leads with used RAM against what processes, zram and tmpfs hold" "$line"
 held=${line#*processes hold }; held=${held%%M*}
 others=${line#*other users\' }; others=${others%%M*}
 rest=${line#*unaccounted }; rest=${rest%%M*}
-expected=$((878 - held - others - 100))
+expected=$((878 - held - others - 100 - 50))
 ((expected < 0)) && expected=0
 ((rest == expected)) || fail "memory top counts zram's share as accounted for" "$line"
 pass "memory top says how much used RAM no process holds"
@@ -983,6 +983,8 @@ skill="$ROOT/default/agents/skills/memory-emergency/SKILL.md"
 grep -Fx 'name: memory-emergency' "$skill" >/dev/null || fail "the responder's skill is named for the prompt that loads it"
 grep -Fq 'unaccounted' "$skill" && grep -Fq 'no kill returns it' "$skill" ||
   fail "the skill tells the responder to stop killing when no process holds the memory"
+grep -Fq '/dev/shm' "$skill" && grep -Fq 'leave deleting them to the user' "$skill" ||
+  fail "the skill tells the responder to name files on tmpfs before advising a reboot"
 migration=$(grep -rl 'memory-emergency' "$ROOT/migrations" | head -n 1 || true)
 [[ -n $migration ]] || fail "existing installs never get the memory-emergency skill linked"
 grep -F 'omarchy-memory-watch.service' "$migration" | grep -F 'enable' >/dev/null &&

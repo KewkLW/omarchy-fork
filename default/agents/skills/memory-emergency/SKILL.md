@@ -104,13 +104,19 @@ in the report.
 
 4. **Safe fix**, when nobody has helped:
    - First read the top line of `omarchy memory top`: RAM used, what this user's
-     processes hold in RAM and in zram, what other users' processes hold, and
-     the unaccounted rest. Other users' memory (root's containers, a VM) is not
-     yours to signal, but it is the user's to stop: name it in the ask and the
-     report. If the unaccounted part is more than about a quarter of RAM, no
-     process holds that memory (after a hung GPU client, the driver can keep
-     tens of gigabytes) and no kill returns it: kill nothing, write the report
-     saying so, send an FYI that a reboot is the only fix, and stop.
+     processes hold in RAM and in zram, what other users' processes hold, what
+     files on tmpfs hold, and the unaccounted rest. Other users' memory (root's
+     containers, a VM) is not yours to signal, but it is the user's to stop:
+     name it in the ask and the report. Memory held by files on tmpfs (`/tmp`,
+     `/dev/shm`) is a build's or an asset job's leftovers more often than not:
+     when that figure is large, find the big files (`du -xsh /tmp/* /dev/shm/*
+     2>/dev/null | sort -h | tail`), name them in the ask and the report, and
+     leave deleting them to the user; killing the job that writes them is
+     still the safe fix if it is one. Only if the unaccounted part itself is
+     more than about a quarter of RAM does no process and no file hold that
+     memory (after a hung GPU client, the driver can keep tens of gigabytes)
+     and no kill returns it: kill nothing, write the report saying so, send an
+     FYI that a reboot is the only fix, and stop.
    - OK to kill (`omarchy-memory-kill <pid> TERM` on each pid of the group, wait
      5s, then `KILL` on what is left): anything restartable
      that holds no unsaved user state. That covers compilers, linkers and build
@@ -137,7 +143,7 @@ in the report.
 
 5. **Verify.** If RAM stays full after a kill and the unaccounted part has grown
    to take its place, stop killing: the memory is not a process's to give back.
-   Report it and advise a reboot. Memory has only recovered when swap has stopped climbing and RAM
+   Report it and advise a reboot. If tmpfs has grown instead, name the files. Memory has only recovered when swap has stopped climbing and RAM
    available is above ~15%. If it hasn't, go back to step 1 once.
 
 6. **Report.** Write the report file named in your prompt: a timeline, the culprit

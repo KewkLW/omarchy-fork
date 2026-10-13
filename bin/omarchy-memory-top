@@ -150,9 +150,13 @@ def memory_line(groups):
         fields[key] = int(value.split()[0])
     used = (fields["MemTotal"] - fields["MemAvailable"]) // 1024
     held, others, zram = held_mb(groups), others_mb(), zram_mb()
-    rest = max(used - held - others - zram, 0)
+    # Files on tmpfs (/tmp, /dev/shm) live in RAM and belong to no process; a
+    # page a process maps is in both figures, which errs toward calling less
+    # unaccounted for, never more.
+    tmpfs = fields.get("Shmem", 0) // 1024
+    rest = max(used - held - others - zram - tmpfs, 0)
     return (f"RAM used {used}M of {fields['MemTotal'] // 1024}M; this user's processes hold {held}M, "
-            f"other users' {others}M, zram {zram}M; "
+            f"other users' {others}M, zram {zram}M, tmpfs {tmpfs}M; "
             f"unaccounted {rest}M ({100 * rest // max(fields['MemTotal'] // 1024, 1)}% of RAM)")
 
 
