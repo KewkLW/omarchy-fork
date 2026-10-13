@@ -192,35 +192,43 @@ brake() {
   IFS=$'\t' read -r key mb name pids starts <<<"$picked"
   IFS=, read -ra pids <<<"$pids"
   IFS=, read -ra starts <<<"$starts"
-  # Individual pids, never `kill -- -pgid`: a pgid can span cgroups, and
-  # Hyprland's spans every app it launched.
-  for i in "${!pids[@]}"; do
-    pid=${pids[i]}
-    # Exited since the pick, or its pid already reused.
-    [[ $(start_time "$pid") == "${starts[i]}" ]] || continue
-    if kill -STOP "$pid" 2>/dev/null; then
-      stopped+=("$pid")
-      stopped_starts+=("${starts[i]}")
-    elif [[ -d /proc/$pid ]]; then
-      refused+=("$pid")
+  # Locked from the first SIGSTOP until the record is written: resume rewrites
+  # frozen.tsv under this lock and would drop a line appended without it,
+  # leaving the group paused with nothing to resume it. No lock, no pause.
+  {
+    if ! flock -w 5 9; then
+      log "brake: frozen.tsv stayed locked; left $name running ($(metrics))"
+      return
     fi
-  done
-  # Half a group paused is not a pause, and saying it was would be a lie.
-  if ((${#refused[@]})); then
-    ((${#stopped[@]})) && kill -CONT "${stopped[@]}" 2>/dev/null
-    log "brake: could not pause $name, pids ${refused[*]} refused SIGSTOP; left it running ($(metrics))"
-    return
-  fi
-  if ((${#stopped[@]} == 0)); then
-    log "brake: $name exited before it could be paused ($(metrics))"
-    return
-  fi
-  pids=$(IFS=,; echo "${stopped[*]}")
-  starts=$(IFS=,; echo "${stopped_starts[*]}")
-  (
-    flock -w 5 9
+    # Individual pids, never `kill -- -pgid`: a pgid can span cgroups, and
+    # Hyprland's spans every app it launched.
+    for i in "${!pids[@]}"; do
+      pid=${pids[i]}
+      # Exited since the pick, or its pid already reused.
+      [[ $(start_time "$pid") == "${starts[i]}" ]] || continue
+      if kill -STOP "$pid" 2>/dev/null; then
+        stopped+=("$pid")
+        stopped_starts+=("${starts[i]}")
+      elif [[ -d /proc/$pid ]]; then
+        refused+=("$pid")
+      fi
+    done
+    # Half a group paused is not a pause, and saying it was would be a lie.
+    if ((${#refused[@]})); then
+      ((${#stopped[@]})) && kill -CONT "${stopped[@]}" 2>/dev/null
+      log "brake: could not pause $name, pids ${refused[*]} refused SIGSTOP; left it running ($(metrics))"
+      return
+    fi
+    if ((${#stopped[@]} == 0)); then
+      log "brake: $name exited before it could be paused ($(metrics))"
+      return
+    fi
+    pids=$(IFS=,; echo "${stopped[*]}")
+    starts=$(IFS=,; echo "${stopped_starts[*]}")
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" brake "$key" "$mb" "$name" "$pids" "$starts" >>"$FROZEN"
-  ) 9>"$FROZEN_LOCK"
+  } 9>"$FROZEN_LOCK"
+  # After the lock is let go: the toast below runs in the background and would
+  # hold it for as long as it runs.
   log "brake: paused $name (${mb}M, pids $pids) $(metrics)"
   brake_pending=1
   omarchy-notification-send --urgency critical --glyph "$MEMORY_GLYPH" \
@@ -266,6 +274,7 @@ last_brake=0
 [[ $last_spawn =~ ^[0-9]+$ ]] || last_spawn=0
 hot=0
 brake_pending=0
+quit=0
 last_snapshot=0
 warm=0
 log "watching: warn at (swap>=${warn_swap_pct}% and ram>=${warn_swap_mem_pct}%) or (ram>=${warn_mem_pct}% and pressure>=${warn_psi}), brake at (swap>=${brake_swap_pct}% and ram>=${brake_swap_mem_pct}%) or (ram>=${brake_mem_pct}% and pressure>=${brake_psi})"
@@ -290,7 +299,13 @@ while true; do
     (mem_pct >= brake_mem_pct && psi >= brake_psi))) &&
     ((EPOCHSECONDS - last_brake >= brake_gap)) && [[ ! -e $STANDDOWN ]] && ! brake_held; then
     snapshot
+    # A TERM waits for the brake to finish: stopping the watcher between a
+    # SIGSTOP and its line in frozen.tsv would leave a pause that
+    # omarchy-memory-resume, run when the watchdog is turned off, cannot see.
+    trap 'quit=1' TERM INT
     brake
+    trap 'exit 0' TERM INT
+    ((quit)) && exit 0
     last_brake=$EPOCHSECONDS
   fi
 

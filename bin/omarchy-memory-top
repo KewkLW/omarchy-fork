@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 # omarchy:summary=Show this user's process groups by memory use (RAM + swap)
-# omarchy:args=[--json] [--pick <min-mb>]
+# omarchy:args=[--json] [--pick <min-mb>] [--agent <pid>]
 # omarchy:examples=omarchy memory top | omarchy memory top --pick 1024
 
 # A group is (cgroup, process group id). Neither alone works: apps launched from
@@ -38,6 +38,9 @@
 # AI agent sessions (AGENT_NAMES) are protected too: they may hold a user's
 # conversation, and the memory responder has to message them. The builds and
 # editors they start are not.
+#
+# --agent prints which agent <pid> is, by the same agent_kind() check; exit 1
+# if none. omarchy-memory-note names a note's sender with it.
 #
 # OMARCHY_MEMORY_PROTECT  regex on process names that are never paused
 # OMARCHY_MEMORY_ONLY     if set, --pick only considers candidates whose name or cmdline matches
@@ -208,6 +211,16 @@ def pick(groups, min_mb):
 
 
 def main():
+    if "--agent" in sys.argv:
+        try:
+            kind = agent_kind(read(f"/proc/{int(sys.argv[sys.argv.index('--agent') + 1])}/cmdline",
+                                   "rb").split(b"\0"))
+        except (OSError, ValueError, IndexError):
+            return 1
+        if kind is None:
+            return 1
+        print(kind)
+        return 0
     groups = scan()
     if "--json" in sys.argv:
         for g in groups:

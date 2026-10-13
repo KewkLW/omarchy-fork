@@ -329,6 +329,84 @@ for pid in "$dummy_pid" "$dummy2_pid"; do
 done
 pass "memory brake holds only while its pause does"
 
+# Whatever holds frozen.lock: waits until it has it.
+wait_locked() {
+  local i
+  for ((i = 0; i < 50; i++)); do
+    flock -n "$state/frozen.lock" true || return 0
+    sleep 0.1
+  done
+  fail "the test's lock holder takes frozen.lock"
+}
+
+# A resume that holds frozen.lock past the brake's wait rewrites frozen.tsv
+# from the copy it read, dropping any line appended meanwhile. The brake
+# pauses nothing it cannot record under the lock.
+setsid bash -c 'exec -a omarchy-memtest-locked sleep 3040' &
+locked_pid=$!
+dummy_pids+=("$locked_pid")
+: >"$state/frozen.tsv"
+: >"$state/watch.log"
+(
+  flock 9
+  cp "$state/frozen.tsv" "$TMPDIR/frozen.kept"
+  sleep 8.5
+  mv "$TMPDIR/frozen.kept" "$state/frozen.tsv"
+) 9>"$state/frozen.lock" &
+holder=$!
+wait_locked
+run env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" OMARCHY_MEMORY_PRESSURE="$fake/pressure" \
+  OMARCHY_MEMORY_APP_PRESSURE="$fake/app-pressure" OMARCHY_MEMORY_INTERVAL=0.2 \
+  OMARCHY_MEMORY_ONLY=omarchy-memtest-locked OMARCHY_MEMORY_BRAKE_MIN_MB=0 \
+  timeout 7.5 "$ROOT/bin/omarchy-memory-watch" 2>/dev/null || true
+wait "$holder"
+if [[ $(proc_state "$locked_pid") == "T" ]]; then
+  grep -Fq $'\t'"$locked_pid"$'\t' "$state/frozen.tsv" ||
+    fail "the brake never leaves a group paused with no record to resume it" "$(cat "$state/frozen.tsv")"
+fi
+[[ $(proc_state "$locked_pid") != "T" ]] && grep -Fq 'brake: frozen.tsv stayed locked; left sleep running' "$state/watch.log" ||
+  fail "the brake pauses nothing while it cannot take frozen.lock, and says so" "$(cat "$state/watch.log")"
+pass "memory brake pauses only what it can record"
+
+# Turning the watchdog off stops it with a TERM to everything in its unit, then
+# resumes what frozen.tsv lists. A TERM while the brake is under way must not
+# leave a group stopped with no line there.
+: >"$state/frozen.tsv"
+: >"$state/watch.log"
+(
+  flock 9
+  exec -a omarchy-memtest-lockhold sleep 3041
+) 9>"$state/frozen.lock" &
+holder=$!
+dummy_pids+=("$holder")
+wait_locked
+run env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" OMARCHY_MEMORY_PRESSURE="$fake/pressure" \
+  OMARCHY_MEMORY_APP_PRESSURE="$fake/app-pressure" OMARCHY_MEMORY_INTERVAL=0.2 \
+  OMARCHY_MEMORY_ONLY=omarchy-memtest-locked OMARCHY_MEMORY_BRAKE_MIN_MB=0 \
+  timeout 10 "$ROOT/bin/omarchy-memory-watch" 2>/dev/null &
+watch_job=$!
+# timeout leads its own process group, as a unit's cgroup holds the watcher.
+group= waiter=
+for _ in {1..50}; do
+  group=$(pgrep -P "$watch_job" -x timeout || true)
+  [[ -n $group ]] && waiter=$(pgrep -g "$group" -x flock || true)
+  [[ -n $waiter ]] && break
+  sleep 0.1
+done
+[[ -n $waiter ]] || fail "the brake waits for frozen.lock while something else holds it"
+kill -TERM -- -"$group"
+sleep 0.3
+kill "$holder"
+wait "$watch_job" || true
+! pgrep -g "$group" >/dev/null || fail "a TERM during the brake still stops the watcher"
+if [[ $(proc_state "$locked_pid") == "T" ]]; then
+  grep -Fq $'\t'"$locked_pid"$'\t' "$state/frozen.tsv" ||
+    fail "a TERM during the brake never leaves a group paused with no record" "$(cat "$state/frozen.tsv")"
+fi
+run "$ROOT/bin/omarchy-memory-resume" >/dev/null
+[[ $(proc_state "$locked_pid") != "T" ]] || fail "resume continues a pause the brake made as it was stopped"
+pass "memory brake leaves nothing paused unrecorded when stopped"
+
 # Turning the watchdog off resumes what it paused.
 kill -STOP "$dummy_pid"
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "2026-01-01 00:00:00" brake "test#$dummy_pid" 1 sleep "$dummy_pid" \
@@ -468,6 +546,40 @@ run "$ROOT/bin/omarchy-memory-agents" --json | jq -e --argjson agent "$fat_agent
 kill "$fat_child" "$fat_agent" 2>/dev/null || true
 pass "memory agents charges an agent for the group it leads"
 
+# An agent that runs the scan itself, inside its own group, is still charged
+# for that group; only the scan is left out.
+cat >"$TMPDIR/bin/omarchy-memtest-selfscan" <<'SH'
+#!/bin/bash
+omarchy-memtest-fat &
+fat=$!
+until [[ -e $1.go ]]; do sleep 0.1; done
+bash -c 'echo $$ >"$1.pid"; exec omarchy-memory-agents --json' _ "$1" >"$1.json"
+kill "$fat"
+SH
+chmod +x "$TMPDIR/bin/omarchy-memtest-selfscan"
+selfscan="$TMPDIR/selfscan"
+setsid env PATH="$TMPDIR/bin:$ROOT/bin:$PATH" HOME="$test_home" \
+  bash -c "exec -a claude bash '$TMPDIR/bin/omarchy-memtest-selfscan' '$selfscan'" &
+self_agent=$!
+dummy_pids+=("$self_agent")
+self_child=
+for _ in {1..50}; do
+  self_child=$(pgrep -P "$self_agent" -x python3 || true)
+  [[ -n $self_child ]] &&
+    (($(awk '/^VmRSS:/ { print $2 }' "/proc/$self_child/status" 2>/dev/null || echo 0) >= 49152)) && break
+  sleep 0.1
+done
+[[ -n $self_child ]] || fail "the self-scanning agent dummy starts its child"
+dummy_pids+=("$self_child")
+touch "$selfscan.go"
+wait "$self_agent" || true
+jq -e --argjson agent "$self_agent" --argjson child "$self_child" --argjson scan "$(<"$selfscan.pid")" \
+  'any(.[]; .pid == $agent and .kind == "claude" and .total_mb >= 48
+       and any(.groups[]; .pids | index($agent) and index($child)))
+   and ([.[].groups[].pids[]] | index($scan) | not)' "$selfscan.json" >/dev/null ||
+  fail "memory agents run by an agent charges that agent for its group, less the scan" "$(cat "$selfscan.json")"
+pass "memory agents run inside an agent's group still charges that agent"
+
 # A game's own binary often has a bland name (under gamescope, or a Proton
 # helper), so the brake protects everything under a game, as memory kill does:
 # a child in the game's group, and one in a group of its own.
@@ -564,6 +676,18 @@ pass "memory reply accepts only known answers"
 run "$ROOT/bin/omarchy-memory-note" "test note" >/dev/null
 grep -Fq $'\t''test note' "$state/agent-notes.log" || fail "agent notes are logged"
 pass "memory note logs agent replies"
+
+# A node-hosted agent's comm is node, so the note names it by its cmdline.
+mkdir -p "$TMPDIR/node-host/bin"
+ln -s "$(command -v bash)" "$TMPDIR/node-host/node"
+cat >"$TMPDIR/node-host/bin/claude" <<'SH'
+omarchy-memory-note "from a node agent" >/dev/null
+echo $$
+SH
+node_agent=$(run "$TMPDIR/node-host/node" "$TMPDIR/node-host/bin/claude")
+grep -Fq $'\t'"claude-$node_agent"$'\t''from a node agent' "$state/agent-notes.log" ||
+  fail "memory note names a node-hosted agent" "$(cat "$state/agent-notes.log")"
+pass "memory note names a node-hosted agent by its cmdline"
 
 # Turning the watchdog off also stops a responder that is still running.
 : >"$SYSTEMCTL_LOG"

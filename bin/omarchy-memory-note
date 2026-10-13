@@ -20,9 +20,9 @@ while ((pid > 1)); do
     sender=$(jq -r '.name // "claude-\(.pid)"' "$claude_home/sessions/$pid.json")
     break
   fi
-  comm=$(cat "/proc/$pid/comm" 2>/dev/null)
-  if [[ $comm =~ ^(claude|codex|cursor-agent|opencode|crush|agy|gemini|grok|pi|omp|ori|hermes|muse|copilot|aider|goose)$ ]]; then
-    sender=$comm-$pid
+  # By cmdline, not comm: a node-hosted agent's comm is node.
+  if kind=$(omarchy-memory-top --agent "$pid" 2>/dev/null); then
+    sender=$kind-$pid
     break
   fi
   pid=$(awk '{ print $4 }' "/proc/$pid/stat" 2>/dev/null) || break
