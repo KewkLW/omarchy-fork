@@ -34,6 +34,8 @@ SH
 cat >"$TMPDIR/bin/systemd-run" <<'SH'
 #!/bin/bash
 printf '%s\n' "$*" >>"$SYSTEMD_RUN_LOG"
+# A user manager that cannot start the unit, when the test asks for one.
+[[ ! -e $SYSTEMD_RUN_LOG.fail ]]
 SH
 
 # --print-id answers with a fresh id, also kept with the toast in NOTIFY_LOG.ids.
@@ -447,6 +449,38 @@ grep -Fq -- '--slice=session.slice' "$SYSTEMD_RUN_LOG" ||
 run "$ROOT/bin/omarchy-memory-resume" >/dev/null
 pass "memory brake hands the emergency to the responder once"
 
+# A responder that could not start is tried again after a gap, with the
+# brake's reason kept, and starts no cooldown: a failed start must not cost
+# the paused group its handoff for 15 minutes.
+rm -f "$state/last-spawn"
+: >"$SYSTEMD_RUN_LOG"
+: >"$state/frozen.tsv"
+touch "$SYSTEMD_RUN_LOG.fail"
+watch OMARCHY_MEMORY_ONLY=omarchy-memtest-dummy OMARCHY_MEMORY_BRAKE_MIN_MB=0 OMARCHY_MEMORY_BRAKE_GAP=0 OMARCHY_MEMORY_RETRY=1
+rm -f "$SYSTEMD_RUN_LOG.fail"
+[[ $(proc_state "$dummy_pid") == "T" ]] || fail "the brake paused the group before the responder failed to start"
+(($(grep -c 'omarchy-agent-memory the memory brake paused a process group' "$SYSTEMD_RUN_LOG") >= 2)) ||
+  fail "a responder that could not start is tried again, for the brake's reason" "$(cat "$SYSTEMD_RUN_LOG")"
+grep -Fq 'could not start omarchy-memory-agent' "$state/watch.log" || fail "a failed responder start is logged"
+[[ ! -e $state/last-spawn ]] || fail "a responder that could not start begins no cooldown"
+run "$ROOT/bin/omarchy-memory-resume" >/dev/null
+pass "memory watchdog retries a responder that could not start"
+
+# A pause the brake cannot record (the disk full, say) is not kept: resume
+# and turning the watchdog off could never find it.
+: >"$SYSTEMD_RUN_LOG"
+rm -f "$state/frozen.tsv"
+ln -s /dev/full "$state/frozen.tsv"
+paused_before=$(grep -c 'brake: paused' "$state/watch.log")
+watch OMARCHY_MEMORY_ONLY=omarchy-memtest-dummy OMARCHY_MEMORY_BRAKE_MIN_MB=0 OMARCHY_MEMORY_BRAKE_GAP=0
+rm -f "$state/frozen.tsv"
+[[ $(proc_state "$dummy_pid") != "T" ]] || fail "the brake resumes a pause it could not record" "$(tail -3 "$state/watch.log")"
+grep -Fq 'could not record the pause' "$state/watch.log" || fail "the brake says it could not record the pause"
+[[ $(grep -c 'brake: paused' "$state/watch.log") == "$paused_before" ]] || fail "the brake does not announce a pause it undid"
+[[ ! -s $SYSTEMD_RUN_LOG ]] || fail "a pause that was undone hands nothing to the responder" "$(cat "$SYSTEMD_RUN_LOG")"
+: >"$state/frozen.tsv"
+pass "memory brake keeps no pause it could not record"
+
 # The cooldown covers a responder the brake would start, too: one started for
 # nearly full memory is not followed by another when the brake then pauses.
 rm -f "$state/last-spawn"
@@ -729,6 +763,23 @@ node_agent=$(run "$TMPDIR/node-host/node" "$TMPDIR/node-host/bin/claude")
 grep -Fq $'\t'"claude-$node_agent"$'\t''from a node agent' "$state/agent-notes.log" ||
   fail "memory note names a node-hosted agent" "$(cat "$state/agent-notes.log")"
 pass "memory note names a node-hosted agent by its cmdline"
+
+# A wrapper whose name has a space sits between the agent and the note; the
+# parent pid is read after the name, not by field position.
+mkdir -p "$TMPDIR/spaced"
+ln -s "$(command -v bash)" "$TMPDIR/spaced/sp ace"
+cat >"$TMPDIR/spaced/inner" <<'SH'
+omarchy-memory-note "through a spaced wrapper" >/dev/null
+SH
+mkdir -p "$TMPDIR/spaced/bin"
+cat >"$TMPDIR/spaced/bin/claude" <<SH
+"$TMPDIR/spaced/sp ace" "$TMPDIR/spaced/inner"
+echo \$\$
+SH
+spaced_agent=$(run "$TMPDIR/node-host/node" "$TMPDIR/spaced/bin/claude")
+grep -Fq $'\t'"claude-$spaced_agent"$'\t''through a spaced wrapper' "$state/agent-notes.log" ||
+  fail "memory note reads the parent past a name with a space" "$(tail -2 "$state/agent-notes.log")"
+pass "memory note walks past a wrapper whose name has a space"
 
 # Turning the watchdog off also stops a responder that is still running.
 : >"$SYSTEMCTL_LOG"

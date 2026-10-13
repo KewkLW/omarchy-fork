@@ -90,6 +90,7 @@ agent_mem_pct=${OMARCHY_MEMORY_AGENT_MEM_PCT:-90}
 agent_swap_pct=${OMARCHY_MEMORY_AGENT_SWAP_PCT:-15}
 agent_psi=${OMARCHY_MEMORY_AGENT_PSI:-30}
 cooldown=${OMARCHY_MEMORY_COOLDOWN:-900}
+retry=${OMARCHY_MEMORY_RETRY:-30} # after a responder that could not start
 standdown_min=${OMARCHY_MEMORY_STANDDOWN_MIN:-30}
 
 mkdir -p "$STATE/reports"
@@ -225,7 +226,13 @@ brake() {
     fi
     pids=$(IFS=,; echo "${stopped[*]}")
     starts=$(IFS=,; echo "${stopped_starts[*]}")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" brake "$key" "$mb" "$name" "$pids" "$starts" >>"$FROZEN"
+    # A pause nothing has on record would outlive the watchdog: with the disk
+    # full, say, the group runs on rather than stays stopped.
+    if ! printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" brake "$key" "$mb" "$name" "$pids" "$starts" >>"$FROZEN" 2>/dev/null; then
+      kill -CONT "${stopped[@]}" 2>/dev/null
+      log "brake: could not record the pause of $name in frozen.tsv; resumed it ($(metrics))"
+      return
+    fi
   } 9>"$FROZEN_LOCK"
   # After the lock is let go: the toast below runs in the background and would
   # hold it for as long as it runs.
@@ -247,10 +254,17 @@ spawn_agent() {
   # A transient unit rather than a child, so it survives this watcher
   # restarting, and in session.slice, like the watcher, so oomd cannot take
   # the responder halfway through.
-  systemd-run --user --unit="$UNIT" --slice=session.slice --collect --quiet \
+  # The cooldown starts only with a responder that did start: a failed start
+  # is tried again after a short gap, so the handoff is not lost for the
+  # whole cooldown, and the brake's reason for it is kept until then.
+  if ! systemd-run --user --unit="$UNIT" --slice=session.slice --collect --quiet \
     -p RuntimeMaxSec=1200 -p CPUWeight=1000 \
     -p WorkingDirectory="$STATE" "${setenv[@]}" \
-    omarchy-agent-memory "$1" "$(metrics)" || log "agent: could not start $UNIT"
+    omarchy-agent-memory "$1" "$(metrics)"; then
+    log "agent: could not start $UNIT; trying again in ${retry}s"
+    retry_at=$((EPOCHSECONDS + retry))
+    return 1
+  fi
   last_spawn=$EPOCHSECONDS
   echo "$last_spawn" >"$LAST_SPAWN"
 }
@@ -274,6 +288,7 @@ last_brake=0
 [[ $last_spawn =~ ^[0-9]+$ ]] || last_spawn=0
 hot=0
 brake_pending=0
+retry_at=0
 quit=0
 last_snapshot=0
 warm=0
@@ -338,13 +353,12 @@ while true; do
   if [[ -e $STANDDOWN ]]; then
     brake_pending=0
   elif ((brake_pending || hot >= 2)) && ((EPOCHSECONDS - last_spawn >= cooldown)) &&
-    ! systemctl --user is-active --quiet "$UNIT"; then
+    ((EPOCHSECONDS >= retry_at)) && ! systemctl --user is-active --quiet "$UNIT"; then
     if ((brake_pending)); then
-      spawn_agent "the memory brake paused a process group"
+      spawn_agent "the memory brake paused a process group" && brake_pending=0
     else
       spawn_agent "memory is nearly full"
     fi
-    brake_pending=0
   fi
 
   sleep "$interval"

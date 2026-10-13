@@ -25,8 +25,11 @@ while ((pid > 1)); do
     sender=$kind-$pid
     break
   fi
-  pid=$(awk '{ print $4 }' "/proc/$pid/stat" 2>/dev/null) || break
-  [[ -n $pid ]] || break
+  # The parent is the field after the state; the name before it can hold spaces.
+  { stat=$(<"/proc/$pid/stat"); } 2>/dev/null || break
+  stat=${stat##*) }
+  read -r _ pid _ <<<"$stat"
+  [[ $pid =~ ^[0-9]+$ ]] || break
 done
 
 mkdir -p "$state"
