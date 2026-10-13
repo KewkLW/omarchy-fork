@@ -638,6 +638,47 @@ fi
 grep -Fq "refused SIGTERM to bash ($agent_pid)" "$state/watch.log" || fail "memory kill logs what it refused"
 pass "memory kill refuses what the responder must never touch"
 
+# A pause the kill wrapper cannot record is not made: resume rewrites frozen.tsv
+# under frozen.lock, so a line appended without it would be lost.
+kill_dummy
+: >"$state/frozen.tsv"
+( exec 9>"$state/frozen.lock"; flock 9; sleep 8 ) &
+lock_holder=$!
+dummy_pids+=("$lock_holder")
+sleep 0.3
+started=$SECONDS
+if run "$ROOT/bin/omarchy-memory-kill" "$kill_pid" STOP 2>"$TMPDIR/kill.err"; then
+  fail "memory kill pauses nothing while frozen.tsv stays locked"
+fi
+((SECONDS - started < 8)) || fail "memory kill gives up on the lock within its wait" "took $((SECONDS - started))s"
+[[ $(proc_state "$kill_pid") == S ]] || fail "memory kill leaves the process running when it cannot record a pause"
+[[ ! -s $state/frozen.tsv ]] || fail "memory kill records no pause it did not make" "$(cat "$state/frozen.tsv")"
+[[ $(<"$TMPDIR/kill.err") == *"stayed locked"* ]] || fail "memory kill says why it did not pause" "$(cat "$TMPDIR/kill.err")"
+kill "$lock_holder" 2>/dev/null || true
+pass "memory kill pauses only what it can record"
+
+# Turning the watchdog off stops the responder's unit and the kill wrapper
+# with it, which must never leave a pause nothing has on record.
+kill_dummy
+: >"$state/frozen.tsv"
+( exec 9>"$state/frozen.lock"; flock 9; sleep 30 ) &
+lock_holder=$!
+dummy_pids+=("$lock_holder")
+sleep 0.3
+run "$ROOT/bin/omarchy-memory-kill" "$kill_pid" STOP 2>/dev/null &
+killer=$!
+sleep 0.5
+# The helper itself, not the shell that ran it, as the unit's stop hits it.
+pkill -TERM -f "omarchy-memory-kill $kill_pid STOP" 2>/dev/null
+wait "$killer" 2>/dev/null || true
+kill "$lock_holder" 2>/dev/null || true
+sleep 0.2
+[[ $(proc_state "$kill_pid") == S ]] || fail "memory kill stopped mid-wait leaves the process running"
+[[ ! -s $state/frozen.tsv ]] || fail "memory kill stopped mid-wait records nothing" "$(cat "$state/frozen.tsv")"
+run "$ROOT/bin/omarchy-memory-resume" >/dev/null 2>&1 || true
+[[ $(proc_state "$kill_pid") == S ]] || fail "a resume after a stopped kill wrapper finds nothing to undo"
+pass "memory kill leaves nothing paused unrecorded when stopped"
+
 # The responder and the relay start in omarchy-agent's own permission modes,
 # with their tools cut down and no MCP servers. Fakes only: never a real agent.
 cat >"$TMPDIR/bin/claude" <<'SH'

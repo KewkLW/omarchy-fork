@@ -15,8 +15,12 @@
 # between can't receive it. A stopped process gets SIGCONT before SIGTERM,
 # since a stopped process only acts on SIGTERM once it runs again. SIGSTOP is
 # recorded in frozen.tsv (source responder when run from the responder's unit,
-# user otherwise) so omarchy-memory-resume can undo it; every signal is logged
-# to watch.log.
+# user otherwise) so omarchy-memory-resume can undo it, and it is sent only
+# under the frozen-list lock, with the record written before the lock is let
+# go and TERM held off meanwhile: turning the watchdog off stops the
+# responder's unit, this helper with it, and a pause nothing has on record
+# would stay. No lock within the wait, no pause. Every signal is logged to
+# watch.log.
 
 import fcntl
 import importlib.machinery
@@ -103,13 +107,42 @@ def log(line):
 
 
 def record_pause(p, who):
+    """The frozen.tsv line for p; the caller holds frozen.lock."""
+    with open(os.path.join(STATE, "frozen.tsv"), "a") as f:
+        key = f"{p['cgroup']}#{p['pgid']}@{p['pid']}"
+        f.write("\t".join([time.strftime("%F %T"), who, key, str(p["kb"] // 1024),
+                           p["name"], str(p["pid"]), p["start"]]) + "\n")
+
+
+def pause(pidfd, p, who):
+    """SIGSTOP p and record it, or say why not. omarchy-memory-resume rewrites
+    frozen.tsv under frozen.lock and would drop a line appended without it, so
+    the lock is taken first and kept until the line is written; the signals
+    that end this helper when the responder's unit is stopped wait until then,
+    so the pause is either on record or never made."""
     os.makedirs(STATE, exist_ok=True)
+    held = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
     with open(os.path.join(STATE, "frozen.lock"), "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        with open(os.path.join(STATE, "frozen.tsv"), "a") as f:
-            key = f"{p['cgroup']}#{p['pgid']}@{p['pid']}"
-            f.write("\t".join([time.strftime("%F %T"), who, key, str(p["kb"] // 1024),
-                               p["name"], str(p["pid"]), p["start"]]) + "\n")
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return "frozen.tsv stayed locked; not pausing"
+                time.sleep(0.1)
+        signal.pthread_sigmask(signal.SIG_BLOCK, held)
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGSTOP)
+            try:
+                record_pause(p, who)
+            except OSError as e:
+                signal.pidfd_send_signal(pidfd, signal.SIGCONT)
+                return f"could not record the pause, resumed it: {e.strerror}"
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
+    return None
 
 
 def main():
@@ -138,10 +171,17 @@ def main():
         return 1
 
     try:
-        # SIGTERM to a stopped process waits until it runs again.
-        if name == "TERM" and p["state"] in "Tt":
-            signal.pidfd_send_signal(pidfd, signal.SIGCONT)
-        signal.pidfd_send_signal(pidfd, SIGNALS[name])
+        if name == "STOP":
+            why = pause(pidfd, p, who)
+            if why:
+                log(f"kill: {who} did not send SIGSTOP to {p['name']} ({pid}): {why}")
+                print(f"Not pausing {p['name']} ({pid}): {why}", file=sys.stderr)
+                return 1
+        else:
+            # SIGTERM to a stopped process waits until it runs again.
+            if name == "TERM" and p["state"] in "Tt":
+                signal.pidfd_send_signal(pidfd, signal.SIGCONT)
+            signal.pidfd_send_signal(pidfd, SIGNALS[name])
     except OSError as e:
         log(f"kill: {who} could not send SIG{name} to {p['name']} ({pid}): {e.strerror}")
         print(f"Could not signal {p['name']} ({pid}): {e.strerror}", file=sys.stderr)
@@ -149,8 +189,6 @@ def main():
     finally:
         os.close(pidfd)
 
-    if name == "STOP":
-        record_pause(p, who)
     log(f"kill: {who} sent SIG{name} to {p['name']} ({pid}, {p['kb'] // 1024}M): {p['cmd'][:120]}")
     print(f"Sent SIG{name} to {p['name']} ({pid}, {p['kb'] // 1024}M)")
     return 0
