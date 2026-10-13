@@ -39,6 +39,18 @@ printf '%s\n' "$*" >>"$SYSTEMD_RUN_LOG"
 SH
 
 # --print-id answers with a fresh id, also kept with the toast in NOTIFY_LOG.ids.
+# A disk with room for a new file but not its contents, when the test asks
+# for one: the frozen list's copy lands on /dev/full.
+cat >"$TMPDIR/bin/mktemp" <<'SH'
+#!/bin/bash
+path=$(/usr/bin/mktemp "$@") || exit 1
+if [[ -e $MKTEMP_FULL && $path == *frozen.tsv.* ]]; then
+  rm -f "$path"
+  ln -s /dev/full "$path"
+fi
+echo "$path"
+SH
+
 cat >"$TMPDIR/bin/omarchy-notification-send" <<'SH'
 #!/bin/bash
 printf '%s\n' "$*" >>"$NOTIFY_LOG"
@@ -71,7 +83,7 @@ installed_unit="$test_home/.config/systemd/user/omarchy-memory-watch.service"
 
 run() {
   PATH="$TMPDIR/bin:$ROOT/bin:$PATH" SYSTEMCTL_LOG="$SYSTEMCTL_LOG" NOTIFY_LOG="$NOTIFY_LOG" \
-    SYSTEMD_RUN_LOG="$SYSTEMD_RUN_LOG" \
+    SYSTEMD_RUN_LOG="$SYSTEMD_RUN_LOG" MKTEMP_FULL="$TMPDIR/mktemp-full" \
     HOME="$test_home" XDG_CONFIG_HOME="$test_home/.config" OMARCHY_PATH="$ROOT" "$@"
 }
 
@@ -466,6 +478,24 @@ grep -Fq 'could not start omarchy-memory-agent' "$state/watch.log" || fail "a fa
 run "$ROOT/bin/omarchy-memory-resume" >/dev/null
 pass "memory watchdog retries a responder that could not start"
 
+# The handoff the brake owes survives a watcher restart: with the brake
+# record holding the brake and RAM under the agent trigger, nothing else
+# would ever start the responder for that group.
+rm -f "$state/last-spawn"
+: >"$SYSTEMD_RUN_LOG"
+: >"$state/frozen.tsv"
+touch "$SYSTEMD_RUN_LOG.fail"
+watch OMARCHY_MEMORY_ONLY=omarchy-memtest-dummy OMARCHY_MEMORY_BRAKE_MIN_MB=0 OMARCHY_MEMORY_BRAKE_GAP=0
+rm -f "$SYSTEMD_RUN_LOG.fail"
+[[ -e $state/brake-pending ]] || fail "a handoff the responder could not take is kept on disk"
+: >"$SYSTEMD_RUN_LOG"
+watch OMARCHY_MEMORY_ONLY=omarchy-memtest-dummy OMARCHY_MEMORY_BRAKE_MIN_MB=0 OMARCHY_MEMORY_BRAKE_GAP=0
+grep -Fq 'omarchy-agent-memory the memory brake paused a process group' "$SYSTEMD_RUN_LOG" ||
+  fail "a restarted watcher starts the responder for the handoff it still owes" "$(cat "$SYSTEMD_RUN_LOG")"
+[[ ! -e $state/brake-pending ]] || fail "a handoff the responder took is no longer owed"
+run "$ROOT/bin/omarchy-memory-resume" >/dev/null
+pass "memory watchdog remembers a handoff it still owes across a restart"
+
 # A pause the brake cannot record (the disk full, say) is not kept: resume
 # and turning the watchdog off could never find it.
 : >"$SYSTEMD_RUN_LOG"
@@ -480,6 +510,30 @@ grep -Fq 'could not record the pause' "$state/watch.log" || fail "the brake says
 [[ ! -s $SYSTEMD_RUN_LOG ]] || fail "a pause that was undone hands nothing to the responder" "$(cat "$SYSTEMD_RUN_LOG")"
 : >"$state/frozen.tsv"
 pass "memory brake keeps no pause it could not record"
+
+# Pruning and resuming rewrite the frozen list through a copy; a copy that
+# cannot be written whole never replaces the list, so no pause loses its record.
+kill -STOP "$dummy_pid"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "2026-01-01 00:00:00" brake "test#$dummy_pid" 1 sleep "$dummy_pid" \
+  "$(start_time "$dummy_pid")" >"$state/frozen.tsv"
+touch "$TMPDIR/mktemp-full"
+watch OMARCHY_MEMORY_ONLY=omarchy-memtest-none
+[[ -f $state/frozen.tsv && ! -L $state/frozen.tsv ]] || fail "pruning keeps the frozen list when its copy cannot be written"
+grep -Fq "$dummy_pid" "$state/frozen.tsv" || fail "pruning keeps every pause it cannot copy" "$(cat "$state/frozen.tsv")"
+# Resuming one group must keep the other's line, which the copy cannot take.
+kill -STOP "$dummy2_pid"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "2026-01-01 00:00:00" brake "test#$dummy2_pid" 1 held "$dummy2_pid" \
+  "$(start_time "$dummy2_pid")" >>"$state/frozen.tsv"
+run "$ROOT/bin/omarchy-memory-resume" '^sleep$' >/dev/null 2>"$TMPDIR/resume.err"
+[[ $(proc_state "$dummy_pid") != "T" ]] || fail "resume continues the pause even when it cannot rewrite the list"
+[[ -f $state/frozen.tsv && ! -L $state/frozen.tsv ]] || fail "resume keeps the frozen list when its copy cannot be written"
+grep -Fq "$dummy2_pid" "$state/frozen.tsv" || fail "resume keeps the pause it did not undo when it cannot copy it" "$(cat "$state/frozen.tsv")"
+[[ $(<"$TMPDIR/resume.err") == *"Could not rewrite frozen.tsv"* ]] || fail "resume says it could not rewrite the list" "$(cat "$TMPDIR/resume.err")"
+rm -f "$TMPDIR/mktemp-full" "$state"/frozen.tsv.*
+run "$ROOT/bin/omarchy-memory-resume" >/dev/null
+[[ $(proc_state "$dummy2_pid") != "T" ]] || fail "the kept pause can still be resumed once the copy can be written"
+: >"$state/frozen.tsv"
+pass "memory watchdog keeps its records when it cannot rewrite them"
 
 # The cooldown covers a responder the brake would start, too: one started for
 # nearly full memory is not followed by another when the brake then pauses.

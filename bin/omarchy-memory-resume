@@ -38,6 +38,15 @@ flock -w 10 9 || {
 }
 
 kept=$(mktemp "$frozen.XXXXXX")
+# A line that cannot be copied keeps the old file in place: with the disk
+# full, a copy that lost lines would lose the pauses they record. The lines
+# of what was resumed here stay until the watcher can prune them.
+keep_line() {
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$kept" 2>/dev/null && return 0
+  rm -f "$kept"
+  echo "Could not rewrite frozen.tsv; its lines stay until the watchdog prunes them" >&2
+  exit 0
+}
 while IFS=$'\t' read -r paused_at source key mb name pids starts; do
   if [[ -z ${1:-} || $name =~ $1 ]]; then
     IFS=, read -ra pid_list <<<"$pids"
@@ -50,7 +59,7 @@ while IFS=$'\t' read -r paused_at source key mb name pids starts; do
     done
     echo "Resumed $name (${mb}M, $resumed of ${#pid_list[@]} processes still there, paused by $source at $paused_at)"
   else
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$paused_at" "$source" "$key" "$mb" "$name" "$pids" "$starts" >>"$kept"
+    keep_line "$paused_at" "$source" "$key" "$mb" "$name" "$pids" "$starts"
   fi
 done <"$frozen"
-mv "$kept" "$frozen"
+mv "$kept" "$frozen" 2>/dev/null || rm -f "$kept"

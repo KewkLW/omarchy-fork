@@ -64,6 +64,8 @@ readonly UNIT=omarchy-memory-agent
 readonly STANDDOWN=$STATE/standdown
 # When the responder last started, so a restart keeps the cooldown.
 readonly LAST_SPAWN=$STATE/last-spawn
+# A handoff the brake still owes the responder; kept across restarts.
+readonly BRAKE_PENDING=$STATE/brake-pending
 # nf-md-memory, escaped so this file reads without a Nerd Font.
 readonly MEMORY_GLYPH=$'\U000f035b'
 
@@ -172,11 +174,18 @@ prune_frozen() {
   (
     flock -w 5 9 || exit 0
     kept=$(mktemp "$FROZEN.XXXXXX") || exit 0
+    # Every line is checked in before the file is replaced: with the disk
+    # full, a copy that lost lines would lose the pauses they record, and
+    # the old file keeps them until the next prune can.
     while IFS=$'\t' read -r line; do
       IFS=$'\t' read -r _ _ _ _ _ pids starts <<<"$line"
-      still_paused "$pids" "$starts" && printf '%s\n' "$line" >>"$kept"
+      still_paused "$pids" "$starts" || continue
+      printf '%s\n' "$line" >>"$kept" 2>/dev/null || {
+        rm -f "$kept"
+        exit 0
+      }
     done <"$FROZEN"
-    mv "$kept" "$FROZEN"
+    mv "$kept" "$FROZEN" 2>/dev/null || rm -f "$kept"
   ) 9>"$FROZEN_LOCK"
 }
 
@@ -238,6 +247,7 @@ brake() {
   # hold it for as long as it runs.
   log "brake: paused $name (${mb}M, pids $pids) $(metrics)"
   brake_pending=1
+  : >"$BRAKE_PENDING"
   omarchy-notification-send --urgency critical --glyph "$MEMORY_GLYPH" \
     "Memory brake: paused $name" \
     "${mb}M. Paused, not killed, before systemd-oomd had to kill something. Resume with: omarchy memory resume" >/dev/null 2>&1 &
@@ -287,7 +297,9 @@ last_brake=0
 { last_spawn=$(<"$LAST_SPAWN"); } 2>/dev/null
 [[ $last_spawn =~ ^[0-9]+$ ]] || last_spawn=0
 hot=0
+# Owed from before a restart, when the responder could not be started.
 brake_pending=0
+[[ -e $BRAKE_PENDING ]] && brake_pending=1
 retry_at=0
 quit=0
 last_snapshot=0
@@ -352,10 +364,14 @@ while true; do
   # things too, and must not wake a second copy of itself.
   if [[ -e $STANDDOWN ]]; then
     brake_pending=0
+    rm -f "$BRAKE_PENDING"
   elif ((brake_pending || hot >= 2)) && ((EPOCHSECONDS - last_spawn >= cooldown)) &&
     ((EPOCHSECONDS >= retry_at)) && ! systemctl --user is-active --quiet "$UNIT"; then
     if ((brake_pending)); then
-      spawn_agent "the memory brake paused a process group" && brake_pending=0
+      spawn_agent "the memory brake paused a process group" && {
+        brake_pending=0
+        rm -f "$BRAKE_PENDING"
+      }
     else
       spawn_agent "memory is nearly full"
     fi
