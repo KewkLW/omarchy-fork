@@ -1,0 +1,114 @@
+#!/bin/bash
+
+# omarchy:summary=Ask the user to approve a memory emergency plan, and wait for a click
+# omarchy:args=[--background] <plan> [reason] | --cancel
+# omarchy:hidden=true
+
+# For the memory responder. Puts up two critical toasts (approve / stand down)
+# and prints approve, standdown, resolved, or timeout. The wait is
+# OMARCHY_MEMORY_ASK_TIMEOUT seconds (default 120).
+#
+# --background returns at once and leaves the answer in ask.out in the state
+# directory. It detaches into its own session because agent shells kill what a
+# command leaves behind when it returns, and Codex's refuses `&` outright.
+#
+# Each ask is a question with its own id, kept in the state directory's
+# question file. The toasts answer with that id, and omarchy-memory-reply drops
+# an answer to any other question, so a click on a toast left over from an
+# earlier ask can never approve a later plan. --cancel withdraws the current
+# question and dismisses its toasts. An ask whose question is withdrawn, or
+# replaced by a newer ask, dismisses its toasts and ends without an answer.
+
+set -uo pipefail
+
+state=$HOME/.local/state/omarchy/memory-watch
+question=$state/question
+readonly MEMORY_GLYPH=$'\U000f035b'
+
+# Replace each toast with a short-lived one that has no click action.
+dismiss() {
+  local text=$1 id
+  shift
+  for id in "$@"; do
+    [[ $id =~ ^[0-9]+$ ]] && omarchy-notification-send --replace-id "$id" --expire-time 4000 \
+      "Memory agent" "$text" >/dev/null 2>&1
+  done
+}
+
+current_question() {
+  local id=
+  [[ -r $question ]] && read -r id _ <"$question"
+  echo "$id"
+}
+
+if [[ ${1:-} == "--cancel" ]]; then
+  [[ -r $question ]] || exit 0
+  read -r _ toasts <"$question"
+  # Withdrawn first, so a click from here on is already stale.
+  rm -f "$question"
+  dismiss "Question withdrawn" $toasts
+  exit 0
+fi
+
+if [[ ${1:-} == "--background" ]]; then
+  shift
+  mkdir -p "$state"
+  : >"$state/ask.out"
+  # The detached ask is a whole ask of its own, cleanup and all.
+  setsid -f "$0" "$@" >"$state/ask.out" 2>/dev/null </dev/null
+  echo "Asking; the answer will be in $state/ask.out"
+  exit 0
+fi
+
+plan=${1:?usage: omarchy-memory-ask [--background] <plan> [reason] | --cancel}
+reason=${2:-}
+reply=$state/reply
+timeout=${OMARCHY_MEMORY_ASK_TIMEOUT:-120}
+qid=$(date +%s)-$$-$RANDOM
+approve_id=
+standdown_id=
+answer=
+
+set_question() {
+  printf '%s\n' "$*" >"$question.$$" && mv -f "$question.$$" "$question"
+}
+
+# On every way out (an answer, a timeout, Ctrl-C, the responder being stopped)
+# no toast of this ask stays clickable, and its question is gone.
+finish() {
+  [[ $(current_question) == "$qid" ]] && rm -f "$question"
+  dismiss "Answer: ${answer:-withdrawn}" $approve_id $standdown_id
+}
+trap finish EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkdir -p "$state"
+# The new question replaces the old one before the old answer is cleared, so
+# a late answer to the old one can't land after the clear.
+set_question "$qid"
+rm -f "$reply"
+
+# --exec rather than a libnotify action: the shell runs clicks from its own hint.
+approve_id=$(omarchy-notification-send --print-id --urgency critical --glyph "$MEMORY_GLYPH" \
+  "Memory agent: $plan" "$reason Click to approve, or it goes ahead in ${timeout}s." \
+  --exec omarchy-memory-reply approve "$qid" 2>/dev/null)
+standdown_id=$(omarchy-notification-send --print-id --urgency critical --glyph "$MEMORY_GLYPH" \
+  "Memory agent: stand down?" "Click if you'll handle it yourself." \
+  --exec omarchy-memory-reply standdown "$qid" 2>/dev/null)
+# Kept with the question, for --cancel to dismiss.
+[[ $(current_question) == "$qid" ]] && set_question "$qid" $approve_id $standdown_id
+
+for ((i = 0; i < timeout; i++)); do
+  # Withdrawn or replaced: whatever reply holds now answers another question.
+  [[ $(current_question) == "$qid" ]] || exit 1
+  if [[ -s $reply ]]; then
+    answer=$(<"$reply")
+    break
+  fi
+  sleep 1
+done
+answer=${answer:-timeout}
+
+echo "$answer"

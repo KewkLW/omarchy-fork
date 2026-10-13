@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 # omarchy:summary=Show this user's process groups by memory use (RAM + swap)
-# omarchy:args=[--json] [--pick <min-mb>]
+# omarchy:args=[--json] [--pick <min-mb>] [--agent <pid>]
 # omarchy:examples=omarchy memory top | omarchy memory top --pick 1024
 
 # A group is (cgroup, process group id). Neither alone works: apps launched from
@@ -35,12 +35,20 @@
 # if none. starts are the pids' start times (/proc/<pid>/stat field 22), so a
 # pid reused by a new process is never signalled in its place.
 #
+# AI agent sessions (AGENT_NAMES) are protected too: they may hold a user's
+# conversation, and the memory responder has to message them. The builds and
+# editors they start are not.
+#
+# --agent prints which agent <pid> is, by the same agent_kind() check; exit 1
+# if none. omarchy-memory-note names a note's sender with it.
+#
 # OMARCHY_MEMORY_PROTECT  regex on process names that are never paused, on top of the built-in list
 # OMARCHY_MEMORY_ONLY     if set, --pick only considers candidates whose name or cmdline matches
 
 import json
 import os
 import re
+import signal
 import sys
 
 DEFAULT_PROTECT = (
@@ -58,12 +66,104 @@ PROTECT_CMD = re.compile(r"steamapps|/proton|\.exe\b", re.I)
 # Games, whose protection passes to everything under them: the game binary
 # under gamescope, or a Proton helper, often has a bland name of its own.
 GAME = re.compile(r"^(steam.*|gamescope.*|wine.*|.*\.exe)$")
+# The agent harnesses omarchy-agent can launch, and a few more.
+AGENT_NAMES = {
+    "claude", "codex", "cursor-agent", "opencode", "crush", "agy", "gemini", "grok",
+    "pi", "omp", "ori", "hermes", "muse", "copilot", "openclaw", "aider", "goose",
+}
 ONLY = os.environ.get("OMARCHY_MEMORY_ONLY")
 
 
 def read(path, mode="r"):
     with open(path, mode) as f:
         return f.read()
+
+
+def agent_kind(argv):
+    """The agent this argv is, if any. Node-hosted agents show up as `node
+    .../bin/<agent>`, so the first two words are checked, not just comm, and
+    Hermes run as a module shows up as `python -m hermes_cli.main`, as
+    omarchy-remove-ai-hermes also knows it."""
+    words = [os.path.basename(w.decode(errors="replace")) for w in argv[:3]]
+    for base in words[:2]:
+        if base in AGENT_NAMES:
+            return base
+    if len(words) == 3 and words[0].startswith("python") and words[1] == "-m" \
+            and words[2].startswith("hermes_cli"):
+        return "hermes"
+    return None
+
+
+def zram_mb():
+    """RAM that zram holds: swapped-out pages, compressed, which are still a
+    process's to give back and so never unaccounted for."""
+    total = 0
+    sys_block = os.environ.get("OMARCHY_MEMORY_SYS_BLOCK", "/sys/block")
+    for dev in os.listdir(sys_block):
+        if dev.startswith("zram"):
+            try:
+                total += int(read(f"{sys_block}/{dev}/mm_stat").split()[2])
+            except (OSError, ValueError, IndexError):
+                continue
+    return total // (1024 * 1024)
+
+
+def held_mb(groups):
+    """What this user's processes hold, a shared page counted once: Pss from
+    smaps_rollup, or RSS where that cannot be read, which counts a page once
+    per process mapping it and would hide memory nobody holds. Shared-memory
+    pages are left out here, since Shmem counts them in the memory line, and
+    counting them twice would hide memory nobody holds the same way."""
+    total = 0
+    for g in groups:
+        for p in g["procs"]:
+            try:
+                fields = dict(l.split(":", 1) for l in read(f"/proc/{p['pid']}/smaps_rollup").splitlines() if ":" in l)
+                total += int(fields["Pss"].split()[0]) - int(fields.get("Pss_Shmem", "0 kB").split()[0])
+            except (OSError, KeyError, ValueError, IndexError):
+                try:
+                    fields = dict(l.split(":", 1) for l in read(f"/proc/{p['pid']}/status").splitlines() if ":" in l)
+                    total += p["rss_kb"] - int(fields.get("RssShmem", "0 kB").split()[0])
+                except (OSError, ValueError, IndexError):
+                    total += p["rss_kb"]
+    return total // 1024
+
+
+def others_mb():
+    """What other users' processes hold (root's containers, a VM): never this
+    watchdog's to signal, but the user's to stop, so not unaccounted for."""
+    uid = os.getuid()
+    total = 0
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            fields = dict(l.split(":", 1) for l in read(f"/proc/{pid}/status").splitlines() if ":" in l)
+            if int(fields["Uid"].split()[0]) != uid:
+                total += int(fields.get("VmRSS", "0 kB").split()[0])
+        except (OSError, KeyError, ValueError, IndexError):
+            continue
+    return total // 1024
+
+
+def memory_line(groups):
+    """Used RAM against what processes hold, this user's and others', in RAM and
+    in zram, for the responder: a large rest is memory no kill can free (a hung
+    GPU client's driver memory, say), which only a reboot returns."""
+    fields = {}
+    for line in read(os.environ.get("OMARCHY_MEMORY_MEMINFO", "/proc/meminfo")).splitlines():
+        key, _, value = line.partition(":")
+        fields[key] = int(value.split()[0])
+    used = (fields["MemTotal"] - fields["MemAvailable"]) // 1024
+    held, others, zram = held_mb(groups), others_mb(), zram_mb()
+    # Files on tmpfs (/tmp, /dev/shm) live in RAM and belong to no process; a
+    # page a process maps is in both figures, which errs toward calling less
+    # unaccounted for, never more.
+    tmpfs = fields.get("Shmem", 0) // 1024
+    rest = max(used - held - others - zram - tmpfs, 0)
+    return (f"RAM used {used}M of {fields['MemTotal'] // 1024}M; this user's processes hold {held}M, "
+            f"other users' {others}M, zram {zram}M, tmpfs {tmpfs}M; "
+            f"unaccounted {rest}M ({100 * rest // max(fields['MemTotal'] // 1024, 1)}% of RAM)")
 
 
 def is_game(name, cmd):
@@ -128,7 +228,7 @@ def scan():
             "leader": None, "leader_cmd": "",
         })
         protected = bool(PROTECT.match(name) or PROTECT_CMD.search(cmd) or "omarchy-memory" in cgroup
-                         or game_ancestor(int(pid), tree.get))
+                         or agent_kind(raw.split(b"\0")) or game_ancestor(int(pid), tree.get))
         g["procs"].append({
             "pid": int(pid), "ppid": ppid, "name": name, "cmd": cmd[:160], "state": state,
             "start": start, "rss_kb": kb("VmRSS"), "swap_kb": kb("VmSwap"), "protected": protected,
@@ -192,6 +292,18 @@ def pick(groups, min_mb):
 
 
 def main():
+    # Piped into head, the table's writer ends quietly, as a shell tool does.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    if "--agent" in sys.argv:
+        try:
+            kind = agent_kind(read(f"/proc/{int(sys.argv[sys.argv.index('--agent') + 1])}/cmdline",
+                                   "rb").split(b"\0"))
+        except (OSError, ValueError, IndexError):
+            return 1
+        if kind is None:
+            return 1
+        print(kind)
+        return 0
     groups = scan()
     if "--json" in sys.argv:
         for g in groups:
@@ -206,6 +318,10 @@ def main():
         print(c["key"], c["total_mb"], c["name"], ",".join(str(p["pid"]) for p in procs),
               ",".join(p["start"] for p in procs), sep="\t")
         return 0
+    try:
+        print(memory_line(groups))
+    except (OSError, KeyError, ValueError, IndexError):
+        pass
     print(f"{'TOTAL':>7} {'RSS':>7} {'SWAP':>7} {'N':>4} P S  LEADER  [UNIT PGID]  CMD")
     for g in groups[:int(os.environ.get("OMARCHY_MEMORY_TOP_N", 20))]:
         print(f"{g['total_mb']:>6}M {g['rss_mb']:>6}M {g['swap_mb']:>6}M "

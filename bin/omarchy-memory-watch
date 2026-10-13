@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# omarchy:summary=Watch memory pressure; warn before systemd-oomd kills an app, and pause the runaway first
+# omarchy:summary=Watch memory pressure; warn before systemd-oomd kills an app, pause the runaway, and hand the emergency to an AI agent
 # omarchy:hidden=true
 
 # systemd-oomd only kills scopes under app.slice
@@ -28,6 +28,20 @@
 #          sized to RAM, so half of it in use is routine while RAM is fine,
 #          and a pause frees no swap. One pause at a time: while something the
 #          brake paused is still stopped, it does not pause anything else.
+#   agent  RAM 90% full and swap filling or stalling, twice in a row, or the
+#          brake paused something: run the default agent headless
+#          (omarchy-agent-memory) to find the cause, ask the AI agents that
+#          started it and the user, and fix it as gently as it can. An agent
+#          can take minutes to start while the machine thrashes, which is why
+#          the brake does not wait for it. At most once per cooldown, whatever
+#          started it.
+#   stand down  once the user answers the responder's ask with stand down
+#          (omarchy-memory-reply standdown), neither the brake nor the agent
+#          acts again until RAM is back under the brake's RAM line and the
+#          stall under the warning's, or for 30 minutes at most, since zram
+#          can hold RAM that high for hours. Swap is left out of that: zram
+#          does not drain just because RAM is free again. A toast says when
+#          it lifts.
 #   kills  after oomd kills, a toast naming what it took (omarchy-memory-oomd-kills).
 #
 # Thresholds are environment variables; change them with a drop-in from
@@ -45,6 +59,13 @@ readonly LAST_TOP=$STATE/last-top.json
 # source is brake, responder or user. Written under FROZEN_LOCK.
 readonly FROZEN=$STATE/frozen.tsv
 readonly FROZEN_LOCK=$STATE/frozen.lock
+readonly UNIT=omarchy-memory-agent
+# Left by omarchy-memory-reply standdown; kept across restarts.
+readonly STANDDOWN=$STATE/standdown
+# When the responder last started, so a restart keeps the cooldown.
+readonly LAST_SPAWN=$STATE/last-spawn
+# A handoff the brake still owes the responder; kept across restarts.
+readonly BRAKE_PENDING=$STATE/brake-pending
 # nf-md-memory, escaped so this file reads without a Nerd Font.
 readonly MEMORY_GLYPH=$'\U000f035b'
 
@@ -68,8 +89,14 @@ brake_mem_pct=${OMARCHY_MEMORY_BRAKE_MEM_PCT:-97} # with brake_psi: thrashing be
 brake_psi=${OMARCHY_MEMORY_BRAKE_PSI:-40}
 brake_min_mb=${OMARCHY_MEMORY_BRAKE_MIN_MB:-1024}
 brake_gap=${OMARCHY_MEMORY_BRAKE_GAP:-10}
+agent_mem_pct=${OMARCHY_MEMORY_AGENT_MEM_PCT:-90}
+agent_swap_pct=${OMARCHY_MEMORY_AGENT_SWAP_PCT:-15}
+agent_psi=${OMARCHY_MEMORY_AGENT_PSI:-30}
+cooldown=${OMARCHY_MEMORY_COOLDOWN:-900}
+retry=${OMARCHY_MEMORY_RETRY:-30} # after a responder that could not start
+standdown_min=${OMARCHY_MEMORY_STANDDOWN_MIN:-30}
 
-mkdir -p "$STATE"
+mkdir -p "$STATE/reports"
 
 log() {
   printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2
@@ -235,9 +262,45 @@ brake() {
   # After the lock is let go: the toast below runs in the background and would
   # hold it for as long as it runs.
   log "brake: paused $name (${mb}M, pids $pids) $(metrics)"
+  brake_pending=1
+  : >"$BRAKE_PENDING"
   omarchy-notification-send --urgency critical --glyph "$MEMORY_GLYPH" \
     "Memory brake: paused $name" \
     "${mb}M. Paused, not killed, before systemd-oomd had to kill something. Resume with: omarchy memory resume" >/dev/null 2>&1 &
+}
+
+spawn_agent() {
+  local setenv=(--setenv=PATH="$PATH" --setenv=OMARCHY_PATH="$OMARCHY_PATH") name
+  log "agent: $1 $(metrics)"
+  # A transient unit starts from the user manager's environment, so pass on this
+  # watcher's settings (a drop-in's ask timeout, say).
+  for name in "${!OMARCHY_MEMORY_@}"; do
+    setenv+=(--setenv="$name=${!name}")
+  done
+  # A transient unit rather than a child, so it survives this watcher
+  # restarting, and in session.slice, like the watcher, so oomd cannot take
+  # the responder halfway through.
+  # The cooldown starts only with a responder that did start: a failed start
+  # is tried again after a short gap, so the handoff is not lost for the
+  # whole cooldown, and the brake's reason for it is kept until then.
+  if ! systemd-run --user --unit="$UNIT" --slice=session.slice --collect --quiet \
+    -p RuntimeMaxSec=1200 -p CPUWeight=1000 \
+    -p WorkingDirectory="$STATE" "${setenv[@]}" \
+    omarchy-agent-memory "$1" "$(metrics)"; then
+    log "agent: could not start $UNIT; trying again in ${retry}s"
+    retry_at=$((EPOCHSECONDS + retry))
+    return 1
+  fi
+  last_spawn=$EPOCHSECONDS
+  echo "$last_spawn" >"$LAST_SPAWN"
+}
+
+lift_standdown() {
+  rm -f "$STANDDOWN"
+  log "stand down over: $1 ($(metrics))"
+  omarchy-notification-send --glyph "$MEMORY_GLYPH" \
+    "Memory watchdog is back on" \
+    "Stand-down over: $1. It will pause a runaway and start the agent again if memory runs short." >/dev/null 2>&1 &
 }
 
 omarchy-memory-oomd-kills &
@@ -247,6 +310,13 @@ trap 'exit 0' TERM INT
 
 last_warn=0
 last_brake=0
+{ last_spawn=$(<"$LAST_SPAWN"); } 2>/dev/null
+[[ $last_spawn =~ ^[0-9]+$ ]] || last_spawn=0
+hot=0
+# Owed from before a restart, when the responder could not be started.
+brake_pending=0
+[[ -e $BRAKE_PENDING ]] && brake_pending=1
+retry_at=0
 quit=0
 last_snapshot=0
 warm=0
@@ -257,12 +327,20 @@ while true; do
 
   prune_frozen
 
+  if [[ -e $STANDDOWN ]]; then
+    if ((mem_pct < brake_swap_mem_pct && psi < warn_psi)); then
+      lift_standdown "memory recovered"
+    elif ((EPOCHSECONDS - $(stat -c %Y "$STANDDOWN" 2>/dev/null || echo 0) >= standdown_min * 60)); then
+      lift_standdown "${standdown_min} minutes passed"
+    fi
+  fi
+
   # One sample is enough here: oomd waits 20s on pressure, this must not.
   # A pause stops the climb but frees nothing, so the lines stay crossed
   # after it; pausing the next group too would only spread the damage.
   if (((swap_pct >= brake_swap_pct && mem_pct >= brake_swap_mem_pct) ||
     (mem_pct >= brake_mem_pct && psi >= brake_psi))) &&
-    ((EPOCHSECONDS - last_brake >= brake_gap)) && ! brake_held; then
+    ((EPOCHSECONDS - last_brake >= brake_gap)) && [[ ! -e $STANDDOWN ]] && ! brake_held; then
     snapshot
     # A TERM waits for the brake to finish: stopping the watcher between a
     # SIGSTOP and its line in frozen.tsv would leave a pause that
@@ -289,6 +367,30 @@ while true; do
   if ((warm >= 2 && EPOCHSECONDS - last_warn >= warn_gap)); then
     warn
     last_warn=$EPOCHSECONDS
+  fi
+
+  # Two samples in a row, so one spike doesn't wake an agent.
+  if ((mem_pct >= agent_mem_pct && (swap_pct >= agent_swap_pct || psi >= agent_psi))); then
+    ((hot++))
+  else
+    hot=0
+  fi
+
+  # Only the brake's own pause counts here, not the responder's: it pauses
+  # things too, and must not wake a second copy of itself.
+  if [[ -e $STANDDOWN ]]; then
+    brake_pending=0
+    rm -f "$BRAKE_PENDING"
+  elif ((brake_pending || hot >= 2)) && ((EPOCHSECONDS - last_spawn >= cooldown)) &&
+    ((EPOCHSECONDS >= retry_at)) && ! systemctl --user is-active --quiet "$UNIT"; then
+    if ((brake_pending)); then
+      spawn_agent "the memory brake paused a process group" && {
+        brake_pending=0
+        rm -f "$BRAKE_PENDING"
+      }
+    else
+      spawn_agent "memory is nearly full"
+    fi
   fi
 
   sleep "$interval"

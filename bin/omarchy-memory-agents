@@ -1,0 +1,165 @@
+#!/usr/bin/python3
+# omarchy:summary=Show which AI agents are using the memory, charged per agent
+# omarchy:args=[--json]
+# omarchy:examples=omarchy memory agents | omarchy memory agents --json
+
+# Every process is charged to the nearest AI agent in its ancestry, itself
+# included, so an agent's own memory and the builds or headless editors it
+# started count against it, and an agent started by another agent is charged
+# for its own work.
+#
+# Each agent carries a messaging route for the memory responder:
+#   claude-peer  a Claude Code session; reachable with its SendMessage tool by "name"
+#   none         no channel; read its transcript or cmdline to learn what it's doing
+
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import sys
+import time
+
+CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+# Claude Code's session and subagent files are not a published interface, so
+# everything read from them is optional. A subagent counts as active while its
+# transcript is still being written.
+SUBAGENT_ACTIVE = 600
+
+loader = importlib.machinery.SourceFileLoader("top", shutil.which("omarchy-memory-top"))
+top = importlib.util.module_from_spec(importlib.util.spec_from_loader("top", loader))
+loader.exec_module(top)
+
+
+def agent_kind(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return top.agent_kind(f.read().split(b"\0"))
+    except OSError:
+        return None
+
+
+def parent(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+    except OSError:
+        return None
+    return int(stat[stat.rindex(")") + 2:].split()[1])
+
+
+def claude_session(pid):
+    try:
+        with open(os.path.join(CLAUDE_HOME, "sessions", f"{pid}.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def transcript(session_id):
+    hits = glob.glob(os.path.join(CLAUDE_HOME, "projects", "*", f"{session_id}.jsonl"))
+    return hits[0] if hits else None
+
+
+def subagents(session_id):
+    out = []
+    pattern = os.path.join(CLAUDE_HOME, "projects", "*", session_id or "-", "subagents", "agent-*.jsonl")
+    for path in glob.glob(pattern):
+        try:
+            if time.time() - os.path.getmtime(path) > SUBAGENT_ACTIVE:
+                continue
+            with open(path[: -len(".jsonl")] + ".meta.json") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            meta = {}
+        out.append({"description": meta.get("description") or "", "transcript": path})
+    return out
+
+
+def main():
+    agents, kinds, ppids, owners = {}, {}, {}, {}
+    groups = top.scan()
+    for g in groups:
+        for p in g["procs"]:
+            ppids[p["pid"]] = p["ppid"]
+        # An agent may run this scan in its own group: leave the scan out, not
+        # the group. A group left empty falls under the 16M floor below.
+        g["procs"] = [p for p in g["procs"] if p["pid"] != os.getpid()]
+        g["total_mb"] = sum(p["rss_kb"] + p["swap_kb"] for p in g["procs"]) // 1024
+
+    def kind(pid):
+        if pid not in kinds:
+            kinds[pid] = agent_kind(pid)
+        return kinds[pid]
+
+    def owner(pid):
+        # The nearest agent at or above pid. An agent owns itself, so a group an
+        # agent leads, with the builds in it, is charged to that agent.
+        path, own = [], None
+        while pid and pid > 1 and len(path) < 64:
+            if pid in owners:
+                own = owners[pid]
+                break
+            path.append(pid)
+            if kind(pid):
+                own = pid
+                break
+            pid = ppids[pid] if pid in ppids else parent(pid)
+        for p in path:
+            owners[p] = own
+        return own
+
+    for g in groups:
+        # Not the responder.
+        if g["total_mb"] < 16 or "omarchy-memory" in g["cgroup"]:
+            continue
+        shares = {}
+        for p in g["procs"]:
+            own = owner(p["pid"])
+            if own is not None:
+                shares.setdefault(own, []).append(p)
+        for own, procs in shares.items():
+            if own not in agents:
+                s = claude_session(own) if kinds[own] == "claude" else {}
+                path = transcript(s["sessionId"]) if s.get("sessionId") else None
+                try:
+                    cwd = os.readlink(f"/proc/{own}/cwd")
+                except OSError:
+                    cwd = None
+                agents[own] = {
+                    "id": f"{kinds[own]}-{own}", "kind": kinds[own], "pid": own, "cwd": cwd,
+                    "name": s.get("name"), "status": s.get("status"),
+                    "route": "claude-peer" if s.get("name") else "none",
+                    "transcript": path, "subagents": subagents(s.get("sessionId")),
+                    "total_mb": 0, "groups": [],
+                }
+            a = agents[own]
+            kb = sum(p["rss_kb"] + p["swap_kb"] for p in procs)
+            a["kb"] = a.get("kb", 0) + kb
+            a["groups"].append({"total_mb": kb // 1024, "leader": g["leader"],
+                                "pids": sorted(p["pid"] for p in procs),
+                                "stopped": sum(p["state"] == "T" for p in procs),
+                                "cmd": g["leader_cmd"]})
+
+    for a in agents.values():
+        a["total_mb"] = a.pop("kb") // 1024
+    out = sorted(agents.values(), key=lambda a: -a["total_mb"])
+    for a in out:
+        a["groups"] = sorted(a["groups"], key=lambda g: -g["total_mb"])[:10]
+
+    if "--json" in sys.argv:
+        json.dump(out, sys.stdout, indent=1)
+        return
+    for a in out:
+        print(f"{a['total_mb']:>7}M  {a['id']:<18} {a['name'] or '-':<18} "
+              f"route={a['route']:<11} {a['status'] or ''}  cwd={a['cwd']}")
+        for s in a["subagents"]:
+            print(f"{'':>10}subagent: {s['description']}")
+        for g in a["groups"][:5]:
+            print(f"{'':>10}{g['total_mb']:>6}M {g['leader']} {'(stopped) ' if g['stopped'] else ''}"
+                  f"pids={','.join(map(str, g['pids'][:6]))}  {g['cmd'][:70]}")
+
+
+if __name__ == "__main__":
+    main()

@@ -190,7 +190,12 @@ Everything goes through the same sender contract, so the pieces are small:
   swap alone, since zram sized to RAM is often half used while RAM is fine)
   sends a critical toast when it pauses a process group, saying
   `omarchy memory resume` undoes it. It pauses one group at a time, and
-  nothing more while that one is still paused.
+  nothing more while that one is still paused. The headless responder it
+  starts (`omarchy-agent-memory`) asks through `omarchy-memory-ask`: two
+  critical toasts whose `--exec` clicks run `omarchy-memory-reply approve` or
+  `standdown`. The ask then replaces both toasts, so a late click can't answer
+  a stale question. A stand-down also leaves a `standdown` file the watcher
+  honours: no brake and no responder until memory recovers.
 - **Pending migrations** — `omarchy-migrate-notify` (from its user service
   after `graphical-session.target`) waits for the server, then sends a
   critical toast whose click opens a terminal running `omarchy-migrate`,

@@ -4,8 +4,9 @@
 # omarchy:args=[toggle|on|off]
 # omarchy:examples=omarchy toggle memory-watch | omarchy toggle memory-watch off
 
-# Off by default: it pauses processes on its own when memory runs short, and
-# every toast it sends is critical, so that is the user's call to make.
+# Off by default: when memory runs out it pauses processes on its own and runs
+# the default agent unattended, approving its own actions (Codex even without
+# its sandbox), so that is the user's call to make.
 
 # nf-md-memory, escaped so this file reads without a Nerd Font.
 readonly MEMORY_GLYPH=$'\U000f035b'
@@ -27,8 +28,17 @@ if omarchy-toggle-enabled memory-watch-on; then
   omarchy-notification-send -g "$MEMORY_GLYPH" "Memory watchdog enabled"
 else
   systemctl --user disable --now "$unit_name"
+  # A responder already running would carry on with nothing to stop it.
+  systemctl --user stop omarchy-memory-agent.service 2>/dev/null
+  # Its ask cleans up when stopped; this also covers one asked from elsewhere,
+  # so no toast is left to answer a question asked after turning it back on.
+  omarchy-memory-ask --cancel >/dev/null 2>&1
   # Nothing would be left to say what it paused, or to resume it.
   omarchy-memory-resume >/dev/null
+  # A handoff still owed from before would start the responder for a pause
+  # that was just undone, once the watchdog is turned back on.
+  rm -f "$HOME/.local/state/omarchy/memory-watch/brake-pending"
+  rm -f "$HOME/.local/state/omarchy/memory-watch/standdown"
   rm -f "$unit"
   systemctl --user daemon-reload
   omarchy-notification-send -g "$MEMORY_GLYPH" "Memory watchdog disabled"
