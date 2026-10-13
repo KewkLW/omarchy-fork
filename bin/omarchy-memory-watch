@@ -72,6 +72,7 @@ readonly MEMORY_GLYPH=$'\U000f035b'
 # Overridable so the tests can feed the watcher numbers.
 meminfo=${OMARCHY_MEMORY_MEMINFO:-/proc/meminfo}
 pressure=${OMARCHY_MEMORY_PRESSURE:-/proc/pressure/memory}
+proc=${OMARCHY_MEMORY_PROC:-/proc} # where the paused processes' state is read
 # oomd's pressure line is app.slice's own stall, which can run ahead of the
 # system's, so the higher of the two counts.
 app_pressure=${OMARCHY_MEMORY_APP_PRESSURE:-/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/app.slice/memory.pressure}
@@ -148,22 +149,37 @@ warn() {
 
 start_time() {
   local stat
-  { stat=$(<"/proc/$1/stat"); } 2>/dev/null || return 1
+  { stat=$(<"$proc/$1/stat"); } 2>/dev/null || return 1
   stat=${stat##*) }
   read -ra stat <<<"$stat"
   echo "${stat[19]}"
 }
 
-# Whether any of the pids is still stopped with its recorded start time.
+# Whether a SIGSTOP sent to the process has yet to take effect: one sent to a
+# process in uninterruptible sleep (disk I/O, say) waits until that is over,
+# and the process stops later, so its record must stay until then.
+stop_pending() {
+  local status mask
+  { status=$(<"$proc/$1/status"); } 2>/dev/null || return 1
+  for mask in SigPnd ShdPnd; do
+    [[ $status =~ $mask:[[:space:]]*([0-9a-f]+) ]] && ((16#${BASH_REMATCH[1]} & 0x40000)) && return 0
+  done
+  return 1
+}
+
+# Whether any of the pids is still stopped, or about to stop, with its
+# recorded start time.
 still_paused() {
   local pids starts i stat
   IFS=, read -ra pids <<<"$1"
   IFS=, read -ra starts <<<"$2"
   for i in "${!pids[@]}"; do
-    { stat=$(<"/proc/${pids[i]}/stat"); } 2>/dev/null || continue
+    { stat=$(<"$proc/${pids[i]}/stat"); } 2>/dev/null || continue
     stat=${stat##*) }
     read -ra stat <<<"$stat"
-    [[ ${stat[0]} == [Tt] && ${stat[19]} == "${starts[i]:-}" ]] && return 0
+    [[ ${stat[19]} == "${starts[i]:-}" ]] || continue
+    [[ ${stat[0]} == [Tt] ]] && return 0
+    stop_pending "${pids[i]}" && return 0
   done
   return 1
 }

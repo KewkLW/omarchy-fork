@@ -211,12 +211,14 @@ pass "memory top lists process groups"
 printf 'MemTotal: 1000000 kB\nMemAvailable: 100000 kB\n' >"$fake/meminfo"
 mkdir -p "$fake/block/zram0" "$fake/block/sda"
 printf '0 0 104857600 0 0 0 0 0 0\n' >"$fake/block/zram0/mm_stat"
-line=$(run env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" OMARCHY_MEMORY_SYS_BLOCK="$fake/block" "$ROOT/bin/omarchy-memory-top" | head -1)
-[[ $line == "RAM used 878M of 976M; this user's processes hold "*"M, zram 100M; unaccounted "*"M ("*"% of RAM)" ]] ||
+line=$(run env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" OMARCHY_MEMORY_SYS_BLOCK="$fake/block" "$ROOT/bin/omarchy-memory-top")
+line=${line%%$'\n'*}
+[[ $line == "RAM used 878M of 976M; this user's processes hold "*"M, other users' "*"M, zram 100M; unaccounted "*"M ("*"% of RAM)" ]] ||
   fail "memory top leads with used RAM against what processes and zram hold" "$line"
 held=${line#*processes hold }; held=${held%%M*}
+others=${line#*other users\' }; others=${others%%M*}
 rest=${line#*unaccounted }; rest=${rest%%M*}
-expected=$((878 - held - 100))
+expected=$((878 - held - others - 100))
 ((expected < 0)) && expected=0
 ((rest == expected)) || fail "memory top counts zram's share as accounted for" "$line"
 pass "memory top says how much used RAM no process holds"
@@ -552,6 +554,23 @@ grep -Fq 'could not record the pause' "$state/watch.log" || fail "the brake says
 [[ ! -s $SYSTEMD_RUN_LOG ]] || fail "a pause that was undone hands nothing to the responder" "$(cat "$SYSTEMD_RUN_LOG")"
 : >"$state/frozen.tsv"
 pass "memory brake keeps no pause it could not record"
+
+# A stop sent to a process in uninterruptible sleep takes effect later: its
+# record stays while the stop is pending, and goes once the process is neither
+# stopped nor about to be. The processes are a fake /proc, since a process
+# cannot be put in that sleep to order.
+mkdir -p "$fake/proc/4000001" "$fake/proc/4000002"
+printf '4000001 (memtest io) D 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 777 0 0\n' >"$fake/proc/4000001/stat"
+printf 'Name:\tmemtest io\nState:\tD (disk sleep)\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000040000\n' >"$fake/proc/4000001/status"
+printf '4000002 (memtest idle) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 778 0 0\n' >"$fake/proc/4000002/stat"
+printf 'Name:\tmemtest idle\nState:\tS (sleeping)\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\n' >"$fake/proc/4000002/status"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "2026-01-01 00:00:00" brake "test#4000001" 1 io 4000001 777 >"$state/frozen.tsv"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "2026-01-01 00:00:00" brake "test#4000002" 1 idle 4000002 778 >>"$state/frozen.tsv"
+watch OMARCHY_MEMORY_PROC="$fake/proc" OMARCHY_MEMORY_ONLY=omarchy-memtest-none
+grep -Fq $'\t4000001\t' "$state/frozen.tsv" || fail "pruning keeps the record of a stop still pending" "$(cat "$state/frozen.tsv")"
+! grep -Fq $'\t4000002\t' "$state/frozen.tsv" || fail "pruning drops the record of a process that runs on" "$(cat "$state/frozen.tsv")"
+: >"$state/frozen.tsv"
+pass "memory watchdog keeps the record of a stop that has yet to take effect"
 
 # Pruning and resuming rewrite the frozen list through a copy; a copy that
 # cannot be written whole never replaces the list, so no pause loses its record.

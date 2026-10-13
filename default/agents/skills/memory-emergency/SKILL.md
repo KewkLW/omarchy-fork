@@ -104,11 +104,13 @@ in the report.
 
 4. **Safe fix**, when nobody has helped:
    - First read the top line of `omarchy memory top`: RAM used, what this user's
-     processes hold in RAM and in zram, and the unaccounted rest. If the unaccounted part is more
-     than about a quarter of RAM, no process holds that memory (after a hung GPU
-     client, the driver can keep tens of gigabytes) and no kill returns it:
-     kill nothing, write the report saying so, send an FYI that a reboot is the
-     only fix, and stop.
+     processes hold in RAM and in zram, what other users' processes hold, and
+     the unaccounted rest. Other users' memory (root's containers, a VM) is not
+     yours to signal, but it is the user's to stop: name it in the ask and the
+     report. If the unaccounted part is more than about a quarter of RAM, no
+     process holds that memory (after a hung GPU client, the driver can keep
+     tens of gigabytes) and no kill returns it: kill nothing, write the report
+     saying so, send an FYI that a reboot is the only fix, and stop.
    - OK to kill (`omarchy-memory-kill <pid> TERM` on each pid of the group, wait
      5s, then `KILL` on what is left): anything restartable
      that holds no unsaved user state. That covers compilers, linkers and build

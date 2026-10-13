@@ -48,6 +48,7 @@
 import json
 import os
 import re
+import signal
 import sys
 
 DEFAULT_PROTECT = (
@@ -107,20 +108,52 @@ def zram_mb():
     return total // (1024 * 1024)
 
 
+def held_mb(groups):
+    """What this user's processes hold, a shared page counted once: Pss from
+    smaps_rollup, or RSS where that cannot be read, which counts a page once
+    per process mapping it and would hide memory nobody holds."""
+    total = 0
+    for g in groups:
+        for p in g["procs"]:
+            try:
+                pss = [l for l in read(f"/proc/{p['pid']}/smaps_rollup").splitlines() if l.startswith("Pss:")]
+                total += int(pss[0].split()[1]) if pss else p["rss_kb"]
+            except (OSError, ValueError, IndexError):
+                total += p["rss_kb"]
+    return total // 1024
+
+
+def others_mb():
+    """What other users' processes hold (root's containers, a VM): never this
+    watchdog's to signal, but the user's to stop, so not unaccounted for."""
+    uid = os.getuid()
+    total = 0
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            fields = dict(l.split(":", 1) for l in read(f"/proc/{pid}/status").splitlines() if ":" in l)
+            if int(fields["Uid"].split()[0]) != uid:
+                total += int(fields.get("VmRSS", "0 kB").split()[0])
+        except (OSError, KeyError, ValueError, IndexError):
+            continue
+    return total // 1024
+
+
 def memory_line(groups):
-    """Used RAM against what this user's processes hold, in RAM and in zram, for
-    the responder: a large rest is memory no kill can free (a hung GPU client's
-    driver memory, say), which only a reboot returns."""
+    """Used RAM against what processes hold, this user's and others', in RAM and
+    in zram, for the responder: a large rest is memory no kill can free (a hung
+    GPU client's driver memory, say), which only a reboot returns."""
     fields = {}
     for line in read(os.environ.get("OMARCHY_MEMORY_MEMINFO", "/proc/meminfo")).splitlines():
         key, _, value = line.partition(":")
         fields[key] = int(value.split()[0])
     used = (fields["MemTotal"] - fields["MemAvailable"]) // 1024
-    held = sum(g["rss_mb"] for g in groups)
-    zram = zram_mb()
-    rest = max(used - held - zram, 0)
+    held, others, zram = held_mb(groups), others_mb(), zram_mb()
+    rest = max(used - held - others - zram, 0)
     return (f"RAM used {used}M of {fields['MemTotal'] // 1024}M; this user's processes hold {held}M, "
-            f"zram {zram}M; unaccounted {rest}M ({100 * rest // max(fields['MemTotal'] // 1024, 1)}% of RAM)")
+            f"other users' {others}M, zram {zram}M; "
+            f"unaccounted {rest}M ({100 * rest // max(fields['MemTotal'] // 1024, 1)}% of RAM)")
 
 
 def is_game(name, cmd):
@@ -249,6 +282,8 @@ def pick(groups, min_mb):
 
 
 def main():
+    # Piped into head, the table's writer ends quietly, as a shell tool does.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     if "--agent" in sys.argv:
         try:
             kind = agent_kind(read(f"/proc/{int(sys.argv[sys.argv.index('--agent') + 1])}/cmdline",
