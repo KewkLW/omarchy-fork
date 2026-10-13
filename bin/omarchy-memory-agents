@@ -3,8 +3,10 @@
 # omarchy:args=[--json]
 # omarchy:examples=omarchy memory agents | omarchy memory agents --json
 
-# Every process is charged to the nearest AI agent above it in the process tree,
-# so a build or headless editor an agent started counts against that agent.
+# Every process is charged to the nearest AI agent in its ancestry, itself
+# included, so an agent's own memory and the builds or headless editors it
+# started count against it, and an agent started by another agent is charged
+# for its own work.
 #
 # Each agent carries a messaging route for the memory responder:
 #   claude-peer  a Claude Code session; reachable with its SendMessage tool by "name"
@@ -76,48 +78,68 @@ def subagents(session_id):
 
 
 def main():
-    agents, kinds = {}, {}
+    agents, kinds, ppids, owners = {}, {}, {}, {}
+    groups = top.scan()
+    for g in groups:
+        for p in g["procs"]:
+            ppids[p["pid"]] = p["ppid"]
+
+    def kind(pid):
+        if pid not in kinds:
+            kinds[pid] = agent_kind(pid)
+        return kinds[pid]
 
     def owner(pid):
-        # Starts above the pid: an agent is charged for what it spawned, not itself.
-        seen = 0
-        while pid and pid > 1 and seen < 64:
-            pid, seen = parent(pid), seen + 1
-            if pid is None:
-                return None
-            if pid not in kinds:
-                kinds[pid] = agent_kind(pid)
-            if kinds[pid]:
-                return pid
-        return None
+        # The nearest agent at or above pid. An agent owns itself, so a group an
+        # agent leads, with the builds in it, is charged to that agent.
+        path, own = [], None
+        while pid and pid > 1 and len(path) < 64:
+            if pid in owners:
+                own = owners[pid]
+                break
+            path.append(pid)
+            if kind(pid):
+                own = pid
+                break
+            pid = ppids[pid] if pid in ppids else parent(pid)
+        for p in path:
+            owners[p] = own
+        return own
 
-    for g in top.scan():
+    for g in groups:
         # Not the responder, and not this scan itself.
         if g["total_mb"] < 16 or "omarchy-memory" in g["cgroup"] or os.getpid() in g["pids"]:
             continue
-        leader = g["pgid"] if g["pgid"] in g["pids"] else g["pids"][0]
-        own = owner(leader)
-        if own is None:
-            continue
-        if own not in agents:
-            s = claude_session(own) if kinds[own] == "claude" else {}
-            path = transcript(s["sessionId"]) if s.get("sessionId") else None
-            try:
-                cwd = os.readlink(f"/proc/{own}/cwd")
-            except OSError:
-                cwd = None
-            agents[own] = {
-                "id": f"{kinds[own]}-{own}", "kind": kinds[own], "pid": own, "cwd": cwd,
-                "name": s.get("name"), "status": s.get("status"),
-                "route": "claude-peer" if s.get("name") else "none",
-                "transcript": path, "subagents": subagents(s.get("sessionId")),
-                "total_mb": 0, "groups": [],
-            }
-        a = agents[own]
-        a["total_mb"] += g["total_mb"]
-        a["groups"].append({"total_mb": g["total_mb"], "leader": g["leader"], "pids": g["pids"],
-                            "stopped": g["stopped"], "cmd": g["leader_cmd"]})
+        shares = {}
+        for p in g["procs"]:
+            own = owner(p["pid"])
+            if own is not None:
+                shares.setdefault(own, []).append(p)
+        for own, procs in shares.items():
+            if own not in agents:
+                s = claude_session(own) if kinds[own] == "claude" else {}
+                path = transcript(s["sessionId"]) if s.get("sessionId") else None
+                try:
+                    cwd = os.readlink(f"/proc/{own}/cwd")
+                except OSError:
+                    cwd = None
+                agents[own] = {
+                    "id": f"{kinds[own]}-{own}", "kind": kinds[own], "pid": own, "cwd": cwd,
+                    "name": s.get("name"), "status": s.get("status"),
+                    "route": "claude-peer" if s.get("name") else "none",
+                    "transcript": path, "subagents": subagents(s.get("sessionId")),
+                    "total_mb": 0, "groups": [],
+                }
+            a = agents[own]
+            kb = sum(p["rss_kb"] + p["swap_kb"] for p in procs)
+            a["kb"] = a.get("kb", 0) + kb
+            a["groups"].append({"total_mb": kb // 1024, "leader": g["leader"],
+                                "pids": sorted(p["pid"] for p in procs),
+                                "stopped": sum(p["state"] == "T" for p in procs),
+                                "cmd": g["leader_cmd"]})
 
+    for a in agents.values():
+        a["total_mb"] = a.pop("kb") // 1024
     out = sorted(agents.values(), key=lambda a: -a["total_mb"])
     for a in out:
         a["groups"] = sorted(a["groups"], key=lambda g: -g["total_mb"])[:10]

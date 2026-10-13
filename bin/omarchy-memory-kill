@@ -30,7 +30,6 @@ import time
 
 STATE = os.path.expanduser("~/.local/state/omarchy/memory-watch")
 SIGNALS = {"TERM": signal.SIGTERM, "KILL": signal.SIGKILL, "STOP": signal.SIGSTOP, "CONT": signal.SIGCONT}
-GAME = re.compile(r"^(steam.*|gamescope.*|wine.*|.*\.exe)$")
 
 loader = importlib.machinery.SourceFileLoader("top", shutil.which("omarchy-memory-top"))
 top = importlib.util.module_from_spec(importlib.util.spec_from_loader("top", loader))
@@ -76,14 +75,18 @@ def refusal(p):
         return "it is the memory watchdog or its responder"
     if top.agent_kind(p["argv"]):
         return "it is an AI agent session; message it instead"
-    for pid in ancestors(p["pid"]):
-        try:
-            a = proc(pid)
-        except (OSError, KeyError, ValueError, IndexError):
-            break
-        if GAME.match(a["name"]) or top.PROTECT_CMD.search(a["cmd"]):
-            return f"it runs under a game ({a['name']} {a['pid']})"
+    game = top.game_ancestor(p["pid"], lookup)
+    if game:
+        return f"it runs under a game ({game[0]} {game[1]})"
     return None
+
+
+def lookup(pid):
+    try:
+        a = proc(pid)
+    except (OSError, KeyError, ValueError, IndexError):
+        return None
+    return a["ppid"], a["name"], a["cmd"]
 
 
 def source():

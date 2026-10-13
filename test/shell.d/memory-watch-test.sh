@@ -36,9 +36,16 @@ cat >"$TMPDIR/bin/systemd-run" <<'SH'
 printf '%s\n' "$*" >>"$SYSTEMD_RUN_LOG"
 SH
 
+# --print-id answers with a fresh id, also kept with the toast in NOTIFY_LOG.ids.
 cat >"$TMPDIR/bin/omarchy-notification-send" <<'SH'
 #!/bin/bash
 printf '%s\n' "$*" >>"$NOTIFY_LOG"
+if [[ " $* " == *" --print-id "* ]]; then
+  id=$(($(cat "$NOTIFY_LOG.next" 2>/dev/null || echo 100) + 1))
+  echo "$id" >"$NOTIFY_LOG.next"
+  printf '%s\t%s\n' "$id" "$*" >>"$NOTIFY_LOG.ids"
+  echo "$id"
+fi
 SH
 
 # The user journal answers a follow with JOURNAL_USER, the system journal any
@@ -434,6 +441,53 @@ IFS=$'\t' read -r _ _ _ pids _ <<<"$picked"
 [[ $pids == "$agent_child" ]] || fail "the brake pauses the agent's child and never the agent, got: $picked"
 pass "memory brake protects agent sessions, not what they start"
 
+# An agent that leads the process group its builds run in is charged for them,
+# and for itself.
+cat >"$TMPDIR/bin/omarchy-memtest-fat" <<'SH'
+#!/bin/bash
+exec python3 -c 'import time; b = b"x" * (64 << 20); time.sleep(300)'
+SH
+chmod +x "$TMPDIR/bin/omarchy-memtest-fat"
+setsid bash -c "exec -a claude bash -c '$TMPDIR/bin/omarchy-memtest-fat & wait'" &
+fat_agent=$!
+dummy_pids+=("$fat_agent")
+fat_child=
+for _ in {1..50}; do
+  fat_child=$(pgrep -P "$fat_agent" -x python3 || true)
+  [[ -n $fat_child ]] &&
+    (($(awk '/^VmRSS:/ { print $2 }' "/proc/$fat_child/status" 2>/dev/null || echo 0) >= 49152)) && break
+  sleep 0.1
+done
+[[ -n $fat_child ]] || fail "the agent dummy starts its child"
+dummy_pids+=("$fat_child")
+run "$ROOT/bin/omarchy-memory-agents" --json | jq -e --argjson agent "$fat_agent" --argjson child "$fat_child" \
+  'any(.[]; .pid == $agent and .kind == "claude" and .total_mb >= 48
+       and any(.groups[]; .pids | index($agent) and index($child)))' >/dev/null ||
+  fail "memory agents charges an agent leading its group for its child and itself" \
+    "$(run "$ROOT/bin/omarchy-memory-agents" --json | jq -c --argjson agent "$fat_agent" '[.[] | {pid, total_mb}]')"
+kill "$fat_child" "$fat_agent" 2>/dev/null || true
+pass "memory agents charges an agent for the group it leads"
+
+# A game's own binary often has a bland name (under gamescope, or a Proton
+# helper), so the brake protects everything under a game, as memory kill does:
+# a child in the game's group, and one in a group of its own.
+setsid bash -c 'exec -a /tmp/memtest/steamapps/common/game.exe bash -c "sleep 3032 & setsid -w sleep 3033 & wait"' &
+game_pid=$!
+dummy_pids+=("$game_pid")
+sleep 0.3
+game_children=$(pgrep -P "$game_pid" -x sleep | sort -n | paste -sd' ')
+dummy_pids+=($game_children)
+[[ $game_children == *' '* ]] || fail "the game's children started" "$game_children"
+if picked=$(OMARCHY_MEMORY_ONLY='sleep 303[23]$' run "$ROOT/bin/omarchy-memory-top" --pick 0); then
+  fail "the brake never pauses what runs under a game" "$picked"
+fi
+for pid in $game_children; do
+  if run "$ROOT/bin/omarchy-memory-kill" "$pid" STOP 2>/dev/null; then
+    fail "memory kill refuses what runs under a game"
+  fi
+done
+pass "memory brake and kill both protect everything under a game"
+
 # Every signal the responder sends goes through omarchy-memory-kill.
 kill_dummy() {
   setsid bash -c 'exec -a omarchy-memtest-kill sleep 300' &
@@ -519,6 +573,72 @@ grep -Fqx -- "--user stop omarchy-memory-agent.service" "$SYSTEMCTL_LOG" ||
   fail "turning the watchdog off stops a running responder" "$(cat "$SYSTEMCTL_LOG")"
 [[ ! -e $state/standdown ]] || fail "turning the watchdog off forgets a stand-down"
 pass "memory watchdog toggle off stops the responder"
+
+# A toast left from an earlier ask never answers a later one. Each ask runs in
+# the foreground here, so the suite can wait on it and clean it up.
+ask_toasts=()
+ask_pid=
+start_ask() {
+  local i
+  : >"$NOTIFY_LOG.ids"
+  run env OMARCHY_MEMORY_ASK_TIMEOUT=20 "$ROOT/bin/omarchy-memory-ask" "$1" "test" >"$TMPDIR/$1.out" &
+  for ((i = 0; i < 50; i++)); do
+    [[ $(wc -l <"$NOTIFY_LOG.ids") == 2 ]] && break
+    sleep 0.1
+  done
+  mapfile -t ask_toasts < <(cut -f1 "$NOTIFY_LOG.ids")
+  ((${#ask_toasts[@]} == 2)) || fail "an ask puts up an approve and a stand-down toast" "$(cat "$NOTIFY_LOG.ids")"
+  ask_pid=$(pgrep -o -f -- "omarchy-memory-ask $1 test")
+  [[ -n $ask_pid ]] || fail "the ask for $1 is running"
+  dummy_pids+=("$ask_pid")
+}
+stop_waiting() {
+  local i
+  for ((i = 0; i < 40; i++)); do
+    [[ -e /proc/$1 ]] || return 0
+    sleep 0.1
+  done
+  fail "$2"
+}
+toast_click() {
+  grep -F "$1" "$NOTIFY_LOG.ids" | sed 's/.* --exec //'
+}
+
+: >"$NOTIFY_LOG"
+start_ask plan-one
+old_toasts=("${ask_toasts[@]}")
+old_click=$(toast_click 'Memory agent: plan-one')
+touch "$flag"
+run "$ROOT/bin/omarchy-toggle-memory-watch" off
+old_pid=$ask_pid
+
+start_ask plan-two
+: >"$state/watch.log"
+run $old_click 2>/dev/null || fail "a stale click exits cleanly"
+[[ ! -s $state/reply ]] || fail "a click on an earlier ask's toast never answers the current one" "$(cat "$state/reply")"
+grep -Fq 'stale reply ignored' "$state/watch.log" || fail "a stale click is logged as ignored"
+stop_waiting "$old_pid" "turning the watchdog off ends the ask it was waiting on"
+for id in "${old_toasts[@]}"; do
+  grep -Fq -- "--replace-id $id " "$NOTIFY_LOG" ||
+    fail "turning the watchdog off dismisses the ask's toast $id" "$(cat "$NOTIFY_LOG")"
+done
+run $(toast_click 'Memory agent: plan-two')
+[[ $(<"$state/reply") == approve ]] || fail "a click on the current ask's toast answers it"
+stop_waiting "$ask_pid" "an answered ask ends"
+[[ $(<"$TMPDIR/plan-two.out") == approve ]] || fail "the ask prints the answer" "$(cat "$TMPDIR/plan-two.out")"
+[[ ! -e $state/question ]] || fail "an answered ask clears its question"
+pass "memory ask ignores clicks on an earlier question's toasts"
+
+# Stopping the responder stops its ask with SIGTERM, which clears up too.
+: >"$NOTIFY_LOG"
+start_ask plan-three
+kill -TERM "$ask_pid"
+stop_waiting "$ask_pid" "a stopped ask exits"
+for id in "${ask_toasts[@]}"; do
+  grep -Fq -- "--replace-id $id " "$NOTIFY_LOG" || fail "a stopped ask dismisses its toast $id" "$(cat "$NOTIFY_LOG")"
+done
+[[ ! -e $state/question ]] || fail "a stopped ask clears its question"
+pass "memory ask dismisses its toasts when stopped"
 
 skill="$ROOT/default/agents/skills/memory-emergency/SKILL.md"
 grep -Fx 'name: memory-emergency' "$skill" >/dev/null || fail "the responder's skill is named for the prompt that loads it"

@@ -1,19 +1,34 @@
 #!/bin/bash
 
 # omarchy:summary=Answer the memory agent's question
-# omarchy:args=<approve|standdown|resolved>
+# omarchy:args=<approve|standdown|resolved> [question-id]
 # omarchy:examples=omarchy memory reply approve | omarchy memory reply standdown
+
+# Without a question id this answers the current question. The ask's toasts
+# pass theirs, so a click on one left over from an earlier question is ignored
+# rather than answering the one asked now.
 
 case ${1:-} in
 approve | standdown | resolved) ;;
 *)
-  echo "Usage: omarchy-memory-reply <approve|standdown|resolved>" >&2
+  echo "Usage: omarchy-memory-reply <approve|standdown|resolved> [question-id]" >&2
   exit 1
   ;;
 esac
 
 state=$HOME/.local/state/omarchy/memory-watch
 mkdir -p "$state"
+
+if [[ -n ${2:-} ]]; then
+  current=
+  [[ -r $state/question ]] && read -r current _ <"$state/question"
+  if [[ $2 != "$current" ]]; then
+    printf '%s stale reply ignored: %s for question %s, current is %s\n' \
+      "$(date '+%F %T')" "$1" "${2//[^0-9a-zA-Z-]/}" "${current:-none}" | tee -a "$state/watch.log" >&2
+    exit 0
+  fi
+fi
+
 echo "$1" >"$state/reply"
 # The watcher reads this too: no more pauses and no more responders until
 # memory has recovered, even once this ask is over.

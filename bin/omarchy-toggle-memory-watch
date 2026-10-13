@@ -30,6 +30,9 @@ else
   systemctl --user disable --now "$unit_name"
   # A responder already running would carry on with nothing to stop it.
   systemctl --user stop omarchy-memory-agent.service 2>/dev/null
+  # Its ask cleans up when stopped; this also covers one asked from elsewhere,
+  # so no toast is left to answer a question asked after turning it back on.
+  omarchy-memory-ask --cancel >/dev/null 2>&1
   # Nothing would be left to say what it paused, or to resume it.
   omarchy-memory-resume >/dev/null
   rm -f "$HOME/.local/state/omarchy/memory-watch/standdown"

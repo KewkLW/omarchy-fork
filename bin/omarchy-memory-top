@@ -17,6 +17,12 @@
 # launcher is, one process tree at a time, so a runaway child of the
 # compositor can still be stopped while the compositor runs on.
 #
+# Games are the exception: everything under a game (GAME by name, or
+# PROTECT_CMD by cmdline) is protected too, since the game binary under
+# gamescope or a Proton helper often has a bland name. omarchy-memory-kill
+# refuses by the same game_ancestor walk. Nothing else passes protection
+# down: the session, terminals and agent sessions protect only themselves.
+#
 # A terminal's foreground job is never paused whole: once every process the
 # shell waits on stops, the shell takes the terminal back, and after SIGCONT
 # the job runs in the background, where a TUI stops itself again on its next
@@ -50,6 +56,9 @@ DEFAULT_PROTECT = (
 PROTECT = re.compile(os.environ.get("OMARCHY_MEMORY_PROTECT") or DEFAULT_PROTECT)
 # Games under Proton or Wine show up as generic loader names; the cmdline gives them away.
 PROTECT_CMD = re.compile(r"steamapps|/proton|\.exe\b", re.I)
+# Games, whose protection passes to everything under them: the game binary
+# under gamescope, or a Proton helper, often has a bland name of its own.
+GAME = re.compile(r"^(steam.*|gamescope.*|wine.*|.*\.exe)$")
 # The agent harnesses omarchy-agent can launch, and a few more.
 AGENT_NAMES = {
     "claude", "codex", "cursor-agent", "opencode", "crush", "agy", "gemini", "grok",
@@ -73,9 +82,38 @@ def agent_kind(argv):
     return None
 
 
+def is_game(name, cmd):
+    return bool(GAME.match(name) or PROTECT_CMD.search(cmd))
+
+
+def game_ancestor(pid, lookup):
+    """The nearest ancestor of pid that is a game, as (name, pid), or None.
+    lookup(pid) gives (ppid, name, cmd) for a process of any user, or None if
+    it can't be read, which ends the walk. omarchy-memory-kill refuses by the
+    same walk, so the brake and the responder never disagree about what runs
+    under a game."""
+    seen = 0
+    while pid > 1 and seen < 64:
+        info = lookup(pid)
+        if info is None:
+            return None
+        pid = info[0]
+        seen += 1
+        up = lookup(pid)
+        if up is None:
+            return None
+        if is_game(up[1], up[2]):
+            return up[1], pid
+    return None
+
+
 def scan():
     uid = os.getuid()
     groups = {}
+    mine = []
+    # Every user's (ppid, name, cmd), since a game's ancestry is checked
+    # through processes of any owner.
+    tree = {}
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
@@ -85,17 +123,19 @@ def scan():
             raw = read(f"/proc/{pid}/cmdline", "rb")
             cmd = raw.replace(b"\0", b" ").decode(errors="replace").strip()
             cgroup = read(f"/proc/{pid}/cgroup").strip().split("::")[-1]
-        except OSError:
+            fields = dict(l.split(":", 1) for l in status.splitlines() if ":" in l)
+            rest = stat[stat.rindex(")") + 2:].split()
+            # Tabs and newlines would break --pick's line and frozen.tsv.
+            name = re.sub(r"\s", " ", fields["Name"].strip())
+            tree[int(pid)] = (int(rest[1]), name, cmd)
+        except (OSError, KeyError, ValueError, IndexError):
             continue
-        fields = dict(l.split(":", 1) for l in status.splitlines() if ":" in l)
-        if int(fields["Uid"].split()[0]) != uid:
-            continue
+        if int(fields["Uid"].split()[0]) == uid:
+            mine.append((pid, fields, rest, raw, cmd, cgroup, name))
+    for pid, fields, rest, raw, cmd, cgroup, name in mine:
         kb = lambda k: int(fields.get(k, "0 kB").split()[0])
-        rest = stat[stat.rindex(")") + 2:].split()
         state, ppid, pgid = rest[0], int(rest[1]), int(rest[2])
         tty, tpgid, start = int(rest[4]), int(rest[5]), rest[19]
-        # Tabs and newlines would break --pick's line and frozen.tsv.
-        name = re.sub(r"\s", " ", fields["Name"].strip())
         key = f"{cgroup}#{pgid}"
         g = groups.setdefault(key, {
             "key": key, "cgroup": cgroup, "unit": cgroup.rsplit("/", 1)[-1],
@@ -104,7 +144,7 @@ def scan():
             "leader": None, "leader_cmd": "",
         })
         protected = bool(PROTECT.match(name) or PROTECT_CMD.search(cmd) or "omarchy-memory" in cgroup
-                         or agent_kind(raw.split(b"\0")))
+                         or agent_kind(raw.split(b"\0")) or game_ancestor(int(pid), tree.get))
         g["procs"].append({
             "pid": int(pid), "ppid": ppid, "name": name, "cmd": cmd[:160], "state": state,
             "start": start, "rss_kb": kb("VmRSS"), "swap_kb": kb("VmSwap"), "protected": protected,
