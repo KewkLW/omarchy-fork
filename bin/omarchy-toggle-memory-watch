@@ -4,8 +4,8 @@
 # omarchy:args=[toggle|on|off]
 # omarchy:examples=omarchy toggle memory-watch | omarchy toggle memory-watch off
 
-# Off by default: it is one more daemon sampling every two seconds, and every
-# toast it sends is critical, so that is the user's call to make.
+# Off by default: it pauses processes on its own when memory runs short, and
+# every toast it sends is critical, so that is the user's call to make.
 
 # nf-md-memory, escaped so this file reads without a Nerd Font.
 readonly MEMORY_GLYPH=$'\U000f035b'
@@ -27,6 +27,8 @@ if omarchy-toggle-enabled memory-watch-on; then
   omarchy-notification-send -g "$MEMORY_GLYPH" "Memory watchdog enabled"
 else
   systemctl --user disable --now "$unit_name"
+  # Nothing would be left to say what it paused, or to resume it.
+  omarchy-memory-resume >/dev/null
   rm -f "$unit"
   systemctl --user daemon-reload
   omarchy-notification-send -g "$MEMORY_GLYPH" "Memory watchdog disabled"

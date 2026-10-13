@@ -171,3 +171,245 @@ run "$ROOT/bin/omarchy-memory-top" --json | jq -e --argjson pid "${dummy_pids[0]
   'any(.[]; .pids == [$pid] and .leader == "sleep")' >/dev/null ||
   fail "memory top lists a process group with its pids"
 pass "memory top lists process groups"
+
+# The brake pauses a whole group when nothing in it is protected.
+# Its own process group, like a job started from a terminal or an agent's shell.
+dummy_pid=${dummy_pids[0]}
+picked=$(OMARCHY_MEMORY_ONLY=omarchy-memtest-dummy run "$ROOT/bin/omarchy-memory-top" --pick 0) ||
+  fail "the brake can pick an unprotected process group"
+[[ $picked == *$'\t'"$dummy_pid"$'\t'* ]] || fail "the brake picks the dummy's own pids, got: $picked"
+pass "memory brake picks an unprotected group"
+
+if OMARCHY_MEMORY_ONLY=omarchy-memtest-dummy OMARCHY_MEMORY_PROTECT='^sleep$' run "$ROOT/bin/omarchy-memory-top" --pick 0 >/dev/null; then
+  fail "the brake never picks a protected process"
+fi
+pass "memory brake skips protected processes"
+
+# Protection is per process: in a group led by a protected process (Hyprland,
+# with everything it started without a launcher in its pgid), the brake takes
+# the unprotected child and never the protected leader.
+cp "$(command -v bash)" "$TMPDIR/memtest-shield"
+cp "$(command -v sleep)" "$TMPDIR/memtest-child"
+setsid "$TMPDIR/memtest-shield" -c "\"$TMPDIR/memtest-child\" 301 & \"$TMPDIR/memtest-child\" 302 & wait" &
+shield_pid=$!
+dummy_pids+=("$shield_pid")
+sleep 0.3
+child_pids=$(pgrep -g "$shield_pid" -x memtest-child | sort -n | paste -sd,)
+dummy_pids+=(${child_pids//,/ })
+[[ $child_pids == *,* ]] || fail "the protected group's children started" "$child_pids"
+picked=$(OMARCHY_MEMORY_ONLY=memtest- OMARCHY_MEMORY_PROTECT='^memtest-shield$' \
+  run "$ROOT/bin/omarchy-memory-top" --pick 0) ||
+  fail "the brake picks an unprotected process inside a protected group"
+IFS=$'\t' read -r key _ name pids _ <<<"$picked"
+[[ $name == memtest-child && $pids =~ ^[0-9]+$ && ,$child_pids, == *,$pids,* ]] ||
+  fail "the brake takes one unprotected child of a protected group, got: $picked"
+[[ $key == *"#$shield_pid@$pids" ]] || fail "the brake records which tree inside the group it took, got: $key"
+[[ ,$pids, != *,$shield_pid,* ]] || fail "the brake never pauses the protected leader"
+pass "memory brake protects per process, not per group"
+
+start_time() {
+  local stat
+  stat=$(<"/proc/$1/stat")
+  stat=${stat##*) }
+  read -ra stat <<<"$stat"
+  echo "${stat[19]}"
+}
+
+proc_state() {
+  awk '{ print $3 }' "/proc/$1/stat"
+}
+
+# A terminal's foreground job is never paused whole: the shell would take the
+# terminal back, and the job would be left in the background after a resume.
+# The name comes from the environment, so the python parent's own cmdline
+# never matches it.
+MEMTEST_NAME=omarchy-memtest-fg python3 -c '
+import os, pty, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("sleep", [os.environ["MEMTEST_NAME"], "300"])
+print(pid, flush=True)
+time.sleep(300)
+' >"$TMPDIR/fg-pid" &
+dummy_pids+=($!)
+sleep 0.5
+fg_pid=$(<"$TMPDIR/fg-pid")
+dummy_pids+=("$fg_pid")
+run "$ROOT/bin/omarchy-memory-top" --json | jq -e --argjson pid "$fg_pid" \
+  'any(.[]; .pids == [$pid] and .foreground)' >/dev/null ||
+  fail "memory top sees the dummy as a terminal's foreground job"
+if picked=$(OMARCHY_MEMORY_ONLY=omarchy-memtest-fg run "$ROOT/bin/omarchy-memory-top" --pick 0); then
+  fail "the brake never pauses a terminal's foreground job" "$picked"
+fi
+pass "memory brake leaves a terminal's foreground job alone"
+
+# Resume sends SIGCONT to exactly what the brake recorded.
+kill -STOP "$dummy_pid"
+mkdir -p "$state"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "2026-01-01 00:00:00" brake "test#$dummy_pid" 1 sleep "$dummy_pid" \
+  "$(start_time "$dummy_pid")" >"$state/frozen.tsv"
+
+if OMARCHY_MEMORY_ONLY=omarchy-memtest-dummy run "$ROOT/bin/omarchy-memory-top" --pick 0 >/dev/null; then
+  fail "the brake doesn't pick a group it already paused"
+fi
+pass "memory brake skips stopped groups"
+
+run "$ROOT/bin/omarchy-memory-resume" sleep >/dev/null
+sleep 0.2
+[[ $(proc_state "$dummy_pid") != "T" ]] || fail "resume continues the paused group"
+[[ ! -s $state/frozen.tsv ]] || fail "resume clears what it resumed from frozen.tsv"
+pass "memory resume continues paused groups"
+
+# A pid whose start time no longer matches is someone else's now.
+kill -STOP "$dummy_pid"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "2026-01-01 00:00:00" brake "test#$dummy_pid" 1 sleep "$dummy_pid" 1 >"$state/frozen.tsv"
+run "$ROOT/bin/omarchy-memory-resume" >/dev/null
+sleep 0.2
+[[ $(proc_state "$dummy_pid") == "T" ]] || fail "resume never signals a pid that has been reused"
+kill -CONT "$dummy_pid"
+pass "memory resume checks each process's start time"
+
+# Swap alone never brakes: zram is sized to RAM, so half of it or more in use
+# is routine while RAM is fine.
+printf 'MemTotal: 1000000 kB\nMemAvailable: 500000 kB\nSwapTotal: 1000000 kB\nSwapFree: 100000 kB\n' >"$fake/meminfo"
+: >"$state/frozen.tsv"
+watch OMARCHY_MEMORY_ONLY=omarchy-memtest-dummy OMARCHY_MEMORY_BRAKE_MIN_MB=0
+[[ $(proc_state "$dummy_pid") != "T" ]] || fail "swap 90% used with RAM half free pauses nothing"
+! grep -Fq 'Memory brake' "$NOTIFY_LOG" || fail "swap with RAM to spare raises no brake toast" "$(cat "$NOTIFY_LOG")"
+pass "memory brake ignores swap while RAM is fine"
+
+# Swap and RAM both past the brake lines pause one group straight away, short
+# of oomd's 90% and 90%. A second dummy stays running: while the first is
+# still paused, the brake pauses nothing else, even with no gap between tries.
+setsid bash -c 'exec -a omarchy-memtest-dummy2 sleep 300' &
+dummy2_pid=$!
+dummy_pids+=("$dummy2_pid")
+sleep 0.2
+printf 'MemTotal: 1000000 kB\nMemAvailable: 120000 kB\nSwapTotal: 1000000 kB\nSwapFree: 200000 kB\n' >"$fake/meminfo"
+watch OMARCHY_MEMORY_ONLY=omarchy-memtest-dummy OMARCHY_MEMORY_BRAKE_MIN_MB=0 OMARCHY_MEMORY_BRAKE_GAP=0
+paused=0
+for pid in "$dummy_pid" "$dummy2_pid"; do
+  [[ $(proc_state "$pid") == "T" ]] && ((++paused))
+done
+((paused == 1)) || fail "swap 80% with RAM 88% pauses exactly one group, paused $paused"
+[[ $(wc -l <"$state/frozen.tsv") == 1 ]] || fail "the brake records one pause" "$(cat "$state/frozen.tsv")"
+IFS=$'\t' read -r _ source _ _ _ pids starts <"$state/frozen.tsv"
+[[ $source == brake ]] || fail "the brake records itself as the source" "$(cat "$state/frozen.tsv")"
+[[ $starts == "$(start_time "$pids")" ]] || fail "the brake records the start time of what it paused"
+grep -Fq 'Memory brake: paused sleep' "$NOTIFY_LOG" || fail "the brake says what it paused" "$(cat "$NOTIFY_LOG")"
+pass "memory brake pauses one group before oomd's lines"
+
+# Resumed by hand (a plain SIGCONT), the pause no longer holds the brake back.
+kill -CONT "$pids"
+watch OMARCHY_MEMORY_ONLY=omarchy-memtest-dummy OMARCHY_MEMORY_BRAKE_MIN_MB=0 OMARCHY_MEMORY_BRAKE_GAP=0
+grep -Fq 'Memory brake: paused sleep' "$NOTIFY_LOG" || fail "a pause resumed by hand stops holding the brake back"
+[[ $(wc -l <"$state/frozen.tsv") == 1 ]] || fail "a resumed pause is dropped from frozen.tsv" "$(cat "$state/frozen.tsv")"
+run "$ROOT/bin/omarchy-memory-resume" >/dev/null
+for pid in "$dummy_pid" "$dummy2_pid"; do
+  [[ $(proc_state "$pid") != "T" ]] || fail "resume continues everything the brake paused"
+done
+pass "memory brake holds only while its pause does"
+
+# Whatever holds frozen.lock: waits until it has it.
+wait_locked() {
+  local i
+  for ((i = 0; i < 50; i++)); do
+    flock -n "$state/frozen.lock" true || return 0
+    sleep 0.1
+  done
+  fail "the test's lock holder takes frozen.lock"
+}
+
+# A resume that holds frozen.lock past the brake's wait rewrites frozen.tsv
+# from the copy it read, dropping any line appended meanwhile. The brake
+# pauses nothing it cannot record under the lock.
+setsid bash -c 'exec -a omarchy-memtest-locked sleep 3040' &
+locked_pid=$!
+dummy_pids+=("$locked_pid")
+: >"$state/frozen.tsv"
+: >"$state/watch.log"
+(
+  flock 9
+  cp "$state/frozen.tsv" "$TMPDIR/frozen.kept"
+  sleep 8.5
+  mv "$TMPDIR/frozen.kept" "$state/frozen.tsv"
+) 9>"$state/frozen.lock" &
+holder=$!
+wait_locked
+run env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" OMARCHY_MEMORY_PRESSURE="$fake/pressure" \
+  OMARCHY_MEMORY_APP_PRESSURE="$fake/app-pressure" OMARCHY_MEMORY_INTERVAL=0.2 \
+  OMARCHY_MEMORY_ONLY=omarchy-memtest-locked OMARCHY_MEMORY_BRAKE_MIN_MB=0 \
+  timeout 7.5 "$ROOT/bin/omarchy-memory-watch" 2>/dev/null || true
+wait "$holder"
+if [[ $(proc_state "$locked_pid") == "T" ]]; then
+  grep -Fq $'\t'"$locked_pid"$'\t' "$state/frozen.tsv" ||
+    fail "the brake never leaves a group paused with no record to resume it" "$(cat "$state/frozen.tsv")"
+fi
+[[ $(proc_state "$locked_pid") != "T" ]] && grep -Fq 'brake: frozen.tsv stayed locked; left sleep running' "$state/watch.log" ||
+  fail "the brake pauses nothing while it cannot take frozen.lock, and says so" "$(cat "$state/watch.log")"
+pass "memory brake pauses only what it can record"
+
+# Turning the watchdog off stops it with a TERM to everything in its unit, then
+# resumes what frozen.tsv lists. A TERM while the brake is under way must not
+# leave a group stopped with no line there.
+: >"$state/frozen.tsv"
+: >"$state/watch.log"
+(
+  flock 9
+  exec -a omarchy-memtest-lockhold sleep 3041
+) 9>"$state/frozen.lock" &
+holder=$!
+dummy_pids+=("$holder")
+wait_locked
+run env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" OMARCHY_MEMORY_PRESSURE="$fake/pressure" \
+  OMARCHY_MEMORY_APP_PRESSURE="$fake/app-pressure" OMARCHY_MEMORY_INTERVAL=0.2 \
+  OMARCHY_MEMORY_ONLY=omarchy-memtest-locked OMARCHY_MEMORY_BRAKE_MIN_MB=0 \
+  timeout 10 "$ROOT/bin/omarchy-memory-watch" 2>/dev/null &
+watch_job=$!
+# timeout leads its own process group, as a unit's cgroup holds the watcher.
+group= waiter=
+for _ in {1..50}; do
+  group=$(pgrep -P "$watch_job" -x timeout || true)
+  [[ -n $group ]] && waiter=$(pgrep -g "$group" -x flock || true)
+  [[ -n $waiter ]] && break
+  sleep 0.1
+done
+[[ -n $waiter ]] || fail "the brake waits for frozen.lock while something else holds it"
+kill -TERM -- -"$group"
+sleep 0.3
+kill "$holder"
+wait "$watch_job" || true
+! pgrep -g "$group" >/dev/null || fail "a TERM during the brake still stops the watcher"
+if [[ $(proc_state "$locked_pid") == "T" ]]; then
+  grep -Fq $'\t'"$locked_pid"$'\t' "$state/frozen.tsv" ||
+    fail "a TERM during the brake never leaves a group paused with no record" "$(cat "$state/frozen.tsv")"
+fi
+run "$ROOT/bin/omarchy-memory-resume" >/dev/null
+[[ $(proc_state "$locked_pid") != "T" ]] || fail "resume continues a pause the brake made as it was stopped"
+pass "memory brake leaves nothing paused unrecorded when stopped"
+
+# Turning the watchdog off resumes what it paused.
+kill -STOP "$dummy_pid"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "2026-01-01 00:00:00" brake "test#$dummy_pid" 1 sleep "$dummy_pid" \
+  "$(start_time "$dummy_pid")" >"$state/frozen.tsv"
+mkdir -p "$(dirname "$flag")"
+touch "$flag"
+run "$ROOT/bin/omarchy-toggle-memory-watch" off
+sleep 0.2
+[[ $(proc_state "$dummy_pid") != "T" ]] || fail "turning the watchdog off resumes what it paused"
+pass "memory watchdog toggle off resumes paused groups"
+
+# A game's own binary often has a bland name (under gamescope, or a Proton
+# helper), so the brake protects everything under a game: a child in the
+# game's group, and one in a group of its own.
+setsid bash -c 'exec -a /tmp/memtest/steamapps/common/game.exe bash -c "sleep 3032 & setsid -w sleep 3033 & wait"' &
+game_pid=$!
+dummy_pids+=("$game_pid")
+sleep 0.3
+game_children=$(pgrep -P "$game_pid" -x sleep | sort -n | paste -sd' ')
+dummy_pids+=($game_children)
+[[ $game_children == *' '* ]] || fail "the game's children started" "$game_children"
+if picked=$(OMARCHY_MEMORY_ONLY='sleep 303[23]$' run "$ROOT/bin/omarchy-memory-top" --pick 0); then
+  fail "the brake never pauses what runs under a game" "$picked"
+fi
+pass "memory brake protects everything under a game"

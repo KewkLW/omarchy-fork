@@ -1,18 +1,64 @@
 #!/usr/bin/python3
 # omarchy:summary=Show this user's process groups by memory use (RAM + swap)
-# omarchy:args=[--json]
-# omarchy:examples=omarchy memory top | omarchy memory top --json
+# omarchy:args=[--json] [--pick <min-mb>]
+# omarchy:examples=omarchy memory top | omarchy memory top --pick 1024
 
 # A group is (cgroup, process group id). Neither alone works: apps launched from
 # Hyprland all share Hyprland's pgid, while one terminal scope holds the
 # terminal, its shells, and every build they started, each in its own pgid.
+# Signals therefore go to pids, never to `kill -- -pgid`.
 #
 # UNIT is the cgroup's last part. systemd-oomd only kills scopes under
 # app.slice, and always the whole scope, so that is what to read it by.
+#
+# Protection is per process. A group with no protected process is paused
+# whole, since a build's jobs share it. A group holding a protected process
+# (Hyprland's own, say) is never paused whole; what it started without a
+# launcher is, one process tree at a time, so a runaway child of the
+# compositor can still be stopped while the compositor runs on.
+#
+# Games are the exception: everything under a game (GAME by name, or
+# PROTECT_CMD by cmdline) is protected too, since the game binary under
+# gamescope or a Proton helper often has a bland name. omarchy-memory-kill
+# refuses by the same game_ancestor walk. Nothing else passes protection
+# down: the session, terminals and agent sessions protect only themselves.
+#
+# A terminal's foreground job is never paused whole: once every process the
+# shell waits on stops, the shell takes the terminal back, and after SIGCONT
+# the job runs in the background, where a TUI stops itself again on its next
+# read or write of the terminal. Inside a protected foreground group, a tree
+# hanging off the protected process is still fair game, since the shell's own
+# child keeps running.
+#
+# --pick prints "key<TAB>total_mb<TAB>name<TAB>pids<TAB>starts" for the largest
+# such candidate that is not already stopped and is at least <min-mb>; exit 1
+# if none. starts are the pids' start times (/proc/<pid>/stat field 22), so a
+# pid reused by a new process is never signalled in its place.
+#
+# OMARCHY_MEMORY_PROTECT  regex on process names that are never paused, on top of the built-in list
+# OMARCHY_MEMORY_ONLY     if set, --pick only considers candidates whose name or cmdline matches
 
 import json
 import os
+import re
 import sys
+
+DEFAULT_PROTECT = (
+    r"^(Hyprland|Xwayland|start-hyprland|systemd.*|\(sd-pam\)|pipewire.*|wireplumber|"
+    r"sddm.*|dbus-.*|uwsm.*|omarchy-memory.*|quickshell|walker|elephant|swayosd.*|"
+    r"hyprpaper|hypridle|hyprlock|xdg-.*|gnome-keyring.*|fcitx5|"
+    r"alacritty|ghostty|kitty|foot|steam.*|gamescope.*|wine.*|.*\.exe)$"
+)
+# A user's pattern adds to the built-in list; it must not cost the compositor,
+# audio or the terminals their protection.
+PROTECT = re.compile(DEFAULT_PROTECT + (f"|(?:{os.environ['OMARCHY_MEMORY_PROTECT']})"
+                                        if os.environ.get("OMARCHY_MEMORY_PROTECT") else ""))
+# Games under Proton or Wine show up as generic loader names; the cmdline gives them away.
+PROTECT_CMD = re.compile(r"steamapps|/proton|\.exe\b", re.I)
+# Games, whose protection passes to everything under them: the game binary
+# under gamescope, or a Proton helper, often has a bland name of its own.
+GAME = re.compile(r"^(steam.*|gamescope.*|wine.*|.*\.exe)$")
+ONLY = os.environ.get("OMARCHY_MEMORY_ONLY")
 
 
 def read(path, mode="r"):
@@ -20,37 +66,75 @@ def read(path, mode="r"):
         return f.read()
 
 
+def is_game(name, cmd):
+    return bool(GAME.match(name) or PROTECT_CMD.search(cmd))
+
+
+def game_ancestor(pid, lookup):
+    """The nearest ancestor of pid that is a game, as (name, pid), or None.
+    lookup(pid) gives (ppid, name, cmd) for a process of any user, or None if
+    it can't be read, which ends the walk. omarchy-memory-kill refuses by the
+    same walk, so the brake and the responder never disagree about what runs
+    under a game."""
+    seen = 0
+    while pid > 1 and seen < 64:
+        info = lookup(pid)
+        if info is None:
+            return None
+        pid = info[0]
+        seen += 1
+        up = lookup(pid)
+        if up is None:
+            return None
+        if is_game(up[1], up[2]):
+            return up[1], pid
+    return None
+
+
 def scan():
     uid = os.getuid()
     groups = {}
+    mine = []
+    # Every user's (ppid, name, cmd), since a game's ancestry is checked
+    # through processes of any owner.
+    tree = {}
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
         try:
             status = read(f"/proc/{pid}/status")
             stat = read(f"/proc/{pid}/stat")
-            cmd = read(f"/proc/{pid}/cmdline", "rb").replace(b"\0", b" ")
-            cmd = cmd.decode(errors="replace").strip()
+            raw = read(f"/proc/{pid}/cmdline", "rb")
+            cmd = raw.replace(b"\0", b" ").decode(errors="replace").strip()
             cgroup = read(f"/proc/{pid}/cgroup").strip().split("::")[-1]
-        except OSError:
+            fields = dict(l.split(":", 1) for l in status.splitlines() if ":" in l)
+            rest = stat[stat.rindex(")") + 2:].split()
+            # Tabs and newlines would break --pick's line and frozen.tsv.
+            name = re.sub(r"\s", " ", fields["Name"].strip())
+            tree[int(pid)] = (int(rest[1]), name, cmd)
+        except (OSError, KeyError, ValueError, IndexError):
             continue
-        fields = dict(l.split(":", 1) for l in status.splitlines() if ":" in l)
-        if int(fields["Uid"].split()[0]) != uid:
-            continue
+        if int(fields["Uid"].split()[0]) == uid:
+            mine.append((pid, fields, rest, raw, cmd, cgroup, name))
+    for pid, fields, rest, raw, cmd, cgroup, name in mine:
         kb = lambda k: int(fields.get(k, "0 kB").split()[0])
-        rest = stat[stat.rindex(")") + 2:].split()
         state, ppid, pgid = rest[0], int(rest[1]), int(rest[2])
-        name = fields["Name"].strip()
+        tty, tpgid, start = int(rest[4]), int(rest[5]), rest[19]
         key = f"{cgroup}#{pgid}"
         g = groups.setdefault(key, {
             "key": key, "cgroup": cgroup, "unit": cgroup.rsplit("/", 1)[-1],
             "pgid": pgid, "rss_mb": 0, "swap_mb": 0, "pids": [], "procs": [],
-            "stopped": 0, "leader": None, "leader_cmd": "",
+            "stopped": 0, "protected": False, "foreground": False,
+            "leader": None, "leader_cmd": "",
         })
+        protected = bool(PROTECT.match(name) or PROTECT_CMD.search(cmd) or "omarchy-memory" in cgroup
+                         or game_ancestor(int(pid), tree.get))
         g["procs"].append({
-            "pid": int(pid), "ppid": ppid, "name": name, "cmd": cmd[:160],
-            "state": state, "rss_kb": kb("VmRSS"), "swap_kb": kb("VmSwap"),
+            "pid": int(pid), "ppid": ppid, "name": name, "cmd": cmd[:160], "state": state,
+            "start": start, "rss_kb": kb("VmRSS"), "swap_kb": kb("VmSwap"), "protected": protected,
         })
+        g["protected"] |= protected
+        g["foreground"] |= tty != 0 and tpgid == pgid
         g["pids"].append(int(pid))
         g["stopped"] += state == "T"
         if int(pid) == pgid or g["leader"] is None:
@@ -65,6 +149,48 @@ def scan():
     return out
 
 
+def candidates(groups):
+    """What the brake may pause: whole groups with nothing protected in them,
+    and, inside a group that has something protected, each tree of unprotected
+    processes hanging off it."""
+    for g in groups:
+        if not g["protected"]:
+            if not g["foreground"]:
+                yield {"key": g["key"], "total_mb": g["total_mb"], "name": g["leader"],
+                       "cmd": g["leader_cmd"], "procs": g["procs"]}
+            continue
+        members = set(g["pids"])
+        free = {p["pid"]: p for p in g["procs"] if not p["protected"]}
+        children = {}
+        for p in free.values():
+            children.setdefault(p["ppid"], []).append(p)
+        for root in (p for p in free.values() if p["ppid"] not in free):
+            # In a foreground job, a process whose parent is outside the
+            # group is one the shell waits on.
+            if g["foreground"] and root["ppid"] not in members:
+                continue
+            tree, todo = [], [root]
+            while todo:
+                p = todo.pop()
+                tree.append(p)
+                todo.extend(children.get(p["pid"], []))
+            total = sum(p["rss_kb"] + p["swap_kb"] for p in tree) // 1024
+            yield {"key": f"{g['key']}@{root['pid']}", "total_mb": total, "name": root["name"],
+                   "cmd": root["cmd"], "procs": tree}
+
+
+def pick(groups, min_mb):
+    for c in sorted(candidates(groups), key=lambda c: -c["total_mb"]):
+        if c["total_mb"] < min_mb:
+            return None
+        if all(p["state"] == "T" for p in c["procs"]):
+            continue
+        if ONLY and not re.search(ONLY, c["name"] + " " + c["cmd"]):
+            continue
+        return c
+    return None
+
+
 def main():
     groups = scan()
     if "--json" in sys.argv:
@@ -72,10 +198,19 @@ def main():
             del g["procs"]
         json.dump(groups, sys.stdout, indent=1)
         return 0
-    print(f"{'TOTAL':>7} {'RSS':>7} {'SWAP':>7} {'N':>4} S  LEADER  [UNIT PGID]  CMD")
+    if "--pick" in sys.argv:
+        c = pick(groups, int(sys.argv[sys.argv.index("--pick") + 1]))
+        if c is None:
+            return 1
+        procs = sorted(c["procs"], key=lambda p: p["pid"])
+        print(c["key"], c["total_mb"], c["name"], ",".join(str(p["pid"]) for p in procs),
+              ",".join(p["start"] for p in procs), sep="\t")
+        return 0
+    print(f"{'TOTAL':>7} {'RSS':>7} {'SWAP':>7} {'N':>4} P S  LEADER  [UNIT PGID]  CMD")
     for g in groups[:int(os.environ.get("OMARCHY_MEMORY_TOP_N", 20))]:
         print(f"{g['total_mb']:>6}M {g['rss_mb']:>6}M {g['swap_mb']:>6}M "
-              f"{len(g['pids']):>4} {'T' if g['stopped'] else '-'}  "
+              f"{len(g['pids']):>4} {'P' if g['protected'] else '-'} "
+              f"{'T' if g['stopped'] else '-'}  "
               f"{g['leader']}  [{g['unit']} pgid={g['pgid']}]  {g['leader_cmd'][:80]}")
     return 0
 

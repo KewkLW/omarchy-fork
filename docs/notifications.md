@@ -186,7 +186,11 @@ Everything goes through the same sender contract, so the pieces are small:
   user journal for the user manager's "systemd-oomd killed" message and sends
   a critical toast naming the app, from the snapshot the watcher took while
   memory was tight, and why, from the system journal when this user can read
-  it.
+  it. Its brake (swap 75% with RAM 85%, or RAM 97% with a 40% stall; never
+  swap alone, since zram sized to RAM is often half used while RAM is fine)
+  sends a critical toast when it pauses a process group, saying
+  `omarchy memory resume` undoes it. It pauses one group at a time, and
+  nothing more while that one is still paused.
 - **Pending migrations** — `omarchy-migrate-notify` (from its user service
   after `graphical-session.target`) waits for the server, then sends a
   critical toast whose click opens a terminal running `omarchy-migrate`,
