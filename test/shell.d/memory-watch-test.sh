@@ -223,6 +223,30 @@ expected=$((878 - held - others - 100 - 50))
 ((rest == expected)) || fail "memory top counts zram's share as accounted for" "$line"
 pass "memory top says how much used RAM no process holds"
 
+# A shared-memory page is tmpfs's in the line, never a process's as well: a
+# process holding 64M of /dev/shm adds nothing to what processes hold.
+python3 -c 'import mmap, time; m = mmap.mmap(-1, 64 << 20); m.write(b"x" * (64 << 20)); time.sleep(300)' &
+shm_pid=$!
+dummy_pids+=("$shm_pid")
+for _ in {1..50}; do
+  (($(awk '/^RssShmem:/ { print $2 }' "/proc/$shm_pid/status" 2>/dev/null || echo 0) >= 65536)) && break
+  sleep 0.1
+done
+(($(awk '/^RssShmem:/ { print $2 }' "/proc/$shm_pid/status") >= 65536)) || fail "the shared-memory dummy maps its 64M"
+# The dummy alone, through the scanner's own sum: the whole table moves by
+# hundreds of megabytes between two scans on a busy machine.
+shm_held=$(run python3 - "$shm_pid" <<'PY'
+import importlib.machinery, importlib.util, shutil, sys
+loader = importlib.machinery.SourceFileLoader("top", shutil.which("omarchy-memory-top"))
+top = importlib.util.module_from_spec(importlib.util.spec_from_loader("top", loader))
+loader.exec_module(top)
+print(top.held_mb([{"procs": [{"pid": int(sys.argv[1]), "rss_kb": 0}]}]))
+PY
+)
+((shm_held < 16)) || fail "memory top counts a shared-memory page once, as tmpfs's" "the dummy's share came to ${shm_held}M"
+kill "$shm_pid" 2>/dev/null || true
+pass "memory top leaves shared memory to the tmpfs figure"
+
 # A user's protect pattern adds to the built-in list; it never strips the
 # compositor of its protection.
 mkdir -p "$TMPDIR/hy"

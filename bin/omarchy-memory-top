@@ -111,15 +111,21 @@ def zram_mb():
 def held_mb(groups):
     """What this user's processes hold, a shared page counted once: Pss from
     smaps_rollup, or RSS where that cannot be read, which counts a page once
-    per process mapping it and would hide memory nobody holds."""
+    per process mapping it and would hide memory nobody holds. Shared-memory
+    pages are left out here, since Shmem counts them in the memory line, and
+    counting them twice would hide memory nobody holds the same way."""
     total = 0
     for g in groups:
         for p in g["procs"]:
             try:
-                pss = [l for l in read(f"/proc/{p['pid']}/smaps_rollup").splitlines() if l.startswith("Pss:")]
-                total += int(pss[0].split()[1]) if pss else p["rss_kb"]
-            except (OSError, ValueError, IndexError):
-                total += p["rss_kb"]
+                fields = dict(l.split(":", 1) for l in read(f"/proc/{p['pid']}/smaps_rollup").splitlines() if ":" in l)
+                total += int(fields["Pss"].split()[0]) - int(fields.get("Pss_Shmem", "0 kB").split()[0])
+            except (OSError, KeyError, ValueError, IndexError):
+                try:
+                    fields = dict(l.split(":", 1) for l in read(f"/proc/{p['pid']}/status").splitlines() if ":" in l)
+                    total += p["rss_kb"] - int(fields.get("RssShmem", "0 kB").split()[0])
+                except (OSError, ValueError, IndexError):
+                    total += p["rss_kb"]
     return total // 1024
 
 
