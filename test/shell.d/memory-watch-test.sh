@@ -205,6 +205,27 @@ run "$ROOT/bin/omarchy-memory-top" --json | jq -e --argjson pid "${dummy_pids[0]
   fail "memory top lists a process group with its pids"
 pass "memory top lists process groups"
 
+# The responder reads how much of the used RAM no process of this user's
+# holds, since no kill can free that.
+printf 'MemTotal: 1000000 kB\nMemAvailable: 100000 kB\n' >"$fake/meminfo"
+line=$(run env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" "$ROOT/bin/omarchy-memory-top" | head -1)
+[[ $line == "RAM used 878M of 976M; this user's processes hold "*"M; unaccounted "*"M ("*"% of RAM)" ]] ||
+  fail "memory top leads with used RAM against what processes hold" "$line"
+pass "memory top says how much used RAM no process holds"
+
+# Hermes run as a module is an agent session too, as omarchy-remove-ai-hermes
+# knows it; its first two words name no agent.
+mkdir -p "$TMPDIR/py"
+ln -s "$(command -v bash)" "$TMPDIR/py/python3"
+printf 'sleep 300\n' >"$TMPDIR/py/hermes_cli.main"
+(cd "$TMPDIR/py" && exec ./python3 -m hermes_cli.main) &
+hermes_pid=$!
+dummy_pids+=("$hermes_pid")
+sleep 0.3
+[[ $(run "$ROOT/bin/omarchy-memory-top" --agent "$hermes_pid") == hermes ]] ||
+  fail "memory top knows Hermes run as python -m hermes_cli.main" "$(tr '\0' ' ' <"/proc/$hermes_pid/cmdline")"
+pass "memory top recognises a Hermes session run as a module"
+
 # The brake pauses a whole group when nothing in it is protected.
 # Its own process group, like a job started from a terminal or an agent's shell.
 dummy_pid=${dummy_pids[0]}
@@ -920,6 +941,8 @@ pass "memory ask dismisses its toasts when stopped"
 
 skill="$ROOT/default/agents/skills/memory-emergency/SKILL.md"
 grep -Fx 'name: memory-emergency' "$skill" >/dev/null || fail "the responder's skill is named for the prompt that loads it"
+grep -Fq 'unaccounted' "$skill" && grep -Fq 'no kill returns it' "$skill" ||
+  fail "the skill tells the responder to stop killing when no process holds the memory"
 migration=$(grep -rl 'memory-emergency' "$ROOT/migrations" | head -n 1 || true)
 [[ -n $migration ]] || fail "existing installs never get the memory-emergency skill linked"
 grep -F 'omarchy-memory-watch.service' "$migration" | grep -F 'enable' >/dev/null &&

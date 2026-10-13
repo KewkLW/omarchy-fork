@@ -77,12 +77,32 @@ def read(path, mode="r"):
 
 def agent_kind(argv):
     """The agent this argv is, if any. Node-hosted agents show up as `node
-    .../bin/<agent>`, so the first two words are checked, not just comm."""
-    for word in argv[:2]:
-        base = os.path.basename(word.decode(errors="replace"))
+    .../bin/<agent>`, so the first two words are checked, not just comm, and
+    Hermes run as a module shows up as `python -m hermes_cli.main`, as
+    omarchy-remove-ai-hermes also knows it."""
+    words = [os.path.basename(w.decode(errors="replace")) for w in argv[:3]]
+    for base in words[:2]:
         if base in AGENT_NAMES:
             return base
+    if len(words) == 3 and words[0].startswith("python") and words[1] == "-m" \
+            and words[2].startswith("hermes_cli"):
+        return "hermes"
     return None
+
+
+def memory_line(groups):
+    """Used RAM against what this user's processes hold, for the responder: a
+    large rest is memory no kill can free (a hung GPU client's driver memory,
+    say), which only a reboot returns."""
+    fields = {}
+    for line in read(os.environ.get("OMARCHY_MEMORY_MEMINFO", "/proc/meminfo")).splitlines():
+        key, _, value = line.partition(":")
+        fields[key] = int(value.split()[0])
+    used = (fields["MemTotal"] - fields["MemAvailable"]) // 1024
+    held = sum(g["rss_mb"] for g in groups)
+    rest = max(used - held, 0)
+    return (f"RAM used {used}M of {fields['MemTotal'] // 1024}M; this user's processes hold {held}M; "
+            f"unaccounted {rest}M ({100 * rest // max(fields['MemTotal'] // 1024, 1)}% of RAM)")
 
 
 def is_game(name, cmd):
@@ -235,6 +255,10 @@ def main():
         print(c["key"], c["total_mb"], c["name"], ",".join(str(p["pid"]) for p in procs),
               ",".join(p["start"] for p in procs), sep="\t")
         return 0
+    try:
+        print(memory_line(groups))
+    except (OSError, KeyError, ValueError, IndexError):
+        pass
     print(f"{'TOTAL':>7} {'RSS':>7} {'SWAP':>7} {'N':>4} P S  LEADER  [UNIT PGID]  CMD")
     for g in groups[:int(os.environ.get("OMARCHY_MEMORY_TOP_N", 20))]:
         print(f"{g['total_mb']:>6}M {g['rss_mb']:>6}M {g['swap_mb']:>6}M "
