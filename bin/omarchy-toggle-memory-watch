@@ -35,6 +35,9 @@ else
   omarchy-memory-ask --cancel >/dev/null 2>&1
   # Nothing would be left to say what it paused, or to resume it.
   omarchy-memory-resume >/dev/null
+  # A handoff still owed from before would start the responder for a pause
+  # that was just undone, once the watchdog is turned back on.
+  rm -f "$HOME/.local/state/omarchy/memory-watch/brake-pending"
   rm -f "$HOME/.local/state/omarchy/memory-watch/standdown"
   rm -f "$unit"
   systemctl --user daemon-reload

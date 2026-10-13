@@ -835,13 +835,21 @@ grep -Fq $'\t'"claude-$spaced_agent"$'\t''through a spaced wrapper' "$state/agen
   fail "memory note reads the parent past a name with a space" "$(tail -2 "$state/agent-notes.log")"
 pass "memory note walks past a wrapper whose name has a space"
 
-# Turning the watchdog off also stops a responder that is still running.
+# Turning the watchdog off also stops a responder that is still running, and
+# forgets a handoff still owed: it resumed what that was for, and turning the
+# watchdog back on must not start an agent for nothing.
 : >"$SYSTEMCTL_LOG"
-touch "$flag" "$state/standdown"
+touch "$flag" "$state/standdown" "$state/brake-pending"
 run "$ROOT/bin/omarchy-toggle-memory-watch" off
 grep -Fqx -- "--user stop omarchy-memory-agent.service" "$SYSTEMCTL_LOG" ||
   fail "turning the watchdog off stops a running responder" "$(cat "$SYSTEMCTL_LOG")"
 [[ ! -e $state/standdown ]] || fail "turning the watchdog off forgets a stand-down"
+[[ ! -e $state/brake-pending ]] || fail "turning the watchdog off forgets a handoff still owed"
+rm -f "$state/last-spawn"
+: >"$SYSTEMD_RUN_LOG"
+printf 'MemTotal: 1000000 kB\nMemAvailable: 900000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n' >"$fake/meminfo"
+watch
+[[ ! -s $SYSTEMD_RUN_LOG ]] || fail "a watcher turned back on with memory fine starts no responder" "$(cat "$SYSTEMD_RUN_LOG")"
 pass "memory watchdog toggle off stops the responder"
 
 # A toast left from an earlier ask never answers a later one. Each ask runs in
