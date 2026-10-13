@@ -207,11 +207,32 @@ pass "memory top lists process groups"
 
 # The responder reads how much of the used RAM no process of this user's
 # holds, since no kill can free that.
+# zram's share is a process's too: swapped-out pages, compressed, still in RAM.
 printf 'MemTotal: 1000000 kB\nMemAvailable: 100000 kB\n' >"$fake/meminfo"
-line=$(run env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" "$ROOT/bin/omarchy-memory-top" | head -1)
-[[ $line == "RAM used 878M of 976M; this user's processes hold "*"M; unaccounted "*"M ("*"% of RAM)" ]] ||
-  fail "memory top leads with used RAM against what processes hold" "$line"
+mkdir -p "$fake/block/zram0" "$fake/block/sda"
+printf '0 0 104857600 0 0 0 0 0 0\n' >"$fake/block/zram0/mm_stat"
+line=$(run env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" OMARCHY_MEMORY_SYS_BLOCK="$fake/block" "$ROOT/bin/omarchy-memory-top" | head -1)
+[[ $line == "RAM used 878M of 976M; this user's processes hold "*"M, zram 100M; unaccounted "*"M ("*"% of RAM)" ]] ||
+  fail "memory top leads with used RAM against what processes and zram hold" "$line"
+held=${line#*processes hold }; held=${held%%M*}
+rest=${line#*unaccounted }; rest=${rest%%M*}
+expected=$((878 - held - 100))
+((expected < 0)) && expected=0
+((rest == expected)) || fail "memory top counts zram's share as accounted for" "$line"
 pass "memory top says how much used RAM no process holds"
+
+# A user's protect pattern adds to the built-in list; it never strips the
+# compositor of its protection.
+mkdir -p "$TMPDIR/hy"
+ln -s "$(command -v sleep)" "$TMPDIR/hy/Hyprland"
+setsid "$TMPDIR/hy/Hyprland" 300 &
+hy_pid=$!
+dummy_pids+=("$hy_pid")
+sleep 0.2
+OMARCHY_MEMORY_PROTECT='^sleep$' run "$ROOT/bin/omarchy-memory-top" --json |
+  jq -e --argjson pid "$hy_pid" 'any(.[]; (.pids | index($pid)) and .protected)' >/dev/null ||
+  fail "a custom protect pattern keeps the built-in protections"
+pass "memory top adds a custom protect pattern to the built-in list"
 
 # Hermes run as a module is an agent session too, as omarchy-remove-ai-hermes
 # knows it; its first two words name no agent.

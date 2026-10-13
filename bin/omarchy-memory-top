@@ -42,7 +42,7 @@
 # --agent prints which agent <pid> is, by the same agent_kind() check; exit 1
 # if none. omarchy-memory-note names a note's sender with it.
 #
-# OMARCHY_MEMORY_PROTECT  regex on process names that are never paused
+# OMARCHY_MEMORY_PROTECT  regex on process names that are never paused, on top of the built-in list
 # OMARCHY_MEMORY_ONLY     if set, --pick only considers candidates whose name or cmdline matches
 
 import json
@@ -56,7 +56,10 @@ DEFAULT_PROTECT = (
     r"hyprpaper|hypridle|hyprlock|xdg-.*|gnome-keyring.*|fcitx5|"
     r"alacritty|ghostty|kitty|foot|steam.*|gamescope.*|wine.*|.*\.exe)$"
 )
-PROTECT = re.compile(os.environ.get("OMARCHY_MEMORY_PROTECT") or DEFAULT_PROTECT)
+# A user's pattern adds to the built-in list; it must not cost the compositor,
+# audio or the terminals their protection.
+PROTECT = re.compile(DEFAULT_PROTECT + (f"|(?:{os.environ['OMARCHY_MEMORY_PROTECT']})"
+                                        if os.environ.get("OMARCHY_MEMORY_PROTECT") else ""))
 # Games under Proton or Wine show up as generic loader names; the cmdline gives them away.
 PROTECT_CMD = re.compile(r"steamapps|/proton|\.exe\b", re.I)
 # Games, whose protection passes to everything under them: the game binary
@@ -90,19 +93,34 @@ def agent_kind(argv):
     return None
 
 
+def zram_mb():
+    """RAM that zram holds: swapped-out pages, compressed, which are still a
+    process's to give back and so never unaccounted for."""
+    total = 0
+    sys_block = os.environ.get("OMARCHY_MEMORY_SYS_BLOCK", "/sys/block")
+    for dev in os.listdir(sys_block):
+        if dev.startswith("zram"):
+            try:
+                total += int(read(f"{sys_block}/{dev}/mm_stat").split()[2])
+            except (OSError, ValueError, IndexError):
+                continue
+    return total // (1024 * 1024)
+
+
 def memory_line(groups):
-    """Used RAM against what this user's processes hold, for the responder: a
-    large rest is memory no kill can free (a hung GPU client's driver memory,
-    say), which only a reboot returns."""
+    """Used RAM against what this user's processes hold, in RAM and in zram, for
+    the responder: a large rest is memory no kill can free (a hung GPU client's
+    driver memory, say), which only a reboot returns."""
     fields = {}
     for line in read(os.environ.get("OMARCHY_MEMORY_MEMINFO", "/proc/meminfo")).splitlines():
         key, _, value = line.partition(":")
         fields[key] = int(value.split()[0])
     used = (fields["MemTotal"] - fields["MemAvailable"]) // 1024
     held = sum(g["rss_mb"] for g in groups)
-    rest = max(used - held, 0)
-    return (f"RAM used {used}M of {fields['MemTotal'] // 1024}M; this user's processes hold {held}M; "
-            f"unaccounted {rest}M ({100 * rest // max(fields['MemTotal'] // 1024, 1)}% of RAM)")
+    zram = zram_mb()
+    rest = max(used - held - zram, 0)
+    return (f"RAM used {used}M of {fields['MemTotal'] // 1024}M; this user's processes hold {held}M, "
+            f"zram {zram}M; unaccounted {rest}M ({100 * rest // max(fields['MemTotal'] // 1024, 1)}% of RAM)")
 
 
 def is_game(name, cmd):

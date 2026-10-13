@@ -104,7 +104,7 @@ in the report.
 
 4. **Safe fix**, when nobody has helped:
    - First read the top line of `omarchy memory top`: RAM used, what this user's
-     processes hold, and the unaccounted rest. If the unaccounted part is more
+     processes hold in RAM and in zram, and the unaccounted rest. If the unaccounted part is more
      than about a quarter of RAM, no process holds that memory (after a hung GPU
      client, the driver can keep tens of gigabytes) and no kill returns it:
      kill nothing, write the report saying so, send an FYI that a reboot is the
