@@ -200,3 +200,149 @@ check "rollup rebuilds the summary from the event files" '.accounts.claude.live[
 "$ROOT/bin/omarchy-agent-otel" status | jq -e '.accounts.claude' >/dev/null ||
   fail "status prints the summary"
 pass "status prints the summary"
+
+# ------------------------------------------------------------------ history
+
+history_dir="$otel_dir/history"
+limits_history="$XDG_STATE_HOME/omarchy/agents/history"
+today=$(date +%F)
+yday=$(date -d yesterday +%F)
+old=$(date -d '20 days ago' +%F)
+
+# Yesterday's raw events: two requests on bounty B-9, one per model, and one
+# untagged request.
+noon=$(date -d "$yday 12:00" +%s)
+{
+  printf '{"kind":"api","ts":%s,"session":"s-9","account":"%s","bounty":"B-9","model":"claude-opus-4-8","cost":1.25,"in":10,"out":20,"cacheRead":0,"cacheWrite":0}\n' "$noon" "$main_uuid"
+  printf '{"kind":"api","ts":%s,"session":"s-9","account":"%s","bounty":"B-9","model":"claude-haiku-4-5","cost":0.25,"in":1,"out":2,"cacheRead":3,"cacheWrite":4}\n' "$((noon + 60))" "$main_uuid"
+  printf '{"kind":"api","ts":%s,"session":"s-0","account":"%s","model":"claude-opus-4-8","cost":0.5,"in":1,"out":1,"cacheRead":0,"cacheWrite":0}\n' "$((noon + 120))" "$main_uuid"
+  printf '{"kind":"tool","ts":%s,"session":"s-9","account":"%s","tool":"Bash","ok":true,"ms":5}\n' "$((noon + 130))" "$main_uuid"
+} >"$otel_dir/events-$yday.jsonl"
+
+# A day whose event file is long gone, as an earlier receiver left it.
+old_line() {
+  mkdir -p "$history_dir"
+  printf '{"account":"claude","accountUuid":"%s","byBounty":{},"byModel":{"claude-opus-4-8":{"costUsd":7,"requests":1,"tokens":70}},"costUsd":7,"day":"%s","requests":1,"tokens":70}\n' \
+    "$main_uuid" "$old" >>"$history_dir/${old:0:7}.jsonl"
+}
+old_line
+
+"$ROOT/bin/omarchy-agent-otel" rollup
+
+hline() {
+  jq -c --arg day "$1" --arg account "$2" 'select(.day == $day and .account == $account)' "$history_dir/${1:0:7}.jsonl"
+}
+
+[[ -n $(hline "$yday" claude) ]] || fail "rollup backfills yesterday from its event file" "$(cat "$history_dir"/*.jsonl)"
+pass "rollup backfills yesterday from its event file"
+
+hline "$yday" claude | jq -e '(.costUsd * 100 | round) == 200 and .requests == 3 and .tokens == 42' >/dev/null ||
+  fail "a day's rollup totals its requests" "$(hline "$yday" claude)"
+pass "a day's rollup totals its requests"
+
+hline "$yday" claude | jq -e '.byBounty["B-9"] | (.costUsd * 100 | round) == 150 and .sessions == 1 and .byModel["claude-opus-4-8"] == 1.25 and .byModel["claude-haiku-4-5"] == 0.25' >/dev/null ||
+  fail "a day's rollup splits each bounty by model" "$(hline "$yday" claude)"
+pass "a day's rollup splits each bounty by model"
+
+hline "$yday" claude | jq -e '.byModel | keys == ["claude-haiku-4-5", "claude-opus-4-8"]' >/dev/null ||
+  fail "a day's rollup splits cost by model" "$(hline "$yday" claude)"
+pass "a day's rollup splits cost by model"
+
+[[ -n $(hline "$today" claude) && -n $(hline "$today" claude-extra) ]] ||
+  fail "today's rollup has a line per account" "$(cat "$history_dir"/*.jsonl)"
+pass "today's rollup has a line per account"
+
+hline "$old" claude | jq -e '.costUsd == 7' >/dev/null ||
+  fail "days older than the raw events are kept as they were" "$(cat "$history_dir/${old:0:7}.jsonl")"
+pass "days older than the raw events are kept as they were"
+
+before=$(cat "$history_dir"/*.jsonl | sha256sum)
+stamp=$(stat -c %Y.%N "$history_dir/${yday:0:7}.jsonl")
+"$ROOT/bin/omarchy-agent-otel" rollup
+[[ $(cat "$history_dir"/*.jsonl | sha256sum) == "$before" && $(stat -c %Y.%N "$history_dir/${yday:0:7}.jsonl") == "$stamp" ]] ||
+  fail "an unchanged rollup leaves the history files alone"
+pass "an unchanged rollup leaves the history files alone"
+
+# The receiver backfills on start, too.
+rm -rf "$history_dir"
+"$ROOT/bin/omarchy-agent-otel" serve --port 0 --rollup-interval 0.3 >"$log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  [[ -n $(hline "$yday" claude 2>/dev/null) ]] && break
+  sleep 0.1
+done
+kill "$SERVER_PID"
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+[[ -n $(hline "$yday" claude 2>/dev/null) ]] || fail "the receiver backfills the history when it starts" "$(cat "$log")"
+pass "the receiver backfills the history when it starts"
+old_line
+
+# ------------------------------------------------------------ limit history
+
+record="$HOME/claude-record.json"
+write_record() {
+  printf '{"id":"claude","limits":[{"label":"Session (5-hour)","percent":%s},{"label":"Weekly (7-day)","percent":%s},{"label":"Fable Weekly","title":"Fable Weekly","percent":0.5}]}\n' "$1" "$2" >"$record"
+}
+limit_lines() { cat "$limits_history"/limits-*.jsonl 2>/dev/null | jq -c "select(.agent == \"$1\")" | wc -l; }
+
+write_record 0.1 0.4
+"$ROOT/bin/omarchy-agent-limits-history" claude "$record"
+"$ROOT/bin/omarchy-agent-limits-history" claude "$record"
+[[ $(limit_lines claude) == 1 ]] || fail "unchanged limits are recorded once" "$(cat "$limits_history"/limits-*.jsonl)"
+pass "unchanged limits are recorded once"
+
+cat "$limits_history"/limits-*.jsonl | jq -e 'select(.agent == "claude") | .session == 0.1 and .weekly == 0.4 and .models["Fable Weekly"] == 0.5 and (.ts | type) == "number"' >/dev/null ||
+  fail "a limit line carries session, weekly and model-scoped percentages" "$(cat "$limits_history"/limits-*.jsonl)"
+pass "a limit line carries session, weekly and model-scoped percentages"
+
+write_record 0.1 0.45
+"$ROOT/bin/omarchy-agent-limits-history" claude "$record"
+[[ $(limit_lines claude) == 2 ]] || fail "a changed limit appends a line" "$(cat "$limits_history"/limits-*.jsonl)"
+pass "a changed limit appends a line"
+
+printf '{"id":"claude","limits":[]}\n' >"$record"
+"$ROOT/bin/omarchy-agent-limits-history" claude "$record"
+[[ $(limit_lines claude) == 2 ]] || fail "a refresh without limits records nothing"
+pass "a refresh without limits records nothing"
+
+# omarchy-agent-usage-update records every record it writes.
+fake="$HOME/fake-omarchy"
+mkdir -p "$fake/bin"
+printf '#!/bin/bash\necho %s\n' "'{\"id\":\"codex\",\"limits\":[{\"label\":\"Weekly (7-day)\",\"percent\":0.2}]}'" >"$fake/bin/omarchy-agent-usage-codex"
+chmod +x "$fake/bin/omarchy-agent-usage-codex"
+ln -s "$ROOT/bin/omarchy-agent-limits-history" "$fake/bin/omarchy-agent-limits-history"
+OMARCHY_PATH="$fake" "$ROOT/bin/omarchy-agent-usage-update" codex
+[[ $(limit_lines codex) == 1 ]] || fail "usage-update records the limits of each record it writes"
+pass "usage-update records the limits of each record it writes"
+
+# ------------------------------------------------------------ history read
+
+report="$HOME/history.json"
+"$ROOT/bin/omarchy-agent-otel" history --range 30d >"$report"
+hcheck() {
+  jq -e "$2" "$report" >/dev/null || fail "$1" "$(jq -c . "$report" | head -c 3000)"
+  pass "$1"
+}
+hcheck "history covers the range day by day up to today" \
+  ".range == \"30d\" and (.days | length) == 30 and .days[-1] == \"$today\""
+hcheck "history reads each day's cost from the rollup" \
+  "[.accounts[] | select(.id == \"claude\") | .perDay[] | select(.day == \"$yday\")][0] | (.costUsd * 100 | round) == 200"
+hcheck "history keeps days older than the raw events" \
+  "[.accounts[] | select(.id == \"claude\") | .perDay[] | select(.day == \"$old\")][0].costUsd == 7"
+hcheck "history ranks bounties over the range" \
+  '[.accounts[] | select(.id == "claude")][0].byBounty | map(.bounty) | index("B-9") != null'
+hcheck "history derives cost per bounty by model" \
+  '[.accounts[] | select(.id == "claude")][0].byModel | map(select(.model == "claude-haiku-4-5"))[0] | .bounties == 1 and .costPerBountyUsd == 0.25'
+hcheck "history carries the limit history per account" \
+  '[.accounts[] | select(.id == "claude")][0].limits | length == 2 and .[1].weekly == 0.45'
+hcheck "history lists accounts that only have limits" \
+  '[.accounts[] | select(.id == "codex")][0] | .hasTelemetry == false and (.limits | length) == 1'
+
+"$ROOT/bin/omarchy-agent-otel" history --range 7d | jq -e '(.days | length) == 7 and ([.accounts[] | select(.id == "claude")][0].perDay | map(.day) | index("'"$old"'")) == null' >/dev/null ||
+  fail "a 7-day history stops at a week"
+pass "a 7-day history stops at a week"
+
+"$ROOT/bin/omarchy-agent-otel" history --range all | jq -e ".days[0] <= \"$old\"" >/dev/null ||
+  fail "an all-time history starts at the oldest rollup"
+pass "an all-time history starts at the oldest rollup"

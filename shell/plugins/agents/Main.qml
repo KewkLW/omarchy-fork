@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import "Format.js" as Format
 
 // The display side of agent usage. All extraction lives behind
 // omarchy-agent-usage-update, which writes one JSON record per agent into
@@ -748,43 +749,9 @@ Item {
 
   // ---------------------------------------------------------------- format
 
-  function formatTokenCount(n) {
-    if (n === undefined || n === null) return "0"
-    if (n >= 1e9) return (n / 1e9).toFixed(1) + "B"
-    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M"
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K"
-    return String(n)
-  }
+  function formatTokenCount(n) { return Format.formatTokenCount(n) }
 
-  function modelWordCase(word) {
-    if (word === "gpt") return "GPT"
-    if (word === "deepseek") return "DeepSeek"
-    return word.charAt(0).toUpperCase() + word.slice(1)
-  }
+  function modelWordCase(word) { return Format.modelWordCase(word) }
 
-  // Model ids arrive hyphenated with the version split across segments
-  // (`claude-opus-4-8`, `gpt-5.6-sol`). Rejoin the numeric run into one
-  // version and title-case the words around it.
-  function friendlyModelName(id) {
-    if (!id) return "Unknown"
-    var name = String(id).replace(/^claude-/, "").replace(/-\d{8}$/, "")
-    var parts = name.split("-")
-    var words = []
-    var version = []
-    for (var i = 0; i < parts.length; i++) {
-      var part = parts[i]
-      if (part === "") continue
-      if (/^\d/.test(part)) {
-        version.push(part)
-        continue
-      }
-      if (version.length > 0) {
-        words.push(version.join("."))
-        version = []
-      }
-      words.push(modelWordCase(part))
-    }
-    if (version.length > 0) words.push(version.join("."))
-    return words.length > 0 ? words.join(" ") : "Unknown"
-  }
+  function friendlyModelName(id) { return Format.friendlyModelName(id) }
 }

@@ -50,6 +50,12 @@ collect() {
   tmp=$(mktemp "$USAGE_DIR/.$agent.XXXXXX")
   printf '%s\n' "$record" >"$tmp"
   mv "$tmp" "$USAGE_DIR/$agent.json"
+
+  # The record holds today's limit percentages only; this keeps how they
+  # moved, one line per change, for the agent stats window.
+  if [[ -x $OMARCHY_PATH/bin/omarchy-agent-limits-history ]]; then
+    "$OMARCHY_PATH/bin/omarchy-agent-limits-history" "$agent" "$USAGE_DIR/$agent.json" || true
+  fi
 }
 
 pids=()

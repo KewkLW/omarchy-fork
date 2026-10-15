@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 # omarchy:summary=Receive Claude Code OpenTelemetry on 127.0.0.1 and roll it up for the agents panel
-# omarchy:args=<serve [--port N] [--rollup-interval S] | rollup | status>
+# omarchy:args=<serve [--port N] [--rollup-interval S] | rollup | status | history [--range 7d|30d|all]>
 # omarchy:hidden=true
 """Local OTLP/HTTP receiver for Claude Code telemetry.
 
@@ -31,6 +31,16 @@ Events append to $XDG_STATE_HOME/omarchy/agents/otel/events-YYYY-MM-DD.jsonl
 (kept 14 days). Every few seconds the receiver rebuilds summary.json in the
 same directory and replaces it atomically when its content changed. `rollup`
 does the same once from the event files, `status` prints the summary.
+
+The raw events go after 14 days; what outlives them is a compact daily
+rollup in history/YYYY-MM.jsonl, one line per day and account with its
+totals by model and by bounty (and, under each bounty, cost by model). It is
+backfilled from the event files when the receiver starts, rewritten at most
+once a minute while a day's totals change, and never pruned: a busy month is
+a few hundred kilobytes. `history --range 7d|30d|all` prints what the agent
+stats window draws: those daily totals, today's from the event file so it is
+current, the limit percentages omarchy-agent-limits-history records under
+../history/limits-YYYY-MM.jsonl, and the live sessions from summary.json.
 
 Costs are cost_usd as Claude Code reports it: what the requests would cost at
 API list prices. A subscription is not billed that amount.
@@ -68,6 +78,8 @@ ROLLUP_DAYS = 7
 LIVE_WINDOW_SECONDS = 300
 LOOP_TOOL_RUN = 12
 LOOP_BURST_CALLS = 40
+HISTORY_WRITE_SECONDS = 60
+HISTORY_TOP_BOUNTIES = 20
 MAX_BODY_BYTES = 32 * 1024 * 1024
 COST_BASIS = "API list price equivalent"
 TAG_KEYS = {"bounty.id": "bounty", "bounty.slot": "slot", "bounty.attempt": "attempt", "ticket": "ticket", "slot": "slot"}
@@ -80,6 +92,14 @@ def state_dir() -> Path:
 
 def summary_path() -> Path:
   return state_dir() / "summary.json"
+
+
+def history_dir() -> Path:
+  return state_dir() / "history"
+
+
+def limits_dir() -> Path:
+  return state_dir().parent / "history"
 
 
 def expand_path(value: str) -> Path:
@@ -285,19 +305,22 @@ def event_files() -> list[tuple[str, Path]]:
   return out
 
 
+def retention_cutoff(now: float) -> str:
+  return (dt.datetime.fromtimestamp(now).date() - dt.timedelta(days=RETENTION_DAYS - 1)).strftime("%Y-%m-%d")
+
+
 def prune_files(now: float) -> None:
-  cutoff = (dt.datetime.fromtimestamp(now).date() - dt.timedelta(days=RETENTION_DAYS - 1)).strftime("%Y-%m-%d")
+  cutoff = retention_cutoff(now)
   for day, path in event_files():
     if day < cutoff:
       path.unlink(missing_ok=True)
 
 
-def read_events(now: float):
-  """Yield (day, event) for the stored events still inside the rollup window."""
-  since = now - ROLLUP_DAYS * 86400
-  cutoff = day_of(since)
+def read_events(now: float, days: int = ROLLUP_DAYS, only: set[str] | None = None):
+  """Yield (day, event) for the stored events of the last `days` days."""
+  cutoff = day_of(now - days * 86400)
   for day, path in event_files():
-    if day < cutoff:
+    if day < cutoff or (only is not None and day not in only):
       continue
     try:
       handle = open(path, encoding="utf-8")
@@ -525,11 +548,341 @@ def build_summary(tally: Tally, accounts: AccountMap, now: float) -> dict[str, A
   }
 
 
-def load_tally(now: float) -> Tally:
-  tally = Tally()
-  for day, event in read_events(now):
+# ------------------------------------------------------------------- history
+
+def month_of(day: str) -> str:
+  return day[:7]
+
+
+def history_file(month: str) -> Path:
+  return history_dir() / f"{month}.jsonl"
+
+
+def read_history_month(path: Path) -> list[dict[str, Any]]:
+  rows = []
+  try:
+    handle = open(path, encoding="utf-8")
+  except OSError:
+    return rows
+  with handle:
+    for line in handle:
+      try:
+        row = json.loads(line)
+      except ValueError:
+        continue
+      if isinstance(row, dict) and isinstance(row.get("day"), str) and isinstance(row.get("account"), str):
+        rows.append(row)
+  return rows
+
+
+def write_lines_if_changed(path: Path, lines: list[str]) -> bool:
+  body = "".join(line + "\n" for line in lines)
+  try:
+    if path.read_text(encoding="utf-8") == body:
+      return False
+  except OSError:
+    pass
+  path.parent.mkdir(parents=True, exist_ok=True)
+  handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(body)
+    tmp.chmod(0o644)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+  return True
+
+
+def round_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+  return {"costUsd": round(bucket["costUsd"], 6), "tokens": bucket["tokens"], "requests": bucket["requests"]}
+
+
+# Daily totals per account that outlive the raw event files. Fed by every
+# api_request the receiver keeps, so a day is exactly what its event file
+# holds; only days still on disk as events are ever rewritten, and days that
+# have aged out of the raw window stay as they were last written.
+class History:
+  def __init__(self) -> None:
+    self.days: dict[str, dict[str, dict[str, Any]]] = {}
+    self.dirty: set[str] = set()
+
+  def add(self, event: dict[str, Any], day: str = "") -> None:
+    if event.get("kind") != "api" or not isinstance(event.get("ts"), (int, float)):
+      return
+    day = day or day_of(event["ts"])
+    # A late event for a day whose event file is already gone would replace
+    # that day's whole rollup line with itself.
+    if day < retention_cutoff(time.time()):
+      return
+    uuid = str(event.get("account") or "")
+    cost = event.get("cost")
+    if not isinstance(cost, (int, float)):
+      cost = 0.0
+    tokens = tokens_of(event)
+    model_name = str(event.get("model") or "") or "unknown"
+    bucket = self.days.setdefault(day, {}).get(uuid)
+    if bucket is None:
+      bucket = self.days[day][uuid] = dict(empty_bucket(), models={}, bounties={})
+    add_to(bucket, cost, tokens)
+    add_to(bucket["models"].setdefault(model_name, empty_bucket()), cost, tokens)
+    bounty_key = str(event.get("bounty") or event.get("ticket") or "")
+    if bounty_key:
+      entry = bucket["bounties"].get(bounty_key)
+      if entry is None:
+        entry = bucket["bounties"][bounty_key] = dict(empty_bucket(), sessions=set(), models={})
+      add_to(entry, cost, tokens)
+      entry["sessions"].add(str(event.get("session") or ""))
+      entry["models"][model_name] = entry["models"].get(model_name, 0.0) + cost
+    self.dirty.add(day)
+
+  def expire(self, now: float) -> None:
+    cutoff = retention_cutoff(now)
+    for day in [d for d in self.days if d < cutoff]:
+      del self.days[day]
+      self.dirty.discard(day)
+
+  def rows_for(self, day: str, accounts: "AccountMap") -> list[dict[str, Any]]:
+    # Two uuids can land on one record id (an account re-logged in); their
+    # totals add up under it.
+    merged: dict[str, dict[str, Any]] = {}
+    for uuid, bucket in self.days.get(day, {}).items():
+      record_id = accounts.resolve(uuid)
+      row = merged.get(record_id)
+      if row is None:
+        row = merged[record_id] = {"uuid": uuid, "total": empty_bucket(), "models": {}, "bounties": {}}
+      add_to(row["total"], bucket["costUsd"], bucket["tokens"], bucket["requests"])
+      for name, model in bucket["models"].items():
+        add_to(row["models"].setdefault(name, empty_bucket()), model["costUsd"], model["tokens"], model["requests"])
+      for name, bounty in bucket["bounties"].items():
+        entry = row["bounties"].get(name)
+        if entry is None:
+          entry = row["bounties"][name] = dict(empty_bucket(), sessions=set(), models={})
+        add_to(entry, bounty["costUsd"], bounty["tokens"], bounty["requests"])
+        entry["sessions"] |= bounty["sessions"]
+        for model_name, cost in bounty["models"].items():
+          entry["models"][model_name] = entry["models"].get(model_name, 0.0) + cost
+    out = []
+    for record_id, row in sorted(merged.items()):
+      out.append(dict(
+        round_bucket(row["total"]),
+        day=day,
+        account=record_id,
+        accountUuid=row["uuid"],
+        byModel={name: round_bucket(m) for name, m in sorted(row["models"].items())},
+        byBounty={
+          name: dict(round_bucket(b), sessions=len(b["sessions"]), byModel={k: round(v, 6) for k, v in sorted(b["models"].items())})
+          for name, b in sorted(row["bounties"].items())
+        },
+      ))
+    return out
+
+  def write(self, accounts: "AccountMap", days: set[str] | None = None) -> int:
+    """Rewrite the month files holding `days` (default: the dirty ones)."""
+    days = set(self.dirty if days is None else days)
+    by_month: dict[str, set[str]] = {}
+    for day in days:
+      by_month.setdefault(month_of(day), set()).add(day)
+    written = 0
+    for month, month_days in sorted(by_month.items()):
+      path = history_file(month)
+      kept = [row for row in read_history_month(path) if row["day"] not in month_days]
+      for day in month_days:
+        kept.extend(self.rows_for(day, accounts))
+      kept.sort(key=lambda r: (r["day"], r["account"]))
+      if write_lines_if_changed(path, [json.dumps(row, separators=(",", ":"), sort_keys=True) for row in kept]):
+        written += 1
+    self.dirty -= days
+    return written
+
+
+def load_store(now: float) -> tuple[Tally, History]:
+  """One pass over every raw event file: the week for the summary, all of it for history."""
+  tally, history = Tally(), History()
+  for day, event in read_events(now, RETENTION_DAYS):
     tally.add(event, now, day)
-  return tally
+    history.add(event, day)
+  return tally, history
+
+
+# ------------------------------------------------------------- history read
+
+RANGE_DAYS = {"7d": 7, "30d": 30}
+
+
+def read_limit_points() -> dict[str, list[dict[str, Any]]]:
+  points: dict[str, list[dict[str, Any]]] = {}
+  for path in sorted(limits_dir().glob("limits-*.jsonl")):
+    try:
+      handle = open(path, encoding="utf-8")
+    except OSError:
+      continue
+    with handle:
+      for line in handle:
+        try:
+          row = json.loads(line)
+        except ValueError:
+          continue
+        if isinstance(row, dict) and isinstance(row.get("ts"), (int, float)) and row.get("agent"):
+          points.setdefault(str(row["agent"]), []).append(row)
+  for rows in points.values():
+    rows.sort(key=lambda r: r["ts"])
+  return points
+
+
+def usage_names() -> dict[str, str]:
+  names = {}
+  for path in sorted((state_dir().parent / "usage").glob("*.json")):
+    try:
+      record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+      continue
+    if isinstance(record, dict):
+      names[path.stem] = str(record.get("tabLabel") or record.get("name") or path.stem)
+  return names
+
+
+def history_report(range_name: str, now: float) -> dict[str, Any]:
+  accounts = AccountMap()
+  today = day_of(now)
+  rows: dict[tuple[str, str], dict[str, Any]] = {}
+  for path in sorted(history_dir().glob("*.jsonl")):
+    if re.fullmatch(r"\d{4}-\d{2}\.jsonl", path.name):
+      for row in read_history_month(path):
+        rows[(row["day"], row["account"])] = row
+
+  # Today straight from its event file, and any raw day the rollup has not
+  # written yet (a receiver that never ran `rollup`), so the window is never
+  # behind the summary.
+  have_days = {day for day, _ in rows}
+  raw_days = {day for day, _ in event_files()}
+  fresh = {today} | (raw_days - have_days)
+  if fresh & raw_days:
+    history = History()
+    for day, event in read_events(now, RETENTION_DAYS, only=fresh):
+      history.add(event, day)
+    for day in fresh:
+      for key in [k for k in rows if k[0] == day]:
+        del rows[key]
+      for row in history.rows_for(day, accounts):
+        rows[(day, row["account"])] = row
+
+  limit_points = read_limit_points()
+  if range_name in RANGE_DAYS:
+    first = (dt.datetime.fromtimestamp(now).date() - dt.timedelta(days=RANGE_DAYS[range_name] - 1)).strftime("%Y-%m-%d")
+  else:
+    starts = [day for day, _ in rows] + [day_of(p[0]["ts"]) for p in limit_points.values() if p]
+    first = min(starts) if starts else today
+    first = min(first, (dt.datetime.fromtimestamp(now).date() - dt.timedelta(days=6)).strftime("%Y-%m-%d"))
+  dates = []
+  cursor = dt.date.fromisoformat(first)
+  end = dt.date.fromisoformat(today)
+  while cursor <= end:
+    dates.append(cursor.isoformat())
+    cursor += dt.timedelta(days=1)
+  week_first = (end - dt.timedelta(days=6)).isoformat()
+
+  try:
+    summary = json.loads(summary_path().read_text(encoding="utf-8"))
+  except (OSError, ValueError):
+    summary = {}
+  summary_accounts = summary.get("accounts") if isinstance(summary, dict) else None
+  summary_accounts = summary_accounts if isinstance(summary_accounts, dict) else {}
+  live_window = int(summary.get("liveWindowSec") or LIVE_WINDOW_SECONDS) if isinstance(summary, dict) else LIVE_WINDOW_SECONDS
+
+  names = usage_names()
+  ids = sorted(set(names) | {a for _, a in rows} | set(summary_accounts) | set(limit_points))
+  out_accounts = []
+  for account_id in ids:
+    per_day = []
+    models: dict[str, dict[str, Any]] = {}
+    bounties: dict[str, dict[str, Any]] = {}
+    model_bounties: dict[str, set[str]] = {}
+    total = empty_bucket()
+    for day in dates:
+      row = rows.get((day, account_id))
+      if not row:
+        per_day.append({"day": day, "costUsd": 0, "tokens": 0, "requests": 0, "byModel": {}})
+        continue
+      per_day.append({"day": day, "costUsd": row.get("costUsd", 0), "tokens": row.get("tokens", 0), "requests": row.get("requests", 0),
+                      "byModel": {k: {"costUsd": v.get("costUsd", 0), "tokens": v.get("tokens", 0)} for k, v in (row.get("byModel") or {}).items()}})
+      add_to(total, number(row.get("costUsd")), number(row.get("tokens"), int), number(row.get("requests"), int))
+      for name, model in (row.get("byModel") or {}).items():
+        add_to(models.setdefault(name, empty_bucket()), number(model.get("costUsd")), number(model.get("tokens"), int), number(model.get("requests"), int))
+      for name, bounty in (row.get("byBounty") or {}).items():
+        entry = bounties.setdefault(name, dict(empty_bucket(), sessions=0, models={}))
+        add_to(entry, number(bounty.get("costUsd")), number(bounty.get("tokens"), int), number(bounty.get("requests"), int))
+        # Sessions are counted per day; a session crossing midnight counts twice.
+        entry["sessions"] += number(bounty.get("sessions"), int)
+        for model_name, cost in (bounty.get("byModel") or {}).items():
+          entry["models"][model_name] = entry["models"].get(model_name, 0.0) + number(cost)
+          model_bounties.setdefault(model_name, set()).add(name)
+
+    by_bounty = []
+    for name, b in sorted(bounties.items(), key=lambda kv: -kv[1]["costUsd"])[:HISTORY_TOP_BOUNTIES]:
+      top_model = max(b["models"].items(), key=lambda kv: kv[1])[0] if b["models"] else ""
+      by_bounty.append(dict(round_bucket(b), bounty=name, sessions=b["sessions"], model=top_model,
+                            byModel={k: round(v, 6) for k, v in sorted(b["models"].items(), key=lambda kv: -kv[1])}))
+    by_model = []
+    for name, m in sorted(models.items(), key=lambda kv: -kv[1]["costUsd"]):
+      # What a bounty costs when this model works it: the model's spend on
+      # tagged requests over the bounties it touched. Untagged spend is left
+      # out, and a bounty worked by two models counts for both.
+      tagged = sum(b["models"].get(name, 0.0) for b in bounties.values())
+      worked = len(model_bounties.get(name, ()))
+      by_model.append(dict(round_bucket(m), model=name, bounties=worked,
+                           costPerBountyUsd=round(tagged / worked, 6) if worked else 0))
+
+    # Every range reaches back at least a week.
+    week = sum(d["costUsd"] for d in per_day if d["day"] >= week_first)
+
+    live = []
+    summary_account = summary_accounts.get(account_id) or {}
+    for session in summary_account.get("live") or []:
+      if isinstance(session, dict) and now * 1000 - number(session.get("lastActivityMs")) <= live_window * 1000:
+        live.append(session)
+
+    points = limit_points.get(account_id, [])
+    first_ts = dt.datetime.fromisoformat(dates[0]).timestamp() if dates else now
+    in_range = [p for p in points if p["ts"] >= first_ts]
+    before = [p for p in points if p["ts"] < first_ts]
+    # The value in force when the range opens, so a line starts at the left edge.
+    if before:
+      in_range.insert(0, dict(before[-1], ts=first_ts, carried=True))
+
+    today_row = rows.get((today, account_id)) or {}
+    out_accounts.append({
+      "id": account_id,
+      "name": names.get(account_id, account_id),
+      "hasTelemetry": bool(total["requests"] or any(a == account_id for _, a in rows) or account_id in summary_accounts),
+      "todayUsd": round(number(today_row.get("costUsd")), 6),
+      "weekUsd": round(week, 6),
+      "rangeUsd": round(total["costUsd"], 6),
+      "rangeTokens": total["tokens"],
+      "rangeRequests": total["requests"],
+      "models": [m["model"] for m in by_model],
+      "perDay": per_day,
+      "byBounty": by_bounty,
+      "byModel": by_model,
+      "live": sorted(live, key=lambda r: (not r.get("looping"), -number(r.get("lastActivityMs")))),
+      "looping": sum(1 for r in live if r.get("looping")),
+      "limits": [{k: v for k, v in p.items() if k in ("ts", "session", "weekly", "models", "carried")} for p in in_range],
+    })
+
+  return {
+    "schemaVersion": 1,
+    "costBasis": COST_BASIS,
+    "range": range_name,
+    "from": dates[0] if dates else today,
+    "to": today,
+    "today": today,
+    "days": dates,
+    "nowMs": int(now * 1000),
+    "liveWindowSec": live_window,
+    "accounts": out_accounts,
+  }
 
 
 def write_summary_if_changed(summary: dict[str, Any], previous: str) -> str:
@@ -550,7 +903,10 @@ class Receiver:
     self.accounts = AccountMap()
     now = time.time()
     prune_files(now)
-    self.tally = load_tally(now)
+    self.tally, self.history = load_store(now)
+    # Backfill: every day still on disk as events goes into the rollup.
+    self.history.write(self.accounts, set(self.history.days))
+    self.last_history_write = time.monotonic()
     self.last_body = ""
     self.last_prune_day = day_of(now)
     self.last_rollup_day = ""
@@ -567,13 +923,21 @@ class Receiver:
       append_events(events)
       for event in events:
         self.tally.add(event, now)
+        self.history.add(event)
       self.dirty = True
     return len(events)
 
-  def rollup(self) -> None:
+  def rollup(self, flush: bool = False) -> None:
     now = time.time()
     today = day_of(now)
     with self.lock:
+      # The daily rollup trails the summary by up to a minute: rewriting a
+      # month file every few seconds while a board is busy buys nothing.
+      if self.history.dirty and (flush or time.monotonic() - self.last_history_write >= HISTORY_WRITE_SECONDS
+                                 or self.history.dirty != {today}):
+        self.history.write(self.accounts)
+        self.history.expire(now)
+        self.last_history_write = time.monotonic()
       # Looking a window further back gives a session that just went quiet
       # one more rollup, which is the one that takes it off the live list.
       if not (self.dirty or today != self.last_rollup_day or self.tally.has_live(now - LIVE_WINDOW_SECONDS)):
@@ -661,7 +1025,7 @@ def serve(port: int, interval: float) -> int:
   server.serve_forever(poll_interval=0.5)
   server.server_close()
   stop.set()
-  receiver.rollup()
+  receiver.rollup(flush=True)
   return 0
 
 
@@ -673,6 +1037,8 @@ def main() -> int:
   serve_parser.add_argument("--rollup-interval", type=float, default=10.0)
   commands.add_parser("rollup", help="rebuild summary.json from the event files once")
   commands.add_parser("status", help="print summary.json")
+  history_parser = commands.add_parser("history", help="print daily cost, limit and live-session history as JSON")
+  history_parser.add_argument("--range", dest="range_name", choices=["7d", "30d", "all"], default="30d")
   args = parser.parse_args()
 
   if args.command == "serve":
@@ -680,7 +1046,13 @@ def main() -> int:
   if args.command == "rollup":
     now = time.time()
     prune_files(now)
-    write_summary_if_changed(build_summary(load_tally(now), AccountMap(), now), "")
+    accounts = AccountMap()
+    tally, history = load_store(now)
+    history.write(accounts, set(history.days))
+    write_summary_if_changed(build_summary(tally, accounts, now), "")
+    return 0
+  if args.command == "history":
+    sys.stdout.write(json.dumps(history_report(args.range_name, time.time()), separators=(",", ":")) + "\n")
     return 0
   try:
     sys.stdout.write(summary_path().read_text(encoding="utf-8"))

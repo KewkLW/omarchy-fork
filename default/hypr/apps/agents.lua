@@ -14,3 +14,8 @@ agent_workspaces.place("agent-room-pane", "room", { class = "org.omarchy.agent-r
 -- Subagent terminals open on their own whenever a subagent starts, so they
 -- arrive quietly rather than pulling you over to the agent workspace.
 agent_workspaces.place("agent-room-subagents", "room", { class = "org.omarchy.agent-watch" }, true)
+
+-- The agent stats window (right-click the Agents bar icon, or
+-- omarchy-launch-agent-stats): an app window of its own, floated and
+-- centered at a size that fits its two columns of charts.
+o.window("^org.omarchy.agent-stats$", { float = true, center = true, size = { "(monitor_w*5/8)", "(monitor_h*4/5)" } })

@@ -24,12 +24,42 @@ cross-device aggregation); `Agent.qml` is the per-record file watcher.
   to the heaviest model,
   the same way the weekly chart scales to its busiest day. Hover for the
   input / output / cache split.
-- **API equivalent** (Claude tabs, only with telemetry on) — today's cost at
-  API list prices, then the sessions active in the last five minutes as
-  cards (bounty · slot #attempt or ticket, model, tokens, tool calls, last
-  activity), with a looping session drawn as an urgent card, then cost by
-  bounty (top 8) and cost by model over the last 7 days. See
+- **Telemetry line** (Claude tabs, only with telemetry on), under the limits —
+  one line: `Today $X API-equiv · N live · open stats ›`. It turns urgent and
+  counts them when a live session is flagged looping, so a stuck slot shows
+  without opening anything. Click it (or press `s`) for the
+  [agent stats window](#agent-stats-window). See
   [Claude Code telemetry](#claude-code-telemetry).
+
+## Agent stats window
+
+Right-click the bar icon, click the telemetry line, press `s` in the panel,
+or run `omarchy-launch-agent-stats` (bindable; `--toggle` closes it when it
+already has focus). It is an ordinary app window, app id
+`org.omarchy.agent-stats`, floated and centered by a rule in
+`default/hypr/apps/agents.lua`; move, resize, tile or close it like any
+other. `shell/agent-stats.qml` runs as its own Quickshell process (the
+launcher sets `QS_APP_ID`) around `Stats.qml`, with the panel's theme,
+fonts and controls, and the process ends when the window closes.
+
+An account switch like the panel's, a range of 7 days, 30 days or all, and:
+
+- **Tiles** — today and the last 7 days at API list prices, live sessions,
+  and how many of them are looping.
+- **Live sessions** — every field the receiver reports, one row each; a
+  looping one is drawn urgent with its reason.
+- **Cost per day** and **tokens per day**, stacked by model (the top three
+  and Other, in steps of the theme's foreground and accent).
+- **Cost by bounty** — the top 12 bounties or tickets in the range.
+- **Cost per bounty by model** — a model's tagged spend over the bounties it
+  worked. Telemetry does not know which bounties landed, so this is per
+  bounty worked, not per landing.
+- **Limits over time** — weekly and model-scoped weekly percentages as step
+  lines, the 5-hour session as a faint area, with the panel's 90% line.
+
+Keys: `h`/`l` account, `1` `2` `3` range, `r` refresh, `j`/`k` scroll, Esc
+closes. Everything comes from one call, `omarchy-agent-otel history
+--range 7d|30d|all`, rerun every 30 seconds and when `summary.json` changes.
 
 A subscription appears only when it is enabled in settings and has actually
 recorded usage — on this machine or on a synced one. With one such agent
@@ -116,8 +146,27 @@ Accounts are matched by `oauthAccount.accountUuid`: `~/.claude.json` (or
 reports it — the API list price equivalent, not what a subscription bills.
 A live session is marked looping when its last 12 tool calls were the same
 tool with at least half failing, or when it made more than 40 tool calls in
-five minutes with no API cost growth. With no `summary.json` the section is
+five minutes with no API cost growth. With no `summary.json` the line is
 not drawn at all.
+
+### History
+
+The 14 days of raw events are the only place telemetry is kept in detail;
+two compact histories outlive them, are never pruned, and are what the stats
+window draws:
+
+| File | Written by | One line per |
+|---|---|---|
+| `~/.local/state/omarchy/agents/otel/history/YYYY-MM.jsonl` | `omarchy-agent-otel` | day × account: cost, tokens and requests in total, by model, and by bounty (with each bounty's cost by model) |
+| `~/.local/state/omarchy/agents/history/limits-YYYY-MM.jsonl` | `omarchy-agent-limits-history`, after every record `omarchy-agent-usage-update` writes | change in an agent's limits: `ts`, `agent`, `session`, `weekly`, and model-scoped weekly percentages under `models` |
+
+The receiver backfills the daily rollup from every event file still on disk
+when it starts (and on `omarchy-agent-otel rollup`), then rewrites a day's
+line at most once a minute while its totals change. Days whose event files
+have aged out are left as last written. A limit refresh that reads the same
+percentages as the agent's last line appends nothing; a refresh that could
+not reach the limits endpoint records nothing either. Both stay in the
+hundreds of kilobytes a month on a busy board.
 
 ### Fireworks balance
 
@@ -149,9 +198,13 @@ only adds the meter and the spent-of-funded line under the real figure.
 
 ## Interactions
 
-- Bar icon: left = panel, right = launch agent, middle = next subscription.
+- Bar icon: left = panel, right = [agent stats window](#agent-stats-window),
+  middle = next subscription. The agent picker stays on
+  SUPER+SHIFT+CTRL+A, and right-clicking a subscription tab still starts
+  that provider's CLI.
 - Panel: `h`/`l` switch subscription, `j`/`k` scroll, `r` or Enter refresh,
-  Tab moves to the neighboring bar panel, Esc closes.
+  `s` opens the stats window, Tab moves to the neighboring bar panel, Esc
+  closes.
 - IPC: `omarchy-shell omarchy.agents <open|close|toggle|refresh|next>`.
 
 ## Settings

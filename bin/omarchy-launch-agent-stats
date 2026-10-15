@@ -1,0 +1,31 @@
+#!/bin/bash
+
+# omarchy:summary=Open the agent stats window: API-equivalent cost, live sessions and limit history
+# omarchy:args=[--toggle]
+# omarchy:examples=omarchy launch agent-stats | omarchy launch agent-stats --toggle
+
+# The window is its own Quickshell process with its own app id, so it is an
+# ordinary toplevel the compositor tiles, floats, moves and closes like any
+# app, and it outlives a shell restart. An open one is focused instead of
+# opening a second; with --toggle, one that already has focus closes.
+
+APP_ID=org.omarchy.agent-stats
+
+address=$(hyprctl clients -j 2>/dev/null | jq -r --arg id "$APP_ID" '.[] | select(.class == $id) | .address' | head -n1)
+
+if [[ -n $address ]]; then
+  if [[ ${1:-} == "--toggle" && $(hyprctl activewindow -j 2>/dev/null | jq -r '.address // empty') == "$address" ]]; then
+    hyprctl dispatch "hl.dsp.window.close({ window = \"address:$address\" })" >/dev/null 2>&1 ||
+      hyprctl dispatch closewindow "address:$address" >/dev/null
+  else
+    hyprctl dispatch "hl.dsp.focus({ window = \"address:$address\" })" >/dev/null 2>&1 ||
+      hyprctl dispatch focuswindow "address:$address" >/dev/null
+  fi
+  exit 0
+fi
+
+# Inside the command rather than around it: uwsm-app may start the process
+# from its own environment. Reloading stays off for the same reason the shell
+# keeps it off: a package upgrade rewriting the tree under a running window.
+exec setsid uwsm-app -- env QS_APP_ID="$APP_ID" QS_DISABLE_FILE_WATCHER=1 QS_NO_RELOAD_POPUP=1 \
+  quickshell -n -p "$OMARCHY_PATH/shell/agent-stats.qml"

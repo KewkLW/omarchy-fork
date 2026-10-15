@@ -1,0 +1,127 @@
+#!/usr/bin/python3
+# omarchy:summary=Record an agent usage record's limit percentages over time
+# omarchy:args=<agent> <record.json>
+# omarchy:hidden=true
+"""Append an agent's limit percentages to a monthly history file.
+
+omarchy-agent-usage-update calls this after it writes each usage record. The
+record only ever holds the current percentages; this keeps how they moved,
+for the agent stats window. One line per change:
+
+  {"ts": 1792030807.5, "agent": "claude", "session": 0.06, "weekly": 0.69,
+   "models": {"Fable Weekly": 0.56}}
+
+in $XDG_STATE_HOME/omarchy/agents/history/limits-YYYY-MM.jsonl. A refresh that
+finds the same percentages as the last line for that agent appends nothing,
+so a quiet account costs no space; the files are never pruned. The last
+values per agent live in limits-last.json beside them, under a lock, since
+the collectors refresh in parallel.
+
+A limit is the 5-hour session window, the weekly window, or a model-scoped
+weekly window (a limit the collector titles after its model). Anything else
+(a monthly window) is kept under models by its label.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+def history_dir() -> Path:
+  base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+  return Path(base) / "omarchy" / "agents" / "history"
+
+
+# The same reading of a label the panel's LimitRow uses.
+def classify(entry: dict[str, Any]) -> tuple[str, str]:
+  title = str(entry.get("title") or "")
+  label = str(entry.get("label") or "")
+  if title:
+    return "models", title
+  text = label.lower()
+  if any(word in text for word in ("month", "30-day")):
+    return "models", label or "Monthly"
+  if any(word in text for word in ("week", "7-day", "seven")):
+    return "weekly", ""
+  if "session" in text or re.search(r"\d+\s*-?\s*(h|hour|m|min)", text):
+    return "session", ""
+  return "models", label or "Limit"
+
+
+def snapshot(record: dict[str, Any]) -> dict[str, Any]:
+  out: dict[str, Any] = {}
+  models: dict[str, float] = {}
+  for entry in record.get("limits") or []:
+    if not isinstance(entry, dict):
+      continue
+    try:
+      percent = float(entry.get("percent"))
+    except (TypeError, ValueError):
+      continue
+    if percent < 0:
+      continue
+    kind, name = classify(entry)
+    if kind == "models":
+      models[name] = round(percent, 4)
+    elif kind not in out:
+      out[kind] = round(percent, 4)
+  if models:
+    out["models"] = models
+  return out
+
+
+def main() -> int:
+  if len(sys.argv) != 3:
+    print("Usage: omarchy-agent-limits-history <agent> <record.json>", file=sys.stderr)
+    return 2
+  agent, record_path = sys.argv[1], Path(sys.argv[2])
+  if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", agent):
+    print(f"omarchy-agent-limits-history: bad agent id {agent!r}", file=sys.stderr)
+    return 2
+  try:
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+  except (OSError, ValueError):
+    return 0
+  values = snapshot(record if isinstance(record, dict) else {})
+  # A run that could not reach the limits endpoint has nothing to say about
+  # them; it must not draw a drop to zero.
+  if not values:
+    return 0
+
+  directory = history_dir()
+  directory.mkdir(parents=True, exist_ok=True)
+  with open(directory / ".limits.lock", "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    last_path = directory / "limits-last.json"
+    try:
+      last = json.loads(last_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+      last = {}
+    if not isinstance(last, dict):
+      last = {}
+    if last.get(agent) == values:
+      return 0
+
+    now = time.time()
+    line = dict(values, ts=round(now, 3), agent=agent)
+    with open(directory / f"limits-{time.strftime('%Y-%m', time.localtime(now))}.jsonl", "a", encoding="utf-8") as handle:
+      handle.write(json.dumps(line, separators=(",", ":"), sort_keys=True) + "\n")
+
+    last[agent] = values
+    handle_fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".limits-last.", suffix=".tmp")
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(json.dumps(last, sort_keys=True) + "\n")
+    os.replace(tmp_name, last_path)
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())

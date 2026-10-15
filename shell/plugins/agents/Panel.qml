@@ -47,11 +47,15 @@ Panel {
   readonly property bool alarming: (!!headline && headline.percent >= 0.9) || balanceAlarming
 
   // Claude Code's own telemetry for this account, when omarchy-agent-otel
-  // receives it. Every figure in it is the API list price equivalent.
+  // receives it. The panel keeps it to one line; the detail, history and
+  // graphs live in the agent stats window (right-click the icon).
   readonly property var otel: provider ? usage.otelFor(provider.providerId) : null
   readonly property var otelLive: liveSessions(otel)
-  readonly property var otelBounties: costRows(otel ? otel.byBounty : [], "bounty", 8)
-  readonly property var otelModels: costRows(otel ? otel.byModel : [], "model", 4)
+  readonly property int otelLooping: {
+    var count = 0
+    for (var i = 0; i < otelLive.length; i++) if (otelLive[i] && otelLive[i].looping === true) count++
+    return count
+  }
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
@@ -66,8 +70,8 @@ Panel {
     usage.refreshAll(true)
   }
 
-  function launchAgent() {
-    if (root.bar) root.bar.run("omarchy-agent --pick")
+  function openStats() {
+    if (root.bar) root.bar.run("omarchy-launch-agent-stats")
     root.close()
   }
 
@@ -189,87 +193,6 @@ Panel {
     return text
   }
 
-  // -------------------------------------------------------------- telemetry
-  //
-  // omarchy-agent-otel rolls Claude Code's OpenTelemetry events up per
-  // account. Its costs are what the same requests would cost at API list
-  // prices; a subscription is not billed that, so every label says so.
-
-  function otelTodayCost(o) {
-    if (!o || !o.today) return 0
-    // A summary written yesterday by a receiver that has since stopped
-    // must not pass its total off as today's.
-    var summaryDay = usage.otelSummary ? String(usage.otelSummary.today || "") : ""
-    return summaryDay === "" || summaryDay === root.todayDate() ? Number(o.today.costUsd || 0) : 0
-  }
-
-  // Liveness is judged again against the panel's clock: if the receiver
-  // stops, its last summary would otherwise keep a finished session live.
-  function liveSessions(o) {
-    var list = o && Array.isArray(o.live) ? o.live : []
-    var windowMs = 1000 * Number((usage.otelSummary && usage.otelSummary.liveWindowSec) || 300)
-    var out = []
-    for (var i = 0; i < list.length; i++) {
-      var s = list[i] || {}
-      if (root.nowMs - Number(s.lastActivityMs || 0) <= windowMs) out.push(s)
-    }
-    return out
-  }
-
-  function costRows(list, key, limit) {
-    var rows = []
-    var source = Array.isArray(list) ? list : []
-    for (var i = 0; i < source.length && rows.length < limit; i++) {
-      var entry = source[i] || {}
-      var name = String(entry[key] || "")
-      rows.push({
-        name: key === "model" ? usage.friendlyModelName(name) : name,
-        total: Number(entry.costUsd || 0),
-        tokens: Number(entry.tokens || 0),
-        requests: Number(entry.requests || 0),
-        sessions: Number(entry.sessions || 0)
-      })
-    }
-    return rows
-  }
-
-  function costTooltip(row) {
-    if (!row) return ""
-    var text = usage.formatTokenCount(row.tokens) + " tokens · " + row.requests + " requests"
-    if (row.sessions > 0) text += " · " + row.sessions + " session" + (row.sessions === 1 ? "" : "s")
-    return text + " · API list price equivalent"
-  }
-
-  function sessionTitle(s) {
-    if (!s) return ""
-    if (String(s.bounty || "") !== "") {
-      var title = String(s.bounty)
-      if (String(s.slot || "") !== "") title += " · " + s.slot
-      if (String(s.attempt || "") !== "") title += " #" + s.attempt
-      return title
-    }
-    if (String(s.ticket || "") !== "") return String(s.ticket)
-    return "Session " + String(s.session || "")
-  }
-
-  function sessionDetail(s) {
-    if (!s) return ""
-    var parts = []
-    if (String(s.model || "") !== "") parts.push(usage.friendlyModelName(s.model))
-    parts.push(usage.formatTokenCount(Number(s.tokens || 0)) + " tokens")
-    parts.push(Number(s.toolCalls || 0) + " tools")
-    var idleMs = root.nowMs - Number(s.lastActivityMs || 0)
-    parts.push(idleMs < 60000 ? "just now" : root.formatDuration(idleMs) + " ago")
-    return parts.join(" · ")
-  }
-
-  function sessionTooltip(s) {
-    if (!s) return ""
-    var text = "Session " + String(s.sessionId || s.session || "")
-    text += " · " + Number(s.requests || 0) + " requests · " + Number(s.toolFailures || 0) + " failed tools"
-    return text
-  }
-
   // ---------------------------------------------------------------- content
 
   // The plan you pay for, under the name of the tool it pays for. Limits live
@@ -353,6 +276,41 @@ Panel {
       + " · out " + usage.formatTokenCount(row.output)
       + " · cache read " + usage.formatTokenCount(row.cacheRead)
       + " · cache write " + usage.formatTokenCount(row.cacheWrite)
+  }
+
+  // -------------------------------------------------------------- telemetry
+  //
+  // omarchy-agent-otel rolls Claude Code's OpenTelemetry events up per
+  // account. Its costs are what the same requests would cost at API list
+  // prices; a subscription is not billed that, so the line says so.
+
+  function otelTodayCost(o) {
+    if (!o || !o.today) return 0
+    // A summary written yesterday by a receiver that has since stopped
+    // must not pass its total off as today's.
+    var summaryDay = usage.otelSummary ? String(usage.otelSummary.today || "") : ""
+    return summaryDay === "" || summaryDay === root.todayDate() ? Number(o.today.costUsd || 0) : 0
+  }
+
+  // Liveness is judged again against the panel's clock: if the receiver
+  // stops, its last summary would otherwise keep a finished session live.
+  function liveSessions(o) {
+    var list = o && Array.isArray(o.live) ? o.live : []
+    var windowMs = 1000 * Number((usage.otelSummary && usage.otelSummary.liveWindowSec) || 300)
+    var out = []
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i] || {}
+      if (root.nowMs - Number(s.lastActivityMs || 0) <= windowMs) out.push(s)
+    }
+    return out
+  }
+
+  function otelLineText() {
+    if (!root.otel) return ""
+    var text = "Today " + root.formatMoney(root.otelTodayCost(root.otel), "USD") + " API-equiv · "
+      + root.otelLive.length + " live"
+    if (root.otelLooping > 0) text += " · " + root.otelLooping + " looping"
+    return text
   }
 
   // Only speaks up when the numbers cover more than this machine.
@@ -443,7 +401,7 @@ Panel {
     text: "󱚣"
     active: root.alarming
     onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) root.launchAgent()
+      if (buttonCode === Qt.RightButton) root.openStats()
       else if (buttonCode === Qt.MiddleButton) root.selectProvider(root.providerIndex + 1)
       else root.toggle()
     }
@@ -477,7 +435,10 @@ Panel {
       onActivateRequested: root.refreshNow()
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) { if (t === "r" || t === "R") root.refreshNow() }
+      onTextKey: function(t) {
+        if (t === "r" || t === "R") root.refreshNow()
+        else if (t === "s" || t === "S") root.openStats()
+      }
 
       Flickable {
         id: panelFlick
@@ -714,6 +675,61 @@ Panel {
             }
           }
 
+          // ---------- Telemetry: one line, the rest is in the stats window ----------
+          // Right under the limits so a looping slot shows without scrolling.
+          BorderSurface {
+            id: otelLine
+            visible: !!root.otel
+            width: parent.width
+            implicitHeight: Math.max(otelLineText.implicitHeight, otelLineAction.implicitHeight) + Style.spacing.md * 2
+            radius: Style.cornerRadius
+            readonly property bool looping: root.otelLooping > 0
+            color: looping ? root.alpha(root.urgent, otelLineHover.containsMouse ? 0.16 : 0.10)
+              : root.alpha(root.foreground, otelLineHover.containsMouse ? 0.09 : 0.05)
+            borderSpec: looping ? Border.flat(root.alpha(root.urgent, 0.35), 1) : Border.none()
+
+            Text {
+              id: otelLineText
+              textFormat: Text.PlainText
+              text: root.otelLineText()
+              color: otelLine.looping ? root.urgent : root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+              anchors.left: parent.left
+              anchors.right: otelLineAction.left
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Text {
+              id: otelLineAction
+              textFormat: Text.PlainText
+              text: "open stats ›"
+              color: otelLine.looping ? root.urgent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(10)
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            MouseArea {
+              id: otelLineHover
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.openStats()
+            }
+
+            PanelToolTip {
+              visible: otelLineHover.containsMouse
+              text: "At API list prices, from Claude Code telemetry; not what the subscription bills. Right-click the bar icon for the same window."
+              fontFamily: root.fontFamily
+            }
+          }
+
           // ---------- Usage ----------
           PanelSeparator {
             visible: usageSection.visible
@@ -782,156 +798,6 @@ Panel {
                 // Scaled to the heaviest model, so the top row is always full —
                 // the same scale-to-peak the weekly chart uses for its busiest day.
                 share: modelData.total / Math.max(1, root.models[0].total)
-              }
-            }
-          }
-
-          // ---------- Telemetry: API-equivalent cost ----------
-          PanelSeparator {
-            visible: otelSection.visible
-            foreground: root.foreground
-          }
-
-          Column {
-            id: otelSection
-            visible: !!root.otel
-            width: parent.width
-            spacing: Style.space(10)
-
-            PanelSectionHeader {
-              width: parent.width
-              text: "API EQUIVALENT"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Item {
-              width: parent.width
-              implicitHeight: Math.max(otelTodayLabel.implicitHeight, otelTodayValue.implicitHeight)
-
-              Text {
-                id: otelTodayLabel
-                textFormat: Text.PlainText
-                text: "Today"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-              }
-
-              Text {
-                id: otelTodayValue
-                textFormat: Text.PlainText
-                text: root.formatMoney(root.otelTodayCost(root.otel), "USD")
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-              }
-            }
-
-            Text {
-              textFormat: Text.PlainText
-              width: parent.width
-              text: "At API list prices, from Claude Code telemetry. Not what the subscription bills."
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-          }
-
-          PanelSeparator {
-            visible: liveSection.visible
-            foreground: root.foreground
-          }
-
-          Column {
-            id: liveSection
-            visible: root.otelLive.length > 0
-            width: parent.width
-            spacing: Style.spacing.md
-
-            PanelSectionHeader {
-              width: parent.width
-              text: "LIVE SESSIONS"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Repeater {
-              model: root.otelLive
-
-              SessionRow {
-                required property var modelData
-                width: liveSection.width
-                session: modelData
-              }
-            }
-          }
-
-          PanelSeparator {
-            visible: bountySection.visible
-            foreground: root.foreground
-          }
-
-          Column {
-            id: bountySection
-            visible: root.otelBounties.length > 0
-            width: parent.width
-            spacing: Style.spacing.md
-
-            PanelSectionHeader {
-              width: parent.width
-              text: "COST BY BOUNTY · 7 DAYS"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Repeater {
-              model: root.otelBounties
-
-              ModelRow {
-                required property var modelData
-                width: bountySection.width
-                row: modelData
-                share: modelData.total / Math.max(0.000001, root.otelBounties[0].total)
-                valueText: root.formatMoney(modelData.total, "USD")
-                tooltipText: root.costTooltip(modelData)
-              }
-            }
-          }
-
-          PanelSeparator {
-            visible: costModelSection.visible
-            foreground: root.foreground
-          }
-
-          Column {
-            id: costModelSection
-            visible: root.otelModels.length > 0
-            width: parent.width
-            spacing: Style.spacing.md
-
-            PanelSectionHeader {
-              width: parent.width
-              text: "COST BY MODEL · 7 DAYS"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Repeater {
-              model: root.otelModels
-
-              ModelRow {
-                required property var modelData
-                width: costModelSection.width
-                row: modelData
-                share: modelData.total / Math.max(0.000001, root.otelModels[0].total)
-                valueText: root.formatMoney(modelData.total, "USD")
-                tooltipText: root.costTooltip(modelData)
               }
             }
           }
@@ -1129,9 +995,6 @@ Panel {
     id: modelRow
     property var row: null
     property real share: 0
-    // Token rows by default; the telemetry cost rows put dollars here.
-    property string valueText: row ? usage.formatTokenCount(row.total) : ""
-    property string tooltipText: root.modelTooltip(row)
 
     implicitHeight: modelName.implicitHeight + Style.spacing.lg
 
@@ -1172,7 +1035,7 @@ Panel {
     Text {
       id: modelTokens
       textFormat: Text.PlainText
-      text: modelRow.valueText
+      text: modelRow.row ? usage.formatTokenCount(modelRow.row.total) : ""
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
@@ -1191,96 +1054,7 @@ Panel {
 
     PanelToolTip {
       visible: modelHover.containsMouse
-      text: modelRow.tooltipText
-      fontFamily: root.fontFamily
-    }
-  }
-
-  // A live session as a card: what it is working on, what it has cost, and
-  // what it is doing. A session the receiver flags as looping takes the same
-  // urgent card the auth warning uses, so it reads as a problem at a glance.
-  component SessionRow: BorderSurface {
-    id: sessionRow
-    property var session: null
-    readonly property bool looping: !!session && session.looping === true
-
-    implicitHeight: sessionColumn.implicitHeight + Style.spacing.lg
-    radius: Style.cornerRadius
-    color: looping ? root.alpha(root.urgent, 0.10) : root.alpha(root.foreground, 0.05)
-    borderSpec: looping ? Border.flat(root.alpha(root.urgent, 0.35), 1) : Border.none()
-
-    Column {
-      id: sessionColumn
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      anchors.leftMargin: Style.space(8)
-      anchors.rightMargin: Style.space(8)
-      spacing: Style.space(2)
-
-      Item {
-        width: parent.width
-        implicitHeight: Math.max(sessionName.implicitHeight, sessionCost.implicitHeight)
-
-        Text {
-          id: sessionName
-          textFormat: Text.PlainText
-          text: root.sessionTitle(sessionRow.session)
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          elide: Text.ElideRight
-          anchors.left: parent.left
-          anchors.right: sessionCost.left
-          anchors.rightMargin: Style.space(8)
-          anchors.verticalCenter: parent.verticalCenter
-        }
-
-        Text {
-          id: sessionCost
-          textFormat: Text.PlainText
-          text: sessionRow.session ? root.formatMoney(sessionRow.session.costUsd, "USD") : ""
-          color: sessionRow.looping ? root.urgent : root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-          font.bold: true
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-        }
-      }
-
-      Text {
-        textFormat: Text.PlainText
-        width: parent.width
-        text: root.sessionDetail(sessionRow.session)
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
-      }
-
-      Text {
-        textFormat: Text.PlainText
-        visible: sessionRow.looping
-        width: parent.width
-        text: sessionRow.session ? "Looping · " + String(sessionRow.session.loopReason || "") : ""
-        color: root.urgent
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        wrapMode: Text.WordWrap
-      }
-    }
-
-    MouseArea {
-      id: sessionHover
-      anchors.fill: parent
-      hoverEnabled: true
-      acceptedButtons: Qt.NoButton
-    }
-
-    PanelToolTip {
-      visible: sessionHover.containsMouse
-      text: root.sessionTooltip(sessionRow.session)
+      text: root.modelTooltip(modelRow.row)
       fontFamily: root.fontFamily
     }
   }
