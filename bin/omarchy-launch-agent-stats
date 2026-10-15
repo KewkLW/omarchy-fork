@@ -24,8 +24,10 @@ if [[ -n $address ]]; then
   exit 0
 fi
 
-# Inside the command rather than around it: uwsm-app may start the process
+# PATH puts this checkout's commands first, so the window runs the same
+# omarchy-agent-otel as the shell. Inside the command rather than around it:
+# uwsm-app may start the process
 # from its own environment. Reloading stays off for the same reason the shell
 # keeps it off: a package upgrade rewriting the tree under a running window.
-exec setsid uwsm-app -- env QS_APP_ID="$APP_ID" QS_DISABLE_FILE_WATCHER=1 QS_NO_RELOAD_POPUP=1 \
+exec setsid uwsm-app -- env PATH="$OMARCHY_PATH/bin:$PATH" QS_APP_ID="$APP_ID" QS_DISABLE_FILE_WATCHER=1 QS_NO_RELOAD_POPUP=1 \
   quickshell -n -p "$OMARCHY_PATH/shell/agent-stats.qml"
