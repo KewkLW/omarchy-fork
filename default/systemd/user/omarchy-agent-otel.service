@@ -1,0 +1,13 @@
+[Unit]
+Description=Receive Claude Code OpenTelemetry on 127.0.0.1:4318 for the agents panel
+# Shipped, not enabled: the panel's telemetry section stays hidden until this
+# runs and Claude Code exports to it (see shell/plugins/agents/README.md).
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/omarchy-agent-otel serve --port 4318
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

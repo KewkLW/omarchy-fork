@@ -112,6 +112,44 @@ Item {
     if (syncConfigured()) scheduleSync()
   }
 
+  // ------------------------------------------------------------- telemetry
+
+  // Claude Code's own OpenTelemetry, rolled up by omarchy-agent-otel: live
+  // sessions, cost per bounty and per model, keyed by the same record ids as
+  // the usage records. Absent unless the receiver runs, and then nothing
+  // shows.
+  readonly property string otelSummaryPath: usageDir.replace(/\/usage$/, "/otel/summary.json")
+  property var otelSummary: null
+
+  FileView {
+    id: otelSummaryFile
+    path: root.otelSummaryPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.parseOtelSummary(text())
+    onLoadFailed: root.otelSummary = null
+  }
+
+  function parseOtelSummary(content) {
+    try {
+      var parsed = JSON.parse(String(content || ""))
+      root.otelSummary = parsed && typeof parsed === "object" && parsed.accounts ? parsed : null
+    } catch (e) {
+      console.warn("agents", "Ignoring bad telemetry summary", root.otelSummaryPath, e)
+      root.otelSummary = null
+    }
+  }
+
+  // A watcher cannot follow a file that did not exist yet, so the panel asks
+  // again whenever it opens; that is when the numbers are read anyway.
+  function reloadOtel() { otelSummaryFile.reload() }
+
+  function otelFor(providerId) {
+    var accounts = otelSummary && otelSummary.accounts ? otelSummary.accounts : null
+    return accounts && accounts[providerId] ? accounts[providerId] : null
+  }
+
   // -------------------------------------------------------------- refresh
 
   property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 900)))

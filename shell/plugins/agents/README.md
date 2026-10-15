@@ -24,6 +24,12 @@ cross-device aggregation); `Agent.qml` is the per-record file watcher.
   to the heaviest model,
   the same way the weekly chart scales to its busiest day. Hover for the
   input / output / cache split.
+- **API equivalent** (Claude tabs, only with telemetry on) — today's cost at
+  API list prices, then the sessions active in the last five minutes as
+  cards (bounty · slot #attempt or ticket, model, tokens, tool calls, last
+  activity), with a looping session drawn as an urgent card, then cost by
+  bounty (top 8) and cost by model over the last 7 days. See
+  [Claude Code telemetry](#claude-code-telemetry).
 
 A subscription appears only when it is enabled in settings and has actually
 recorded usage — on this machine or on a synced one. With one such agent
@@ -56,6 +62,11 @@ light surfaces — and the bar glyph stands in when there is none.
 | `codex` | The Codex app-server RPC | native Codex CLI session files (plus pi and opencode sessions) |
 | `fireworks` | Estimated prepaid balance: configured funding minus rated account costs | Fireworks billing API, grouped by day and model for the last 30 days |
 
+Claude tabs can also show Claude Code's own OpenTelemetry (live sessions,
+cost per bounty and model), read from
+`~/.local/state/omarchy/agents/otel/summary.json`, which
+`omarchy-agent-otel` writes — see below.
+
 Claude limits need a signed-in CLI; without credentials the panel says so and
 falls back to local stats only. A non-default Claude directory is honored via
 `CLAUDE_CONFIG_DIR`, Codex via `CODEX_HOME`. Fireworks reads
@@ -63,6 +74,50 @@ falls back to local stats only. A non-default Claude directory is honored via
 `~/.fireworks/auth.ini` (which `firectl set-api-key` creates), then the key
 opencode stores in `~/.local/share/opencode/auth.json` when Fireworks is
 signed in there.
+
+### Claude Code telemetry
+
+Claude Code can export OpenTelemetry, and `omarchy-agent-otel serve` is a
+small receiver for it on `127.0.0.1:4318` (loopback only). It ships as
+`omarchy-agent-otel.service` but is not enabled. To turn it on:
+
+```bash
+install -Dm644 "$OMARCHY_PATH/default/systemd/user/omarchy-agent-otel.service" \
+  ~/.config/systemd/user/omarchy-agent-otel.service
+systemctl --user daemon-reload
+systemctl --user enable --now omarchy-agent-otel.service
+```
+
+and start Claude Code with:
+
+```bash
+CLAUDE_CODE_ENABLE_TELEMETRY=1
+OTEL_LOGS_EXPORTER=otlp
+OTEL_METRICS_EXPORTER=otlp
+OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+```
+
+Tag a run with `OTEL_RESOURCE_ATTRIBUTES=bounty.id=…,bounty.slot=…,bounty.attempt=…`
+(or `ticket=…`) to have its cost attributed. The receiver keeps only the
+`api_request` and `tool_result` events, and of those only timestamps,
+session and account ids, model, cost, token counts, tool name, success and
+duration, plus those tags. Prompts are never logged: Claude Code redacts them
+unless `OTEL_LOG_USER_PROMPTS=1`, and even then the receiver drops the field,
+as it does tool inputs, error text, email and organization ids. Events land
+in `~/.local/state/omarchy/agents/otel/events-YYYY-MM-DD.jsonl` (kept 14
+days); every 10 seconds the receiver rewrites `summary.json` beside them when
+it changed, which `Main.qml` watches. `omarchy-agent-otel status` prints it.
+
+Accounts are matched by `oauthAccount.accountUuid`: `~/.claude.json` (or
+`$CLAUDE_CONFIG_DIR/.claude.json`) is the `claude` tab, and each account in
+`~/.config/omarchy/agents/claude-accounts.json` is `claude-<id>` via its own
+`<dir>/.claude.json`. Every dollar figure is `cost_usd` as Claude Code
+reports it — the API list price equivalent, not what a subscription bills.
+A live session is marked looping when its last 12 tool calls were the same
+tool with at least half failing, or when it made more than 40 tool calls in
+five minutes with no API cost growth. With no `summary.json` the section is
+not drawn at all.
 
 ### Fireworks balance
 

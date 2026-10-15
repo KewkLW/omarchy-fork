@@ -1,0 +1,694 @@
+#!/usr/bin/python3
+# omarchy:summary=Receive Claude Code OpenTelemetry on 127.0.0.1 and roll it up for the agents panel
+# omarchy:args=<serve [--port N] [--rollup-interval S] | rollup | status>
+# omarchy:hidden=true
+"""Local OTLP/HTTP receiver for Claude Code telemetry.
+
+Claude Code exports events and metrics over OTLP when telemetry is on:
+
+  CLAUDE_CODE_ENABLE_TELEMETRY=1
+  OTEL_LOGS_EXPORTER=otlp
+  OTEL_METRICS_EXPORTER=otlp
+  OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+
+`serve` listens on 127.0.0.1 only and accepts the JSON encoding on /v1/logs
+and /v1/metrics (/v1/traces is accepted and dropped). Of the log events it
+keeps two kinds, and of those only a whitelist of fields:
+
+  api_request  ts, session, account uuid, model, cost_usd, input / output /
+               cache-read / cache-creation tokens, and the bounty.id,
+               bounty.slot, bounty.attempt and ticket resource attributes
+  tool_result  ts, session, account uuid, tool name, success, duration, and
+               the same tags
+
+Prompt text, tool inputs and parameters, error messages, email addresses and
+organization ids are never written anywhere. Metrics are acknowledged and
+dropped: the api_request events carry the same cost and token numbers per
+request, which is what the per-bounty and per-session views need.
+
+Events append to $XDG_STATE_HOME/omarchy/agents/otel/events-YYYY-MM-DD.jsonl
+(kept 14 days). Every few seconds the receiver rebuilds summary.json in the
+same directory and replaces it atomically when its content changed. `rollup`
+does the same once from the event files, `status` prints the summary.
+
+Costs are cost_usd as Claude Code reports it: what the requests would cost at
+API list prices. A subscription is not billed that amount.
+
+A live session is one with any event in the last 5 minutes. It is flagged as
+looping when either
+  - its last 12 tool calls all used the same tool and at least half of them
+    failed, or
+  - it made more than 40 tool calls in the last 5 minutes while its API cost
+    did not grow at all in that time.
+Both are cheap tells for an agent stuck retrying, not proofs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import gzip
+import http.server
+import json
+import os
+import re
+import signal
+import sys
+import tempfile
+import threading
+import time
+from collections import deque
+from pathlib import Path
+from typing import Any
+
+DEFAULT_PORT = 4318
+RETENTION_DAYS = 14
+ROLLUP_DAYS = 7
+LIVE_WINDOW_SECONDS = 300
+LOOP_TOOL_RUN = 12
+LOOP_BURST_CALLS = 40
+MAX_BODY_BYTES = 32 * 1024 * 1024
+COST_BASIS = "API list price equivalent"
+TAG_KEYS = {"bounty.id": "bounty", "bounty.slot": "slot", "bounty.attempt": "attempt", "ticket": "ticket", "slot": "slot"}
+
+
+def state_dir() -> Path:
+  base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+  return Path(base) / "omarchy" / "agents" / "otel"
+
+
+def summary_path() -> Path:
+  return state_dir() / "summary.json"
+
+
+def expand_path(value: str) -> Path:
+  return Path(os.path.expandvars(os.path.expanduser(value)))
+
+
+def write_json(path: Path, payload: Any) -> None:
+  # Unique temp name, then rename: the panel's file watcher only ever sees a
+  # whole file.
+  path.parent.mkdir(parents=True, exist_ok=True)
+  handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    tmp.chmod(0o644)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+
+
+# ------------------------------------------------------------------ accounts
+
+# The panel names Claude accounts by record id: "claude" for the default
+# config dir, "claude-<id>" for each extra account in claude-accounts.json
+# (the same file omarchy-agent-usage-claude reads). Telemetry names them by
+# account uuid, which each config dir's .claude.json records.
+class AccountMap:
+  def __init__(self) -> None:
+    self.cache: dict[str, tuple[float, str]] = {}
+    self.checked = 0.0
+    self.mapping: dict[str, str] = {}
+
+  def sources(self) -> list[tuple[str, Path]]:
+    custom = os.environ.get("CLAUDE_CONFIG_DIR")
+    default = expand_path(custom) / ".claude.json" if custom else Path.home() / ".claude.json"
+    sources = [("claude", default)]
+    config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    try:
+      extras = json.loads((Path(config_home) / "omarchy" / "agents" / "claude-accounts.json").read_text(encoding="utf-8"))
+    except Exception:
+      extras = []
+    for entry in extras if isinstance(extras, list) else []:
+      if not isinstance(entry, dict):
+        continue
+      account_id = re.sub(r"[^a-z0-9-]+", "-", str(entry.get("id") or "").lower()).strip("-")
+      directory = str(entry.get("dir") or "")
+      if account_id and directory:
+        sources.append((f"claude-{account_id}", expand_path(directory) / ".claude.json"))
+    return sources
+
+  def uuid_for(self, path: Path) -> str:
+    try:
+      mtime = path.stat().st_mtime
+    except OSError:
+      return ""
+    cached = self.cache.get(str(path))
+    if cached and cached[0] == mtime:
+      return cached[1]
+    try:
+      data = json.loads(path.read_text(encoding="utf-8"))
+      uuid = str(((data or {}).get("oauthAccount") or {}).get("accountUuid") or "")
+    except Exception:
+      uuid = ""
+    self.cache[str(path)] = (mtime, uuid)
+    return uuid
+
+  def resolve(self, uuid: str) -> str:
+    now = time.monotonic()
+    if now - self.checked > 60 or (uuid and uuid not in self.mapping):
+      mapping = {}
+      for record_id, path in self.sources():
+        found = self.uuid_for(path)
+        if found and found not in mapping:
+          mapping[found] = record_id
+      self.mapping = mapping
+      self.checked = now
+    return self.mapping.get(uuid, uuid or "unknown")
+
+
+# ---------------------------------------------------------------------- OTLP
+
+def any_value(value: Any) -> Any:
+  if not isinstance(value, dict):
+    return value
+  if "stringValue" in value:
+    return value["stringValue"]
+  if "intValue" in value:
+    try:
+      return int(value["intValue"])
+    except (TypeError, ValueError):
+      return 0
+  if "doubleValue" in value:
+    try:
+      return float(value["doubleValue"])
+    except (TypeError, ValueError):
+      return 0.0
+  if "boolValue" in value:
+    return bool(value["boolValue"])
+  if "arrayValue" in value:
+    return [any_value(v) for v in (value["arrayValue"] or {}).get("values") or []]
+  if "kvlistValue" in value:
+    return attributes((value["kvlistValue"] or {}).get("values"))
+  return None
+
+
+def attributes(items: Any) -> dict[str, Any]:
+  out: dict[str, Any] = {}
+  for item in items if isinstance(items, list) else []:
+    if isinstance(item, dict) and "key" in item:
+      out[str(item["key"])] = any_value(item.get("value"))
+  return out
+
+
+def number(value: Any, kind: type = float) -> Any:
+  try:
+    return kind(float(value)) if kind is int else float(value)
+  except (TypeError, ValueError):
+    return kind(0)
+
+
+def truthy(value: Any) -> bool:
+  if isinstance(value, bool):
+    return value
+  return str(value).strip().lower() in ("true", "1", "yes")
+
+
+def record_time(record: dict[str, Any], attrs: dict[str, Any], now: float) -> float:
+  for key in ("timeUnixNano", "observedTimeUnixNano"):
+    try:
+      nanos = int(record.get(key) or 0)
+    except (TypeError, ValueError):
+      nanos = 0
+    if nanos > 0:
+      return min(nanos / 1e9, now + 60)
+  stamp = str(attrs.get("event.timestamp") or "")
+  try:
+    return min(dt.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp(), now + 60)
+  except ValueError:
+    return now
+
+
+def short(value: Any, limit: int = 120) -> str:
+  return str(value if value is not None else "")[:limit]
+
+
+def extract_events(payload: dict[str, Any], now: float) -> list[dict[str, Any]]:
+  events = []
+  for resource_logs in payload.get("resourceLogs") or []:
+    resource = attributes(((resource_logs or {}).get("resource") or {}).get("attributes"))
+    for scope_logs in (resource_logs or {}).get("scopeLogs") or []:
+      for record in (scope_logs or {}).get("logRecords") or []:
+        if not isinstance(record, dict):
+          continue
+        attrs = attributes(record.get("attributes"))
+        name = str(attrs.get("event.name") or any_value(record.get("body")) or "")
+        name = name.removeprefix("claude_code.")
+        if name not in ("api_request", "tool_result"):
+          continue
+        event: dict[str, Any] = {
+          "kind": "api" if name == "api_request" else "tool",
+          "ts": round(record_time(record, attrs, now), 3),
+          "session": short(attrs.get("session.id")),
+          "account": short(attrs.get("user.account_uuid")),
+        }
+        # Tags ride on both the resource and every record; the record wins.
+        for key, field in TAG_KEYS.items():
+          value = attrs.get(key, resource.get(key))
+          if value not in (None, "") and field not in event:
+            event[field] = short(value, 80)
+        if name == "api_request":
+          event.update({
+            "model": short(attrs.get("model"), 80),
+            "cost": number(attrs.get("cost_usd")),
+            "in": number(attrs.get("input_tokens"), int),
+            "out": number(attrs.get("output_tokens"), int),
+            "cacheRead": number(attrs.get("cache_read_tokens"), int),
+            "cacheWrite": number(attrs.get("cache_creation_tokens"), int),
+          })
+        else:
+          event.update({
+            "tool": short(attrs.get("tool_name"), 80),
+            "ok": truthy(attrs.get("success")),
+            "ms": number(attrs.get("duration_ms"), int),
+          })
+        events.append(event)
+  return events
+
+
+# --------------------------------------------------------------------- store
+
+def day_of(ts: float) -> str:
+  return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+def event_files() -> list[tuple[str, Path]]:
+  out = []
+  for path in sorted(state_dir().glob("events-*.jsonl")):
+    match = re.fullmatch(r"events-(\d{4}-\d{2}-\d{2})\.jsonl", path.name)
+    if match:
+      out.append((match.group(1), path))
+  return out
+
+
+def prune_files(now: float) -> None:
+  cutoff = (dt.datetime.fromtimestamp(now).date() - dt.timedelta(days=RETENTION_DAYS - 1)).strftime("%Y-%m-%d")
+  for day, path in event_files():
+    if day < cutoff:
+      path.unlink(missing_ok=True)
+
+
+def read_events(now: float):
+  """Yield (day, event) for the stored events still inside the rollup window."""
+  since = now - ROLLUP_DAYS * 86400
+  cutoff = day_of(since)
+  for day, path in event_files():
+    if day < cutoff:
+      continue
+    try:
+      handle = open(path, encoding="utf-8")
+    except OSError:
+      continue
+    with handle:
+      for line in handle:
+        try:
+          event = json.loads(line)
+        except ValueError:
+          continue
+        if isinstance(event, dict):
+          yield day, event
+
+
+def append_events(events: list[dict[str, Any]]) -> None:
+  directory = state_dir()
+  directory.mkdir(parents=True, exist_ok=True)
+  by_day: dict[str, list[str]] = {}
+  for event in events:
+    by_day.setdefault(day_of(event["ts"]), []).append(json.dumps(event, separators=(",", ":"), sort_keys=True))
+  for day, lines in by_day.items():
+    with open(directory / f"events-{day}.jsonl", "a", encoding="utf-8") as handle:
+      handle.write("\n".join(lines) + "\n")
+
+
+# -------------------------------------------------------------------- rollup
+
+def tokens_of(event: dict[str, Any]) -> int:
+  try:
+    return int(event.get("in") or 0) + int(event.get("out") or 0) + int(event.get("cacheRead") or 0) + int(event.get("cacheWrite") or 0)
+  except (TypeError, ValueError):
+    return 0
+
+
+def iso(ts: float) -> str:
+  return dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def empty_bucket() -> dict[str, Any]:
+  return {"costUsd": 0.0, "tokens": 0, "requests": 0}
+
+
+def add_to(bucket: dict[str, Any], cost: float, tokens: int, requests: int = 1) -> None:
+  bucket["costUsd"] += cost
+  bucket["tokens"] += tokens
+  bucket["requests"] += requests
+
+
+# Running totals, updated as events arrive, so a rollup costs as much as
+# there are sessions and bounties rather than events: a week of a busy board
+# is hundreds of thousands of events, and the rollup runs every few seconds.
+# Per-day buckets (cost per account, model and bounty) age out a day at a
+# time; per-session state keeps only counters, the last 12 tool outcomes and
+# the last five minutes of activity for the looping checks.
+class Tally:
+  def __init__(self) -> None:
+    self.days: dict[str, dict[str, dict[str, Any]]] = {}
+    self.sessions: dict[tuple[str, str], dict[str, Any]] = {}
+
+  def add(self, event: dict[str, Any], now: float, day: str = "") -> None:
+    ts = event.get("ts")
+    if not isinstance(ts, (int, float)) or ts < now - ROLLUP_DAYS * 86400:
+      return
+    kind = event.get("kind")
+    if kind not in ("api", "tool"):
+      return
+    uuid = str(event.get("account") or "")
+    session_id = str(event.get("session") or "")
+    session = self.sessions.get((uuid, session_id))
+    if session is None:
+      session = self.sessions[(uuid, session_id)] = {
+        "last": 0.0, "tags": {}, "model": "", "cost": 0.0, "tokens": 0, "requests": 0,
+        "tools": 0, "failures": 0, "recent": deque(maxlen=LOOP_TOOL_RUN), "window": deque(),
+      }
+    if ts > session["last"]:
+      session["last"] = ts
+    for field in ("bounty", "slot", "attempt", "ticket"):
+      if event.get(field):
+        session["tags"][field] = event[field]
+
+    if kind == "tool":
+      ok = bool(event.get("ok"))
+      session["tools"] += 1
+      session["failures"] += 0 if ok else 1
+      session["recent"].append((str(event.get("tool") or ""), ok))
+      session["window"].append((ts, 0.0, 1))
+      return
+
+    cost = event.get("cost")
+    if not isinstance(cost, (int, float)):
+      cost = 0.0
+    tokens = tokens_of(event)
+    model_name = str(event.get("model") or "")
+    session["cost"] += cost
+    session["tokens"] += tokens
+    session["requests"] += 1
+    session["window"].append((ts, cost, 0))
+    if model_name:
+      session["model"] = model_name
+
+    bucket = self.days.setdefault(day or day_of(ts), {}).get(uuid)
+    if bucket is None:
+      bucket = self.days[day or day_of(ts)][uuid] = dict(empty_bucket(), models={}, bounties={})
+    add_to(bucket, cost, tokens)
+    add_to(bucket["models"].setdefault(model_name or "unknown", empty_bucket()), cost, tokens)
+    bounty_key = str(event.get("bounty") or event.get("ticket") or "")
+    if bounty_key:
+      entry = bucket["bounties"].get(bounty_key)
+      if entry is None:
+        entry = bucket["bounties"][bounty_key] = dict(empty_bucket(), sessions=set())
+      add_to(entry, cost, tokens)
+      entry["sessions"].add(session_id)
+
+  def expire(self, now: float) -> None:
+    first_day = (dt.datetime.fromtimestamp(now).date() - dt.timedelta(days=ROLLUP_DAYS - 1)).strftime("%Y-%m-%d")
+    for day in [d for d in self.days if d < first_day]:
+      del self.days[day]
+    since = now - ROLLUP_DAYS * 86400
+    live_since = now - LIVE_WINDOW_SECONDS
+    for key in [k for k, s in self.sessions.items() if s["last"] < since]:
+      del self.sessions[key]
+    for session in self.sessions.values():
+      window = session["window"]
+      while window and window[0][0] < live_since:
+        window.popleft()
+
+  def has_live(self, now: float) -> bool:
+    live_since = now - LIVE_WINDOW_SECONDS
+    return any(s["last"] >= live_since for s in self.sessions.values())
+
+
+def looping_reason(session: dict[str, Any]) -> str:
+  recent = session["recent"]
+  if len(recent) == LOOP_TOOL_RUN and len({name for name, _ in recent}) == 1:
+    failures = sum(1 for _, ok in recent if not ok)
+    if failures * 2 >= LOOP_TOOL_RUN:
+      return f"{recent[-1][0] or 'tool'} failed {failures} of the last {LOOP_TOOL_RUN} calls"
+  window_tools = sum(t for _, _, t in session["window"])
+  window_cost = sum(c for _, c, _ in session["window"])
+  if window_tools > LOOP_BURST_CALLS and window_cost <= 0:
+    return f"{window_tools} tool calls in 5 min with no API cost growth"
+  return ""
+
+
+def build_summary(tally: Tally, accounts: AccountMap, now: float) -> dict[str, Any]:
+  tally.expire(now)
+  today = day_of(now)
+  live_since = now - LIVE_WINDOW_SECONDS
+  per_account: dict[str, dict[str, Any]] = {}
+
+  def account_acc(uuid: str) -> dict[str, Any]:
+    record_id = accounts.resolve(uuid)
+    acc = per_account.get(record_id)
+    if acc is None:
+      acc = per_account[record_id] = {"uuid": uuid, "today": empty_bucket(), "models": {}, "bounties": {}, "live": []}
+    return acc
+
+  for day, buckets in tally.days.items():
+    for uuid, bucket in buckets.items():
+      acc = account_acc(uuid)
+      if day == today:
+        add_to(acc["today"], bucket["costUsd"], bucket["tokens"], bucket["requests"])
+      for name, model in bucket["models"].items():
+        add_to(acc["models"].setdefault(name, empty_bucket()), model["costUsd"], model["tokens"], model["requests"])
+      for name, bounty in bucket["bounties"].items():
+        entry = acc["bounties"].get(name)
+        if entry is None:
+          entry = acc["bounties"][name] = dict(empty_bucket(), sessions=set())
+        add_to(entry, bounty["costUsd"], bounty["tokens"], bounty["requests"])
+        entry["sessions"] |= bounty["sessions"]
+
+  for (uuid, session_id), session in tally.sessions.items():
+    if session["last"] < live_since:
+      continue
+    reason = looping_reason(session)
+    row = {
+      "session": session_id[:8],
+      "sessionId": session_id,
+      "model": session["model"],
+      "costUsd": round(session["cost"], 6),
+      "tokens": session["tokens"],
+      "requests": session["requests"],
+      "toolCalls": session["tools"],
+      "toolFailures": session["failures"],
+      "lastActivity": iso(session["last"]),
+      "lastActivityMs": int(session["last"] * 1000),
+      "looping": bool(reason),
+      "loopReason": reason,
+    }
+    row.update(session["tags"])
+    account_acc(uuid)["live"].append(row)
+
+  out_accounts = {}
+  total_today = 0.0
+  for record_id, acc in sorted(per_account.items()):
+    live = sorted(acc["live"], key=lambda r: (not r["looping"], -r["lastActivityMs"]))
+    bounties = sorted((
+      {"bounty": key, "costUsd": round(b["costUsd"], 6), "tokens": b["tokens"], "requests": b["requests"], "sessions": len(b["sessions"])}
+      for key, b in acc["bounties"].items()
+    ), key=lambda r: -r["costUsd"])
+    models = sorted((
+      {"model": key, "costUsd": round(m["costUsd"], 6), "tokens": m["tokens"], "requests": m["requests"]}
+      for key, m in acc["models"].items()
+    ), key=lambda r: -r["costUsd"])
+    total_today += acc["today"]["costUsd"]
+    out_accounts[record_id] = {
+      "id": record_id,
+      "accountUuid": acc["uuid"],
+      "today": {"costUsd": round(acc["today"]["costUsd"], 6), "tokens": acc["today"]["tokens"], "requests": acc["today"]["requests"]},
+      "live": live,
+      "byBounty": bounties[:20],
+      "byModel": models,
+    }
+
+  return {
+    "schemaVersion": 1,
+    "costBasis": COST_BASIS,
+    "costNote": "cost_usd as Claude Code reports it: API list prices, not what a subscription bills",
+    "windowDays": ROLLUP_DAYS,
+    "liveWindowSec": LIVE_WINDOW_SECONDS,
+    "today": today,
+    "todayCostUsd": round(total_today, 6),
+    "accounts": out_accounts,
+  }
+
+
+def load_tally(now: float) -> Tally:
+  tally = Tally()
+  for day, event in read_events(now):
+    tally.add(event, now, day)
+  return tally
+
+
+def write_summary_if_changed(summary: dict[str, Any], previous: str) -> str:
+  # generatedAt is stamped after the comparison so an idle receiver leaves
+  # the file (and the panel's watcher) alone.
+  body = json.dumps(summary, sort_keys=True)
+  if body == previous and summary_path().exists():
+    return previous
+  write_json(summary_path(), dict(summary, generatedAt=iso(time.time())))
+  return body
+
+
+# --------------------------------------------------------------------- serve
+
+class Receiver:
+  def __init__(self) -> None:
+    self.lock = threading.Lock()
+    self.accounts = AccountMap()
+    now = time.time()
+    prune_files(now)
+    self.tally = load_tally(now)
+    self.last_body = ""
+    self.last_prune_day = day_of(now)
+    self.last_rollup_day = ""
+    # The rollup reruns only when it can come out different: new events, a
+    # live session that may age out or trip a flag, or a new day.
+    self.dirty = True
+
+  def ingest(self, payload: dict[str, Any]) -> int:
+    now = time.time()
+    events = extract_events(payload, now)
+    if not events:
+      return 0
+    with self.lock:
+      append_events(events)
+      for event in events:
+        self.tally.add(event, now)
+      self.dirty = True
+    return len(events)
+
+  def rollup(self) -> None:
+    now = time.time()
+    today = day_of(now)
+    with self.lock:
+      # Looking a window further back gives a session that just went quiet
+      # one more rollup, which is the one that takes it off the live list.
+      if not (self.dirty or today != self.last_rollup_day or self.tally.has_live(now - LIVE_WINDOW_SECONDS)):
+        return
+      if today != self.last_prune_day:
+        prune_files(now)
+        self.last_prune_day = today
+      summary = build_summary(self.tally, self.accounts, now)
+      self.dirty = False
+      self.last_rollup_day = today
+    self.last_body = write_summary_if_changed(summary, self.last_body)
+
+
+def make_handler(receiver: Receiver) -> type:
+  class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "omarchy-agent-otel"
+
+    def reply(self, code: int, body: bytes = b"{}") -> None:
+      self.send_response(code)
+      self.send_header("Content-Type", "application/json")
+      self.send_header("Content-Length", str(len(body)))
+      self.end_headers()
+      self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802
+      path = self.path.split("?", 1)[0]
+      if path not in ("/v1/logs", "/v1/metrics", "/v1/traces"):
+        self.reply(404, b'{"error":"unknown path"}')
+        return
+      try:
+        length = int(self.headers.get("Content-Length") or 0)
+      except ValueError:
+        length = 0
+      if length <= 0 or length > MAX_BODY_BYTES:
+        self.reply(413 if length > MAX_BODY_BYTES else 400, b'{"error":"bad length"}')
+        return
+      raw = self.rfile.read(length)
+      if path != "/v1/logs":
+        self.reply(200)
+        return
+      if "json" not in str(self.headers.get("Content-Type") or "").lower():
+        self.reply(415, b'{"error":"set OTEL_EXPORTER_OTLP_PROTOCOL=http/json"}')
+        return
+      try:
+        if str(self.headers.get("Content-Encoding") or "").lower() == "gzip":
+          raw = gzip.decompress(raw)
+        payload = json.loads(raw)
+      except (OSError, ValueError):
+        self.reply(400, b'{"error":"bad payload"}')
+        return
+      if isinstance(payload, dict):
+        receiver.ingest(payload)
+      self.reply(200)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+      return
+
+  return Handler
+
+
+def serve(port: int, interval: float) -> int:
+  receiver = Receiver()
+  server = http.server.ThreadingHTTPServer(("127.0.0.1", port), make_handler(receiver))
+  server.daemon_threads = True
+  stop = threading.Event()
+
+  def on_signal(signum: int, frame: Any) -> None:
+    stop.set()
+    threading.Thread(target=server.shutdown, daemon=True).start()
+
+  signal.signal(signal.SIGTERM, on_signal)
+  signal.signal(signal.SIGINT, on_signal)
+
+  def rollup_loop() -> None:
+    while not stop.is_set():
+      try:
+        receiver.rollup()
+      except Exception as error:  # keep receiving even if one rollup fails
+        print(f"omarchy-agent-otel: rollup failed: {error}", file=sys.stderr, flush=True)
+      stop.wait(interval)
+
+  thread = threading.Thread(target=rollup_loop, daemon=True)
+  thread.start()
+  print(f"listening on 127.0.0.1:{server.server_address[1]}", flush=True)
+  server.serve_forever(poll_interval=0.5)
+  server.server_close()
+  stop.set()
+  receiver.rollup()
+  return 0
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(prog="omarchy-agent-otel")
+  commands = parser.add_subparsers(dest="command", required=True)
+  serve_parser = commands.add_parser("serve", help="run the OTLP/HTTP receiver on 127.0.0.1")
+  serve_parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="0 picks a free port")
+  serve_parser.add_argument("--rollup-interval", type=float, default=10.0)
+  commands.add_parser("rollup", help="rebuild summary.json from the event files once")
+  commands.add_parser("status", help="print summary.json")
+  args = parser.parse_args()
+
+  if args.command == "serve":
+    return serve(args.port, max(0.2, args.rollup_interval))
+  if args.command == "rollup":
+    now = time.time()
+    prune_files(now)
+    write_summary_if_changed(build_summary(load_tally(now), AccountMap(), now), "")
+    return 0
+  try:
+    sys.stdout.write(summary_path().read_text(encoding="utf-8"))
+  except OSError:
+    print(f"No telemetry summary at {summary_path()}; is omarchy-agent-otel.service running?", file=sys.stderr)
+    return 1
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())
