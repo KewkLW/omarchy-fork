@@ -289,7 +289,7 @@ def extract_events(payload: dict[str, Any], now: float) -> list[dict[str, Any]]:
             "ok": truthy(attrs.get("success")),
             "ms": number(attrs.get("duration_ms"), int),
           })
-        events.append(event)
+        events.append(SESSION_TAGS.apply(event))
   return events
 
 
@@ -336,7 +336,7 @@ def read_events(now: float, days: int = ROLLUP_DAYS, only: set[str] | None = Non
         except ValueError:
           continue
         if isinstance(event, dict):
-          yield day, event
+          yield day, SESSION_TAGS.apply(event)
 
 
 def append_events(events: list[dict[str, Any]]) -> None:
@@ -391,6 +391,30 @@ def agent_key_of(event: dict[str, Any]) -> str:
     return ""
   project = str(event.get("project") or "")
   return f"{project}/{agent}" if project else agent
+
+
+# A session's project and agent name are fixed for its life (they ride on the
+# resource), so an event missing them takes the ones an earlier event of the
+# same session carried: events written before a tag existed, or backfilled
+# while the session was still running, land under the right agent.
+class SessionTags:
+  def __init__(self) -> None:
+    self.known: dict[str, dict[str, str]] = {}
+
+  def apply(self, event: dict[str, Any]) -> dict[str, Any]:
+    session_id = str(event.get("session") or "")
+    if not session_id:
+      return event
+    if event.get("project"):
+      self.known[session_id] = {k: event[k] for k in ("project", "agent") if event.get(k)}
+      return event
+    tags = self.known.get(session_id)
+    if tags:
+      event.update({k: v for k, v in tags.items() if not event.get(k)})
+    return event
+
+
+SESSION_TAGS = SessionTags()
 
 
 def split_key(key: str) -> tuple[str, str]:
