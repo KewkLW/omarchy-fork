@@ -17,8 +17,9 @@ and /v1/metrics (/v1/traces is accepted and dropped). Of the log events it
 keeps two kinds, and of those only a whitelist of fields:
 
   api_request  ts, session, account uuid, model, cost_usd, input / output /
-               cache-read / cache-creation tokens, and the bounty.id,
-               bounty.slot, bounty.attempt and ticket resource attributes
+               cache-read / cache-creation tokens, and the project,
+               agent.name, bounty.id, bounty.slot, bounty.attempt and
+               ticket resource attributes
   tool_result  ts, session, account uuid, tool name, success, duration, and
                the same tags
 
@@ -82,7 +83,9 @@ HISTORY_WRITE_SECONDS = 60
 HISTORY_TOP_BOUNTIES = 20
 MAX_BODY_BYTES = 32 * 1024 * 1024
 COST_BASIS = "API list price equivalent"
-TAG_KEYS = {"bounty.id": "bounty", "bounty.slot": "slot", "bounty.attempt": "attempt", "ticket": "ticket", "slot": "slot"}
+TAG_KEYS = {"bounty.id": "bounty", "bounty.slot": "slot", "bounty.attempt": "attempt", "ticket": "ticket", "slot": "slot",
+            "project": "project", "agent.name": "agent"}
+TAG_FIELDS = ("project", "agent", "bounty", "slot", "attempt", "ticket")
 
 
 def state_dir() -> Path:
@@ -370,6 +373,51 @@ def add_to(bucket: dict[str, Any], cost: float, tokens: int, requests: int = 1) 
   bucket["requests"] += requests
 
 
+# Bounty ids and slot ids repeat from one board to the next, so a bounty or an
+# agent is keyed "<project>/<id>" whenever the event carries a project tag.
+# An agent is its stable name for the project's life (agent.name); a slot id
+# stands in for events from before names existed.
+def bounty_key_of(event: dict[str, Any]) -> str:
+  bounty = str(event.get("bounty") or event.get("ticket") or "")
+  if not bounty:
+    return ""
+  project = str(event.get("project") or "")
+  return f"{project}/{bounty}" if project else bounty
+
+
+def agent_key_of(event: dict[str, Any]) -> str:
+  agent = str(event.get("agent") or event.get("slot") or "")
+  if not agent:
+    return ""
+  project = str(event.get("project") or "")
+  return f"{project}/{agent}" if project else agent
+
+
+def split_key(key: str) -> tuple[str, str]:
+  project, sep, name = str(key).partition("/")
+  return (project, name) if sep else ("", project)
+
+
+def model_bucket_of(value: Any) -> dict[str, Any]:
+  """A per-model entry as a bucket: month files from before tokens were kept per
+  model hold a bare cost number."""
+  if isinstance(value, dict):
+    return {"costUsd": number(value.get("costUsd")), "tokens": number(value.get("tokens"), int), "requests": number(value.get("requests"), int)}
+  return {"costUsd": number(value), "tokens": 0, "requests": 0}
+
+
+def tagged_entry() -> dict[str, Any]:
+  return dict(empty_bucket(), sessions=set(), models={})
+
+
+def add_tagged(entry: dict[str, Any], cost: float, tokens: int, requests: int, session_id: str, model_name: str) -> None:
+  add_to(entry, cost, tokens, requests)
+  if session_id:
+    entry["sessions"].add(session_id)
+  if model_name:
+    add_to(entry["models"].setdefault(model_name, empty_bucket()), cost, tokens, requests)
+
+
 # Running totals, updated as events arrive, so a rollup costs as much as
 # there are sessions and bounties rather than events: a week of a busy board
 # is hundreds of thousands of events, and the rollup runs every few seconds.
@@ -398,7 +446,7 @@ class Tally:
       }
     if ts > session["last"]:
       session["last"] = ts
-    for field in ("bounty", "slot", "attempt", "ticket"):
+    for field in TAG_FIELDS:
       if event.get(field):
         session["tags"][field] = event[field]
 
@@ -424,16 +472,15 @@ class Tally:
 
     bucket = self.days.setdefault(day or day_of(ts), {}).get(uuid)
     if bucket is None:
-      bucket = self.days[day or day_of(ts)][uuid] = dict(empty_bucket(), models={}, bounties={})
+      bucket = self.days[day or day_of(ts)][uuid] = dict(empty_bucket(), models={}, bounties={}, agents={})
     add_to(bucket, cost, tokens)
     add_to(bucket["models"].setdefault(model_name or "unknown", empty_bucket()), cost, tokens)
-    bounty_key = str(event.get("bounty") or event.get("ticket") or "")
+    bounty_key = bounty_key_of(event)
     if bounty_key:
-      entry = bucket["bounties"].get(bounty_key)
-      if entry is None:
-        entry = bucket["bounties"][bounty_key] = dict(empty_bucket(), sessions=set())
-      add_to(entry, cost, tokens)
-      entry["sessions"].add(session_id)
+      add_tagged(bucket["bounties"].setdefault(bounty_key, tagged_entry()), cost, tokens, 1, session_id, model_name or "unknown")
+    agent_key = agent_key_of(event)
+    if agent_key:
+      add_tagged(bucket["agents"].setdefault(agent_key, tagged_entry()), cost, tokens, 1, session_id, model_name or "unknown")
 
   def expire(self, now: float) -> None:
     first_day = (dt.datetime.fromtimestamp(now).date() - dt.timedelta(days=ROLLUP_DAYS - 1)).strftime("%Y-%m-%d")
@@ -476,7 +523,7 @@ def build_summary(tally: Tally, accounts: AccountMap, now: float) -> dict[str, A
     record_id = accounts.resolve(uuid)
     acc = per_account.get(record_id)
     if acc is None:
-      acc = per_account[record_id] = {"uuid": uuid, "today": empty_bucket(), "models": {}, "bounties": {}, "live": []}
+      acc = per_account[record_id] = {"uuid": uuid, "today": empty_bucket(), "models": {}, "bounties": {}, "agents": {}, "live": []}
     return acc
 
   for day, buckets in tally.days.items():
@@ -486,12 +533,13 @@ def build_summary(tally: Tally, accounts: AccountMap, now: float) -> dict[str, A
         add_to(acc["today"], bucket["costUsd"], bucket["tokens"], bucket["requests"])
       for name, model in bucket["models"].items():
         add_to(acc["models"].setdefault(name, empty_bucket()), model["costUsd"], model["tokens"], model["requests"])
-      for name, bounty in bucket["bounties"].items():
-        entry = acc["bounties"].get(name)
-        if entry is None:
-          entry = acc["bounties"][name] = dict(empty_bucket(), sessions=set())
-        add_to(entry, bounty["costUsd"], bounty["tokens"], bounty["requests"])
-        entry["sessions"] |= bounty["sessions"]
+      for group in ("bounties", "agents"):
+        for name, source in bucket[group].items():
+          entry = acc[group].setdefault(name, tagged_entry())
+          add_to(entry, source["costUsd"], source["tokens"], source["requests"])
+          entry["sessions"] |= source["sessions"]
+          for model_name, model in source["models"].items():
+            add_to(entry["models"].setdefault(model_name, empty_bucket()), model["costUsd"], model["tokens"], model["requests"])
 
   for (uuid, session_id), session in tally.sessions.items():
     if session["last"] < live_since:
@@ -526,6 +574,14 @@ def build_summary(tally: Tally, accounts: AccountMap, now: float) -> dict[str, A
       {"model": key, "costUsd": round(m["costUsd"], 6), "tokens": m["tokens"], "requests": m["requests"]}
       for key, m in acc["models"].items()
     ), key=lambda r: -r["costUsd"])
+    agents = []
+    for key, a in acc["agents"].items():
+      project, name = split_key(key)
+      top_model = max(a["models"].items(), key=lambda kv: kv[1]["costUsd"])[0] if a["models"] else ""
+      agents.append({"agent": key, "project": project, "name": name, "model": top_model, "costUsd": round(a["costUsd"], 6),
+                     "tokens": a["tokens"], "requests": a["requests"], "sessions": len(a["sessions"]),
+                     "live": any(agent_key_of(r) == key and r["lastActivityMs"] >= live_since * 1000 for r in live)})
+    agents.sort(key=lambda r: -r["costUsd"])
     total_today += acc["today"]["costUsd"]
     out_accounts[record_id] = {
       "id": record_id,
@@ -534,10 +590,11 @@ def build_summary(tally: Tally, accounts: AccountMap, now: float) -> dict[str, A
       "live": live,
       "byBounty": bounties[:20],
       "byModel": models,
+      "byAgent": agents,
     }
 
   return {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "costBasis": COST_BASIS,
     "costNote": "cost_usd as Claude Code reports it: API list prices, not what a subscription bills",
     "windowDays": ROLLUP_DAYS,
@@ -625,17 +682,16 @@ class History:
     model_name = str(event.get("model") or "") or "unknown"
     bucket = self.days.setdefault(day, {}).get(uuid)
     if bucket is None:
-      bucket = self.days[day][uuid] = dict(empty_bucket(), models={}, bounties={})
+      bucket = self.days[day][uuid] = dict(empty_bucket(), models={}, bounties={}, agents={})
     add_to(bucket, cost, tokens)
     add_to(bucket["models"].setdefault(model_name, empty_bucket()), cost, tokens)
-    bounty_key = str(event.get("bounty") or event.get("ticket") or "")
+    session_id = str(event.get("session") or "")
+    bounty_key = bounty_key_of(event)
     if bounty_key:
-      entry = bucket["bounties"].get(bounty_key)
-      if entry is None:
-        entry = bucket["bounties"][bounty_key] = dict(empty_bucket(), sessions=set(), models={})
-      add_to(entry, cost, tokens)
-      entry["sessions"].add(str(event.get("session") or ""))
-      entry["models"][model_name] = entry["models"].get(model_name, 0.0) + cost
+      add_tagged(bucket["bounties"].setdefault(bounty_key, tagged_entry()), cost, tokens, 1, session_id, model_name)
+    agent_key = agent_key_of(event)
+    if agent_key:
+      add_tagged(bucket["agents"].setdefault(agent_key, tagged_entry()), cost, tokens, 1, session_id, model_name)
     self.dirty.add(day)
 
   def expire(self, now: float) -> None:
@@ -652,18 +708,24 @@ class History:
       record_id = accounts.resolve(uuid)
       row = merged.get(record_id)
       if row is None:
-        row = merged[record_id] = {"uuid": uuid, "total": empty_bucket(), "models": {}, "bounties": {}}
+        row = merged[record_id] = {"uuid": uuid, "total": empty_bucket(), "models": {}, "bounties": {}, "agents": {}}
       add_to(row["total"], bucket["costUsd"], bucket["tokens"], bucket["requests"])
       for name, model in bucket["models"].items():
         add_to(row["models"].setdefault(name, empty_bucket()), model["costUsd"], model["tokens"], model["requests"])
-      for name, bounty in bucket["bounties"].items():
-        entry = row["bounties"].get(name)
-        if entry is None:
-          entry = row["bounties"][name] = dict(empty_bucket(), sessions=set(), models={})
-        add_to(entry, bounty["costUsd"], bounty["tokens"], bounty["requests"])
-        entry["sessions"] |= bounty["sessions"]
-        for model_name, cost in bounty["models"].items():
-          entry["models"][model_name] = entry["models"].get(model_name, 0.0) + cost
+      for group in ("bounties", "agents"):
+        for name, source in bucket[group].items():
+          entry = row[group].setdefault(name, tagged_entry())
+          add_to(entry, source["costUsd"], source["tokens"], source["requests"])
+          entry["sessions"] |= source["sessions"]
+          for model_name, model in source["models"].items():
+            add_to(entry["models"].setdefault(model_name, empty_bucket()), model["costUsd"], model["tokens"], model["requests"])
+
+    def tagged_rows(group: dict[str, dict[str, Any]]) -> dict[str, Any]:
+      return {
+        name: dict(round_bucket(b), sessions=len(b["sessions"]), byModel={k: round_bucket(v) for k, v in sorted(b["models"].items())})
+        for name, b in sorted(group.items())
+      }
+
     out = []
     for record_id, row in sorted(merged.items()):
       out.append(dict(
@@ -672,10 +734,8 @@ class History:
         account=record_id,
         accountUuid=row["uuid"],
         byModel={name: round_bucket(m) for name, m in sorted(row["models"].items())},
-        byBounty={
-          name: dict(round_bucket(b), sessions=len(b["sessions"]), byModel={k: round(v, 6) for k, v in sorted(b["models"].items())})
-          for name, b in sorted(row["bounties"].items())
-        },
+        byBounty=tagged_rows(row["bounties"]),
+        byAgent=tagged_rows(row["agents"]),
       ))
     return out
 
@@ -799,9 +859,10 @@ def history_report(range_name: str, now: float) -> dict[str, Any]:
     per_day = []
     models: dict[str, dict[str, Any]] = {}
     bounties: dict[str, dict[str, Any]] = {}
+    agents: dict[str, dict[str, Any]] = {}
     model_bounties: dict[str, set[str]] = {}
     total = empty_bucket()
-    for day in dates:
+    for day_index, day in enumerate(dates):
       row = rows.get((day, account_id))
       if not row:
         per_day.append({"day": day, "costUsd": 0, "tokens": 0, "requests": 0, "byModel": {}})
@@ -811,29 +872,45 @@ def history_report(range_name: str, now: float) -> dict[str, Any]:
       add_to(total, number(row.get("costUsd")), number(row.get("tokens"), int), number(row.get("requests"), int))
       for name, model in (row.get("byModel") or {}).items():
         add_to(models.setdefault(name, empty_bucket()), number(model.get("costUsd")), number(model.get("tokens"), int), number(model.get("requests"), int))
-      for name, bounty in (row.get("byBounty") or {}).items():
-        entry = bounties.setdefault(name, dict(empty_bucket(), sessions=0, models={}))
-        add_to(entry, number(bounty.get("costUsd")), number(bounty.get("tokens"), int), number(bounty.get("requests"), int))
-        # Sessions are counted per day; a session crossing midnight counts twice.
-        entry["sessions"] += number(bounty.get("sessions"), int)
-        for model_name, cost in (bounty.get("byModel") or {}).items():
-          entry["models"][model_name] = entry["models"].get(model_name, 0.0) + number(cost)
-          model_bounties.setdefault(model_name, set()).add(name)
+      for group, target in (("byBounty", bounties), ("byAgent", agents)):
+        for name, source in (row.get(group) or {}).items():
+          entry = target.setdefault(name, dict(empty_bucket(), sessions=0, models={}, perDay=[None] * len(dates)))
+          cost, tokens, requests = number(source.get("costUsd")), number(source.get("tokens"), int), number(source.get("requests"), int)
+          add_to(entry, cost, tokens, requests)
+          # Sessions are counted per day; a session crossing midnight counts twice.
+          entry["sessions"] += number(source.get("sessions"), int)
+          entry["perDay"][day_index] = {"day": day, "costUsd": round(cost, 6), "tokens": tokens, "requests": requests}
+          for model_name, value in (source.get("byModel") or {}).items():
+            model = model_bucket_of(value)
+            add_to(entry["models"].setdefault(model_name, empty_bucket()), model["costUsd"], model["tokens"], model["requests"])
+            if group == "byBounty":
+              model_bounties.setdefault(model_name, set()).add(name)
+
+    def filled(entry: dict[str, Any]) -> list[dict[str, Any]]:
+      return [p or {"day": dates[i], "costUsd": 0, "tokens": 0, "requests": 0} for i, p in enumerate(entry["perDay"])]
+
+    def models_out(entry: dict[str, Any]) -> dict[str, Any]:
+      return {k: round_bucket(v) for k, v in sorted(entry["models"].items(), key=lambda kv: -kv[1]["costUsd"])}
+
+    def top_model(entry: dict[str, Any]) -> str:
+      return max(entry["models"].items(), key=lambda kv: kv[1]["costUsd"])[0] if entry["models"] else ""
 
     by_bounty = []
     for name, b in sorted(bounties.items(), key=lambda kv: -kv[1]["costUsd"])[:HISTORY_TOP_BOUNTIES]:
-      top_model = max(b["models"].items(), key=lambda kv: kv[1])[0] if b["models"] else ""
-      by_bounty.append(dict(round_bucket(b), bounty=name, sessions=b["sessions"], model=top_model,
-                            byModel={k: round(v, 6) for k, v in sorted(b["models"].items(), key=lambda kv: -kv[1])}))
+      project, bounty_id = split_key(name)
+      by_bounty.append(dict(round_bucket(b), bounty=name, project=project, id=bounty_id, sessions=b["sessions"], model=top_model(b),
+                            byModel=models_out(b)))
     by_model = []
     for name, m in sorted(models.items(), key=lambda kv: -kv[1]["costUsd"]):
       # What a bounty costs when this model works it: the model's spend on
       # tagged requests over the bounties it touched. Untagged spend is left
       # out, and a bounty worked by two models counts for both.
-      tagged = sum(b["models"].get(name, 0.0) for b in bounties.values())
+      tagged = sum(b["models"][name]["costUsd"] for b in bounties.values() if name in b["models"])
+      tagged_tokens = sum(b["models"][name]["tokens"] for b in bounties.values() if name in b["models"])
       worked = len(model_bounties.get(name, ()))
       by_model.append(dict(round_bucket(m), model=name, bounties=worked,
-                           costPerBountyUsd=round(tagged / worked, 6) if worked else 0))
+                           costPerBountyUsd=round(tagged / worked, 6) if worked else 0,
+                           tokensPerBounty=int(tagged_tokens / worked) if worked else 0))
 
     # Every range reaches back at least a week.
     week = sum(d["costUsd"] for d in per_day if d["day"] >= week_first)
@@ -852,6 +929,27 @@ def history_report(range_name: str, now: float) -> dict[str, Any]:
     if before:
       in_range.insert(0, dict(before[-1], ts=first_ts, carried=True))
 
+    # One row per agent for the project's life, with its own day series so
+    # the window can draw one agent, or several side by side.
+    by_agent = []
+    live_keys = {agent_key_of(r) for r in live if isinstance(r, dict)}
+    for name, a in sorted(agents.items(), key=lambda kv: -kv[1]["costUsd"]):
+      project, agent_name = split_key(name)
+      by_agent.append(dict(round_bucket(a), agent=name, project=project, name=agent_name, sessions=a["sessions"], model=top_model(a),
+                           live=name in live_keys, byModel=models_out(a), perDay=filled(a)))
+    projects: dict[str, dict[str, Any]] = {}
+    for name, a in agents.items():
+      project, _ = split_key(name)
+      entry = projects.setdefault(project, dict(empty_bucket(), agents=0, bounties=0))
+      add_to(entry, a["costUsd"], a["tokens"], a["requests"])
+      entry["agents"] += 1
+    for name in bounties:
+      project, _ = split_key(name)
+      if project in projects:
+        projects[project]["bounties"] += 1
+    by_project = [dict(round_bucket(p), project=name, agents=p["agents"], bounties=p["bounties"])
+                  for name, p in sorted(projects.items(), key=lambda kv: -kv[1]["costUsd"])]
+
     today_row = rows.get((today, account_id)) or {}
     out_accounts.append({
       "id": account_id,
@@ -866,13 +964,15 @@ def history_report(range_name: str, now: float) -> dict[str, Any]:
       "perDay": per_day,
       "byBounty": by_bounty,
       "byModel": by_model,
+      "byAgent": by_agent,
+      "byProject": by_project,
       "live": sorted(live, key=lambda r: (not r.get("looping"), -number(r.get("lastActivityMs")))),
       "looping": sum(1 for r in live if r.get("looping")),
       "limits": [{k: v for k, v in p.items() if k in ("ts", "session", "weekly", "models", "carried")} for p in in_range],
     })
 
   return {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "costBasis": COST_BASIS,
     "range": range_name,
     "from": dates[0] if dates else today,

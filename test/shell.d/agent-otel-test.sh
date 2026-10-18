@@ -91,9 +91,9 @@ def record(name, ns, overrides):
   return r
 
 s = lambda v: {"stringValue": v}
-tags_a = {"bounty.id": s("B-101"), "bounty.slot": s("s2"), "bounty.attempt": s("3"), "ticket": None}
-tags_b = {"bounty.id": None, "bounty.slot": None, "bounty.attempt": None, "ticket": s("T-7")}
-tags_c = {"bounty.id": s("B-202"), "bounty.slot": s("s1"), "bounty.attempt": s("1"), "ticket": None}
+tags_a = {"project": s("alpha"), "agent.name": s("Mercury"), "bounty.id": s("B-101"), "bounty.slot": s("s2"), "bounty.attempt": s("3"), "ticket": None}
+tags_b = {"project": None, "agent.name": None, "bounty.id": None, "bounty.slot": None, "bounty.attempt": None, "ticket": s("T-7")}
+tags_c = {"project": s("beta"), "agent.name": s("Azoth"), "bounty.id": s("B-202"), "bounty.slot": s("s1"), "bounty.attempt": s("1"), "ticket": None}
 
 def ident(session, uuid, tags):
   return dict(tags, **{"session.id": s(session), "user.account_uuid": s(uuid)})
@@ -120,7 +120,7 @@ records.append(record("claude_code.api_request", t + 200, dict(c, cost_usd={"dou
 
 # The resource carries no tags of its own here, so attribution has to come
 # from the record attributes; session B must not inherit A's bounty.
-resource_logs["resource"]["attributes"] = [x for x in resource_logs["resource"]["attributes"] if x["key"] not in ("bounty.id", "bounty.slot", "bounty.attempt", "ticket")]
+resource_logs["resource"]["attributes"] = [x for x in resource_logs["resource"]["attributes"] if x["key"] not in ("project", "agent.name", "bounty.id", "bounty.slot", "bounty.attempt", "ticket")]
 resource_logs["scopeLogs"][0]["logRecords"] = records
 json.dump(template, open(out, "w"))
 PY
@@ -159,9 +159,12 @@ check "summary labels costs as API list price equivalent" '.costBasis == "API li
 check "accounts map to the panel's record ids" '(.accounts | keys) == ["claude", "claude-extra"]'
 check "today's cost totals every account" '(.todayCostUsd * 1000 | round) == 2850'
 check "today's cost per account" '(.accounts.claude.today.costUsd * 1000 | round) == 850 and .accounts.claude.today.requests == 3'
-check "cost is attributed to the bounty id" '.accounts.claude.byBounty[0] | .bounty == "B-101" and (.costUsd * 100 | round) == 75 and .sessions == 1'
+check "cost is attributed to the bounty id under its project" '.accounts.claude.byBounty[0] | .bounty == "alpha/B-101" and (.costUsd * 100 | round) == 75 and .sessions == 1'
+check "cost and tokens are attributed to the named agent under its project" \
+  '.accounts.claude.byAgent[0] | .agent == "alpha/Mercury" and .project == "alpha" and .name == "Mercury" and (.costUsd * 100 | round) == 75 and .tokens >= 150 and .sessions == 1 and .live == true and .model == "claude-opus-4-8"'
+check "a live session carries its project and agent name" '[.accounts.claude.live[] | select(.session == "aaaaaaaa")][0] | .project == "alpha" and .agent == "Mercury"'
 check "a ticket stands in for a missing bounty id" '[.accounts.claude.byBounty[] | select(.bounty == "T-7")] | length == 1'
-check "the extra account keeps its own bounty" '.accounts["claude-extra"].byBounty | length == 1 and .[0].bounty == "B-202" and .[0].costUsd == 2'
+check "the extra account keeps its own bounty" '.accounts["claude-extra"].byBounty | length == 1 and .[0].bounty == "beta/B-202" and .[0].costUsd == 2'
 check "cost by model is split per model" '[.accounts.claude.byModel[].model] == ["claude-opus-4-8", "claude-haiku-4-5-20251001"]'
 check "string token counts are read as numbers" '[.accounts.claude.live[] | select(.session == "aaaaaaaa")][0].tokens >= 150'
 check "a session failing the same tool over and over is flagged looping" \
@@ -213,8 +216,8 @@ old=$(date -d '20 days ago' +%F)
 # untagged request.
 noon=$(date -d "$yday 12:00" +%s)
 {
-  printf '{"kind":"api","ts":%s,"session":"s-9","account":"%s","bounty":"B-9","model":"claude-opus-4-8","cost":1.25,"in":10,"out":20,"cacheRead":0,"cacheWrite":0}\n' "$noon" "$main_uuid"
-  printf '{"kind":"api","ts":%s,"session":"s-9","account":"%s","bounty":"B-9","model":"claude-haiku-4-5","cost":0.25,"in":1,"out":2,"cacheRead":3,"cacheWrite":4}\n' "$((noon + 60))" "$main_uuid"
+  printf '{"kind":"api","ts":%s,"session":"s-9","account":"%s","project":"alpha","agent":"Mercury","bounty":"B-9","slot":"s2","model":"claude-opus-4-8","cost":1.25,"in":10,"out":20,"cacheRead":0,"cacheWrite":0}\n' "$noon" "$main_uuid"
+  printf '{"kind":"api","ts":%s,"session":"s-9","account":"%s","project":"alpha","agent":"Mercury","bounty":"B-9","slot":"s2","model":"claude-haiku-4-5","cost":0.25,"in":1,"out":2,"cacheRead":3,"cacheWrite":4}\n' "$((noon + 60))" "$main_uuid"
   printf '{"kind":"api","ts":%s,"session":"s-0","account":"%s","model":"claude-opus-4-8","cost":0.5,"in":1,"out":1,"cacheRead":0,"cacheWrite":0}\n' "$((noon + 120))" "$main_uuid"
   printf '{"kind":"tool","ts":%s,"session":"s-9","account":"%s","tool":"Bash","ok":true,"ms":5}\n' "$((noon + 130))" "$main_uuid"
 } >"$otel_dir/events-$yday.jsonl"
@@ -222,7 +225,7 @@ noon=$(date -d "$yday 12:00" +%s)
 # A day whose event file is long gone, as an earlier receiver left it.
 old_line() {
   mkdir -p "$history_dir"
-  printf '{"account":"claude","accountUuid":"%s","byBounty":{},"byModel":{"claude-opus-4-8":{"costUsd":7,"requests":1,"tokens":70}},"costUsd":7,"day":"%s","requests":1,"tokens":70}\n' \
+  printf '{"account":"claude","accountUuid":"%s","byBounty":{"B-old":{"byModel":{"claude-opus-4-8":7},"costUsd":7,"requests":1,"sessions":1,"tokens":70}},"byModel":{"claude-opus-4-8":{"costUsd":7,"requests":1,"tokens":70}},"costUsd":7,"day":"%s","requests":1,"tokens":70}\n' \
     "$main_uuid" "$old" >>"$history_dir/${old:0:7}.jsonl"
 }
 old_line
@@ -240,9 +243,13 @@ hline "$yday" claude | jq -e '(.costUsd * 100 | round) == 200 and .requests == 3
   fail "a day's rollup totals its requests" "$(hline "$yday" claude)"
 pass "a day's rollup totals its requests"
 
-hline "$yday" claude | jq -e '.byBounty["B-9"] | (.costUsd * 100 | round) == 150 and .sessions == 1 and .byModel["claude-opus-4-8"] == 1.25 and .byModel["claude-haiku-4-5"] == 0.25' >/dev/null ||
-  fail "a day's rollup splits each bounty by model" "$(hline "$yday" claude)"
-pass "a day's rollup splits each bounty by model"
+hline "$yday" claude | jq -e '.byBounty["alpha/B-9"] | (.costUsd * 100 | round) == 150 and .sessions == 1 and .byModel["claude-opus-4-8"].costUsd == 1.25 and .byModel["claude-opus-4-8"].tokens == 30 and .byModel["claude-haiku-4-5"].costUsd == 0.25' >/dev/null ||
+  fail "a day's rollup splits each bounty by model, cost and tokens" "$(hline "$yday" claude)"
+pass "a day's rollup splits each bounty by model, cost and tokens"
+
+hline "$yday" claude | jq -e '.byAgent["alpha/Mercury"] | (.costUsd * 100 | round) == 150 and .tokens == 40 and .requests == 2 and .sessions == 1 and .byModel["claude-opus-4-8"].tokens == 30' >/dev/null ||
+  fail "a day's rollup totals each named agent under its project" "$(hline "$yday" claude)"
+pass "a day's rollup totals each named agent under its project"
 
 hline "$yday" claude | jq -e '.byModel | keys == ["claude-haiku-4-5", "claude-opus-4-8"]' >/dev/null ||
   fail "a day's rollup splits cost by model" "$(hline "$yday" claude)"
@@ -330,8 +337,16 @@ hcheck "history reads each day's cost from the rollup" \
   "[.accounts[] | select(.id == \"claude\") | .perDay[] | select(.day == \"$yday\")][0] | (.costUsd * 100 | round) == 200"
 hcheck "history keeps days older than the raw events" \
   "[.accounts[] | select(.id == \"claude\") | .perDay[] | select(.day == \"$old\")][0].costUsd == 7"
-hcheck "history ranks bounties over the range" \
-  '[.accounts[] | select(.id == "claude")][0].byBounty | map(.bounty) | index("B-9") != null'
+hcheck "history ranks bounties over the range, old rows with bare costs included" \
+  '[.accounts[] | select(.id == "claude")][0].byBounty | map(.bounty) | index("alpha/B-9") != null and index("B-old") != null'
+hcheck "history splits a bounty's project from its id" \
+  '[.accounts[] | select(.id == "claude")][0].byBounty | map(select(.bounty == "alpha/B-9"))[0] | .project == "alpha" and .id == "B-9" and .byModel["claude-opus-4-8"].tokens == 30'
+hcheck "history lists each named agent with a day series over the whole range" \
+  "[.accounts[] | select(.id == \"claude\")][0].byAgent | map(select(.agent == \"alpha/Mercury\"))[0] | .project == \"alpha\" and .name == \"Mercury\" and (.perDay | length) == 30 and ([.perDay[] | select(.day == \"$yday\")][0].tokens == 40) and ([.perDay[] | select(.day == \"$today\")][0].costUsd > 0) and .live == true"
+hcheck "history totals each project" \
+  '[.accounts[] | select(.id == "claude")][0].byProject | map(select(.project == "alpha"))[0] | .agents == 1 and .bounties == 2 and .costUsd > 2'
+hcheck "history derives tokens per bounty by model" \
+  '[.accounts[] | select(.id == "claude")][0].byModel | map(select(.model == "claude-haiku-4-5"))[0] | .tokensPerBounty == 10'
 hcheck "history derives cost per bounty by model" \
   '[.accounts[] | select(.id == "claude")][0].byModel | map(select(.model == "claude-haiku-4-5"))[0] | .bounties == 1 and .costPerBountyUsd == 0.25'
 hcheck "history carries the limit history per account" \
