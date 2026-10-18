@@ -18,7 +18,13 @@ FocusScope {
   signal closeRequested()
 
   property string range: "30d"
+  // What the bounty and agent views count: API-equivalent cost or tokens.
+  property string metric: "costUsd"
   property string selectedAccountId: ""
+  // Agents picked in the table: a click keeps one, Ctrl+click adds or drops
+  // one, and the agent chart draws every picked one side by side.
+  property var selectedAgents: []
+  property string projectFilter: ""
   property var report: null
   property string errorText: ""
   property double nowMs: Date.now()
@@ -52,6 +58,26 @@ FocusScope {
   readonly property var limitSeries: buildLimitSeries(account)
   readonly property var live: account && Array.isArray(account.live) ? account.live : []
   readonly property bool hasTelemetry: !!account && account.hasTelemetry === true
+  readonly property var agents: account && Array.isArray(account.byAgent) ? account.byAgent : []
+  readonly property var projects: account && Array.isArray(account.byProject) ? account.byProject : []
+  readonly property var shownAgents: {
+    var out = []
+    for (var i = 0; i < agents.length; i++)
+      if (projectFilter === "" || String(agents[i].project || "") === projectFilter) out.push(agents[i])
+    out.sort(function(a, b) { return Number(b[metric] || 0) - Number(a[metric] || 0) })
+    return out
+  }
+  // The chart's agents: the picked ones, or the three biggest when none is.
+  readonly property var chartedAgents: {
+    var out = []
+    if (selectedAgents.length > 0) {
+      for (var i = 0; i < agents.length; i++)
+        if (selectedAgents.indexOf(String(agents[i].agent)) >= 0) out.push(agents[i])
+      return out
+    }
+    return shownAgents.slice(0, 3)
+  }
+  readonly property var agentSeries: buildAgentSeries(chartedAgents, metric)
 
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
@@ -82,6 +108,51 @@ FocusScope {
     if (index === 2) return alpha(foreground, accentUsable ? 0.5 : 0.36)
     return alpha(foreground, 0.3)
   }
+
+  function metricIsMoney() { return metric === "costUsd" }
+  function metricWord() { return metricIsMoney() ? "cost" : "tokens" }
+  function formatMetric(value) { return metricIsMoney() ? formatMoney(value) : Format.formatTokenCount(Number(value || 0)) }
+  function formatMetricShort(value) { return metricIsMoney() ? formatMoneyShort(value) : Format.formatTokenCount(Number(value || 0)).replace(".0", "") }
+  function toggleMetric() { metric = metricIsMoney() ? "tokens" : "costUsd" }
+
+  // Colours for agents drawn together: the two theme colours first, then
+  // hues stepped around the wheel from the accent so each line stays apart.
+  function agentColor(index) {
+    if (index === 0) return foreground
+    if (index === 1) return accentUsable ? accent : alpha(foreground, 0.6)
+    var base = accentUsable ? accent : foreground
+    var hue = (base.hslHue < 0 ? 0.6 : base.hslHue) + 0.17 * (index - 1)
+    return Qt.hsla(hue - Math.floor(hue), 0.55, luminance(surface) > 0.5 ? 0.42 : 0.66, 1)
+  }
+
+  function buildAgentSeries(list, field) {
+    var out = []
+    for (var i = 0; i < list.length; i++) {
+      var a = list[i]
+      var perDay = Array.isArray(a.perDay) ? a.perDay : []
+      var values = []
+      for (var d = 0; d < perDay.length; d++) values.push(Number(perDay[d][field] || 0))
+      out.push({ key: String(a.agent), name: agentTitle(a), color: agentColor(i), values: values })
+    }
+    return out
+  }
+
+  function agentTitle(a) {
+    if (!a) return ""
+    var name = String(a.name || a.agent || "")
+    return a.project ? name + " · " + a.project : name
+  }
+
+  function selectAgent(key, extend) {
+    key = String(key)
+    var next = extend ? selectedAgents.slice() : []
+    var at = next.indexOf(key)
+    if (at >= 0) next.splice(at, 1)
+    else if (extend || selectedAgents.indexOf(key) < 0 || selectedAgents.length > 1) next.push(key)
+    selectedAgents = next
+  }
+
+  function clearAgents() { selectedAgents = [] }
 
   function formatMoney(value) {
     var amount = Number(value)
@@ -200,12 +271,16 @@ FocusScope {
 
   function sessionTitle(s) {
     if (!s) return ""
+    var who = String(s.agent || s.slot || "")
+    var where = String(s.project || "")
     if (String(s.bounty || "") !== "") {
-      var title = String(s.bounty)
-      if (String(s.slot || "") !== "") title += " · " + s.slot
+      var title = who !== "" ? who : "Session " + String(s.session || "")
+      if (where !== "") title += " · " + where
+      title += " · #" + s.bounty
       if (String(s.attempt || "") !== "") title += " #" + s.attempt
       return title
     }
+    if (who !== "") return where !== "" ? who + " · " + where : who
     if (String(s.ticket || "") !== "") return String(s.ticket)
     return "Session " + String(s.session || "")
   }
@@ -290,6 +365,8 @@ FocusScope {
     else if (t === "2") root.setRange("30d")
     else if (t === "3") root.setRange("all")
     else if (t === "r") root.refresh()
+    else if (t === "t") root.toggleMetric()
+    else if (t === "c") root.clearAgents()
     else return
     event.accepted = true
   }
@@ -325,7 +402,7 @@ FocusScope {
         Column {
           id: titleColumn
           anchors.left: parent.left
-          anchors.right: rangeGroup.left
+          anchors.right: metricGroup.left
           anchors.rightMargin: Style.space(12)
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(2)
@@ -348,6 +425,25 @@ FocusScope {
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
           }
+        }
+
+        ButtonGroup {
+          id: metricGroup
+          anchors.right: rangeGroup.left
+          anchors.rightMargin: Style.space(18)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.spacing.md
+          options: [
+            { value: "costUsd", label: "Cost", tooltip: "Key t toggles" },
+            { value: "tokens", label: "Tokens", tooltip: "Key t toggles" }
+          ]
+          value: root.metric
+          focusable: false
+          foreground: root.foreground
+          background: root.surface
+          fontFamily: root.fontFamily
+          fontSize: Style.font.bodySmall
+          onChanged: function(v) { root.metric = v }
         }
 
         ButtonGroup {
@@ -421,13 +517,13 @@ FocusScope {
           width: tiles.tileWidth
           label: "TODAY"
           value: root.hasTelemetry ? root.formatMoney(root.account.todayUsd) : "—"
-          detail: "API-equivalent"
+          detail: root.hasTelemetry ? Format.formatTokenCount(root.dayTokens(0)) + " tokens · API-equivalent" : "API-equivalent"
         }
         Tile {
           width: tiles.tileWidth
           label: "LAST 7 DAYS"
           value: root.hasTelemetry ? root.formatMoney(root.account.weekUsd) : "—"
-          detail: root.hasTelemetry ? root.formatMoney(root.account.rangeUsd) + " over " + root.rangeLabel() : "No telemetry for this account"
+          detail: root.hasTelemetry ? Format.formatTokenCount(root.dayTokens(7)) + " tokens · " + root.formatMoney(root.account.rangeUsd) + " over " + root.rangeLabel() : "No telemetry for this account"
         }
         Tile {
           width: tiles.tileWidth
@@ -553,7 +649,7 @@ FocusScope {
 
         ChartCard {
           width: charts.cellWidth
-          title: "COST BY BOUNTY · TOP " + Math.min(12, root.account && root.account.byBounty ? root.account.byBounty.length : 0)
+          title: (root.metricIsMoney() ? "COST" : "TOKENS") + " BY BOUNTY · TOP " + Math.min(12, root.account && root.account.byBounty ? root.account.byBounty.length : 0)
           summary: root.rangeLabel()
           legend: []
 
@@ -566,8 +662,8 @@ FocusScope {
 
         ChartCard {
           width: charts.cellWidth
-          title: "COST PER BOUNTY · BY MODEL"
-          summary: "tagged spend ÷ bounties worked"
+          title: (root.metricIsMoney() ? "COST" : "TOKENS") + " PER BOUNTY · BY MODEL"
+          summary: "tagged " + root.metricWord() + " ÷ bounties worked"
           legend: []
 
           BarList {
@@ -584,6 +680,113 @@ FocusScope {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+          }
+        }
+      }
+
+      // ---------- Agents ----------
+      PanelSeparator {
+        visible: charts.visible
+        width: parent.width
+        foreground: root.foreground
+      }
+
+      Column {
+        id: agentSection
+        visible: root.hasTelemetry
+        width: parent.width
+        spacing: Style.spacing.md
+
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(agentHeader.implicitHeight, projectGroup.implicitHeight)
+
+          PanelSectionHeader {
+            id: agentHeader
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: "AGENTS · " + root.shownAgents.length + (root.projectFilter !== "" ? " ON " + root.projectFilter.toUpperCase() : " ACROSS " + root.projects.length + " PROJECT" + (root.projects.length === 1 ? "" : "S"))
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          ButtonGroup {
+            id: projectGroup
+            visible: root.projects.length > 1
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.spacing.md
+            options: root.projectOptions()
+            value: root.projectFilter
+            focusable: false
+            foreground: root.foreground
+            background: root.surface
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onChanged: function(v) { root.projectFilter = v }
+          }
+        }
+
+        Text {
+          visible: root.agents.length === 0
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "No named agents in this range. Board slots carry a name in board.json; omarchy agent --project <p> --name <n> tags a session by hand."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        AgentHeader {
+          visible: root.shownAgents.length > 0
+          width: parent.width
+        }
+
+        Repeater {
+          model: root.shownAgents
+
+          AgentRow {
+            required property var modelData
+            required property int index
+            width: agentSection.width
+            agent: modelData
+            picked: root.selectedAgents.indexOf(String(modelData.agent)) >= 0
+            swatch: {
+              for (var i = 0; i < root.agentSeries.length; i++)
+                if (root.agentSeries[i].key === String(modelData.agent)) return root.agentSeries[i].color
+              return "transparent"
+            }
+          }
+        }
+
+        Text {
+          visible: root.shownAgents.length > 0
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "Click an agent to chart it alone · Ctrl+click adds one to compare · c clears"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
+        ChartCard {
+          visible: root.agentSeries.length > 0
+          width: parent.width
+          title: (root.metricIsMoney() ? "COST" : "TOKENS") + " PER DAY · " + (root.selectedAgents.length > 0 ? root.agentSeries.length + " PICKED AGENT" + (root.agentSeries.length === 1 ? "" : "S") : "TOP 3 AGENTS")
+          summary: root.rangeLabel()
+          readout: agentChart.hoverIndex >= 0 ? root.agentReadout(agentChart.hoverIndex) : ""
+          legend: root.agentSeries
+
+          BarChart {
+            id: agentChart
+            width: parent.width
+            height: Style.space(210)
+            series: root.agentSeries
+            labels: root.days
+            unit: root.metricIsMoney() ? "USD / day" : "tokens / day (incl. cache)"
+            money: root.metricIsMoney()
+            lines: root.agentSeries.length > 1
           }
         }
       }
@@ -627,7 +830,7 @@ FocusScope {
       Text {
         width: parent.width
         textFormat: Text.PlainText
-        text: "h / l account · 1 2 3 range · r refresh · Esc close"
+        text: "h / l account · 1 2 3 range · t cost / tokens · c clear agents · r refresh · Esc close"
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -666,17 +869,52 @@ FocusScope {
     return parts.join(" · ")
   }
 
+  function dayTokens(lastDays) {
+    var perDay = account && Array.isArray(account.perDay) ? account.perDay : []
+    if (perDay.length === 0) return 0
+    if (lastDays <= 0) return Number(perDay[perDay.length - 1].tokens || 0)
+    var sum = 0
+    for (var i = Math.max(0, perDay.length - lastDays); i < perDay.length; i++) sum += Number(perDay[i].tokens || 0)
+    return sum
+  }
+
+  function projectOptions() {
+    var out = [{ value: "", label: "All", tooltip: "Every project" }]
+    for (var i = 0; i < projects.length; i++) {
+      var p = projects[i]
+      var name = String(p.project || "")
+      out.push({ value: name, label: name === "" ? "untagged" : name,
+                 tooltip: p.agents + " agent" + (p.agents === 1 ? "" : "s") + " · " + p.bounties + " bount" + (p.bounties === 1 ? "y" : "ies") + " · " + formatMoney(p.costUsd) + " · " + Format.formatTokenCount(Number(p.tokens || 0)) + " tokens" })
+    }
+    return out
+  }
+
+  function agentReadout(index) {
+    var day = days[index]
+    if (!day) return ""
+    var parts = [longDay(day)]
+    for (var i = 0; i < agentSeries.length; i++) {
+      var v = agentSeries[i].values[index]
+      parts.push(agentSeries[i].name + " " + formatMetric(v))
+    }
+    return parts.join(" · ")
+  }
+
+  // The bounty and per-bounty cards follow the metric switch; the tooltip
+  // always carries the other number.
   function bountyRows(acc) {
     var list = acc && Array.isArray(acc.byBounty) ? acc.byBounty : []
+    list = list.slice().sort(function(a, b) { return Number(b[metric] || 0) - Number(a[metric] || 0) })
     var rows = []
     for (var i = 0; i < list.length && i < 12; i++) {
       var b = list[i]
+      var id = String(b.id || b.bounty)
       rows.push({
-        name: String(b.bounty),
+        name: b.project ? "#" + id + " · " + b.project : id,
         detail: b.model ? Format.friendlyModelName(b.model) : "",
-        value: Number(b.costUsd || 0),
-        valueText: formatMoney(b.costUsd),
-        tooltip: Format.formatTokenCount(Number(b.tokens || 0)) + " tokens · " + Number(b.requests || 0) + " requests · "
+        value: Number(b[metric] || 0),
+        valueText: formatMetric(b[metric]),
+        tooltip: formatMoney(b.costUsd) + " · " + Format.formatTokenCount(Number(b.tokens || 0)) + " tokens · " + Number(b.requests || 0) + " requests · "
           + Number(b.sessions || 0) + " session" + (Number(b.sessions) === 1 ? "" : "s")
       })
     }
@@ -685,17 +923,19 @@ FocusScope {
 
   function perBountyRows(acc) {
     var list = acc && Array.isArray(acc.byModel) ? acc.byModel : []
+    var field = metricIsMoney() ? "costPerBountyUsd" : "tokensPerBounty"
     var rows = []
-    list = list.slice().sort(function(a, b) { return Number(b.costPerBountyUsd || 0) - Number(a.costPerBountyUsd || 0) })
+    list = list.slice().sort(function(a, b) { return Number(b[field] || 0) - Number(a[field] || 0) })
     for (var i = 0; i < list.length; i++) {
       var m = list[i]
       if (!(Number(m.bounties) > 0)) continue
       rows.push({
         name: Format.friendlyModelName(m.model),
         detail: m.bounties + " bount" + (Number(m.bounties) === 1 ? "y" : "ies"),
-        value: Number(m.costPerBountyUsd || 0),
-        valueText: formatMoney(m.costPerBountyUsd),
-        tooltip: formatMoney(m.costUsd) + " on " + Format.formatTokenCount(Number(m.tokens || 0)) + " tokens in the range, tagged or not"
+        value: Number(m[field] || 0),
+        valueText: formatMetric(m[field]),
+        tooltip: formatMoney(m.costPerBountyUsd) + " and " + Format.formatTokenCount(Number(m.tokensPerBounty || 0)) + " tokens per bounty · "
+          + formatMoney(m.costUsd) + " on " + Format.formatTokenCount(Number(m.tokens || 0)) + " tokens in the range, tagged or not"
       })
     }
     return rows
@@ -854,6 +1094,9 @@ FocusScope {
     property var labels: []
     property string unit: ""
     property bool money: false
+    // Lines instead of stacked bars: one line per series, for comparing
+    // agents rather than adding them up.
+    property bool lines: false
     property int hoverIndex: -1
 
     readonly property int fontPx: Style.font.caption
@@ -862,6 +1105,8 @@ FocusScope {
 
     onSeriesChanged: requestPaint()
     onLabelsChanged: requestPaint()
+    onLinesChanged: requestPaint()
+    onMoneyChanged: requestPaint()
     onHoverIndexChanged: requestPaint()
     onWidthChanged: requestPaint()
     onHeightChanged: requestPaint()
@@ -892,9 +1137,13 @@ FocusScope {
       var max = 0
       for (var i = 0; i < n; i++) {
         var sum = 0
-        for (var s = 0; s < chart.series.length; s++) sum += Number(chart.series[s].values[i] || 0)
+        for (var s = 0; s < chart.series.length; s++) {
+          var one = Number(chart.series[s].values[i] || 0)
+          sum += one
+          if (chart.lines) max = Math.max(max, one)
+        }
         totals.push(sum)
-        max = Math.max(max, sum)
+        if (!chart.lines) max = Math.max(max, sum)
       }
       if (max <= 0) max = chart.money ? 1 : 1000
       var step = niceStep(max, 4)
@@ -935,19 +1184,48 @@ FocusScope {
       }
 
       var barW = Math.max(1, Math.min(slotW * 0.72, 30))
-      for (var d = 0; d < n; d++) {
-        var x = left + d * slotW + (slotW - barW) / 2
-        var y = bottom
-        for (var k = 0; k < chart.series.length; k++) {
-          var value = Number(chart.series[k].values[d] || 0)
-          if (value <= 0) continue
-          var h = value / top * plotH
-          ctx.fillStyle = root.css(chart.series[k].color)
-          // A hairline of surface between stacked segments keeps two close
-          // shades apart.
-          var gap = h > 3 && k > 0 ? 1 : 0
-          ctx.fillRect(x, y - h, barW, h - gap)
-          y -= h
+      if (chart.lines) {
+        // One line per series through the day centres, a dot on each day
+        // that has a value, and a ring on the hovered day.
+        for (var ls = chart.series.length - 1; ls >= 0; ls--) {
+          var lineSeries = chart.series[ls]
+          ctx.strokeStyle = root.css(lineSeries.color)
+          ctx.fillStyle = root.css(lineSeries.color)
+          ctx.lineWidth = 2
+          ctx.beginPath()
+          var started = false
+          for (var ld = 0; ld < n; ld++) {
+            var lv = Number(lineSeries.values[ld] || 0)
+            var lx = left + ld * slotW + slotW / 2
+            var ly = bottom - lv / top * plotH
+            if (started) ctx.lineTo(lx, ly); else { ctx.moveTo(lx, ly); started = true }
+          }
+          ctx.stroke()
+          for (var pd = 0; pd < n; pd++) {
+            var pv = Number(lineSeries.values[pd] || 0)
+            if (pv <= 0) continue
+            var px = left + pd * slotW + slotW / 2
+            var py = bottom - pv / top * plotH
+            ctx.beginPath()
+            ctx.arc(px, py, pd === chart.hoverIndex ? 4 : 2.5, 0, Math.PI * 2)
+            ctx.fill()
+          }
+        }
+      } else {
+        for (var d = 0; d < n; d++) {
+          var x = left + d * slotW + (slotW - barW) / 2
+          var y = bottom
+          for (var k = 0; k < chart.series.length; k++) {
+            var value = Number(chart.series[k].values[d] || 0)
+            if (value <= 0) continue
+            var h = value / top * plotH
+            ctx.fillStyle = root.css(chart.series[k].color)
+            // A hairline of surface between stacked segments keeps two close
+            // shades apart.
+            var gap = h > 3 && k > 0 ? 1 : 0
+            ctx.fillRect(x, y - h, barW, h - gap)
+            y -= h
+          }
         }
       }
 
@@ -1216,6 +1494,117 @@ FocusScope {
           fontFamily: root.fontFamily
         }
       }
+    }
+  }
+
+  // Columns of the agents table, as fractions of its width.
+  readonly property var agentColumns: [0.22, 0.14, 0.16, 0.11, 0.11, 0.08, 0.08, 0.10]
+
+  component AgentHeader: Row {
+    id: agentHeaderRow
+    readonly property var titles: ["AGENT", "PROJECT", "MODEL", "COST", "TOKENS", "REQ", "SESSIONS", "STATUS"]
+    Repeater {
+      model: agentHeaderRow.titles
+      Text {
+        required property var modelData
+        required property int index
+        width: agentHeaderRow.width * root.agentColumns[index]
+        leftPadding: index === 0 ? Style.space(22) : 0
+        textFormat: Text.PlainText
+        text: modelData
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.letterSpacing: 0.6
+        horizontalAlignment: index >= 3 && index <= 6 ? Text.AlignRight : Text.AlignLeft
+        rightPadding: index >= 3 && index <= 6 ? Style.space(14) : 0
+      }
+    }
+  }
+
+  // One named agent over the range. A click charts it alone; Ctrl+click
+  // adds it to, or drops it from, the agents drawn together.
+  component AgentRow: BorderSurface {
+    id: agentRow
+    property var agent: null
+    property bool picked: false
+    property color swatch: "transparent"
+    readonly property bool live: !!agent && agent.live === true
+    readonly property var cells: {
+      var a = agent || {}
+      return [
+        String(a.name || a.agent || ""),
+        String(a.project || "") !== "" ? String(a.project) : "—",
+        a.model ? Format.friendlyModelName(a.model) : "—",
+        root.formatMoney(a.costUsd),
+        Format.formatTokenCount(Number(a.tokens || 0)),
+        String(Number(a.requests || 0)),
+        String(Number(a.sessions || 0)),
+        live ? "Live" : "Idle"
+      ]
+    }
+
+    implicitHeight: Math.max(Style.spacing.controlHeight, agentCells.implicitHeight + Style.spacing.md * 2)
+    radius: Style.cornerRadius
+    color: picked ? Style.selectedFillFor(root.foreground, root.accent) : root.alpha(root.foreground, agentHover.containsMouse ? 0.07 : 0.04)
+    borderSpec: picked ? Border.flat(root.alpha(root.accentUsable ? root.accent : root.foreground, 0.5), 1) : Border.none()
+
+    Rectangle {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(8)
+      height: width
+      radius: width / 2
+      color: agentRow.swatch
+      visible: agentRow.swatch.a > 0
+    }
+
+    Row {
+      id: agentCells
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+
+      Repeater {
+        model: agentRow.cells
+        Text {
+          required property var modelData
+          required property int index
+          width: agentCells.width * root.agentColumns[index]
+          leftPadding: index === 0 ? Style.space(22) : 0
+          rightPadding: index >= 3 && index <= 6 ? Style.space(14) : Style.space(8)
+          textFormat: Text.PlainText
+          text: modelData
+          color: index === 0 || (index === 3 && root.metricIsMoney()) || (index === 4 && !root.metricIsMoney()) ? root.foreground
+            : (index === 7 && agentRow.live ? (root.accentUsable ? root.accent : root.foreground) : root.dim)
+          font.family: root.fontFamily
+          font.pixelSize: index === 0 ? Style.font.bodySmall : Style.font.caption
+          font.bold: (index === 3 && root.metricIsMoney()) || (index === 4 && !root.metricIsMoney())
+          horizontalAlignment: index >= 3 && index <= 6 ? Text.AlignRight : Text.AlignLeft
+          elide: Text.ElideRight
+        }
+      }
+    }
+
+    MouseArea {
+      id: agentHover
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.LeftButton
+      onClicked: function(mouse) { root.selectAgent(agentRow.agent.agent, (mouse.modifiers & Qt.ControlModifier) !== 0) }
+    }
+
+    PanelToolTip {
+      visible: agentHover.containsMouse
+      text: {
+        var a = agentRow.agent || {}
+        var models = []
+        var byModel = a.byModel || {}
+        for (var m in byModel) models.push(Format.friendlyModelName(m) + " " + root.formatMoney(byModel[m].costUsd) + " / " + Format.formatTokenCount(Number(byModel[m].tokens || 0)))
+        return (models.length > 0 ? models.join(" · ") + "\n" : "") + "Click: this agent alone · Ctrl+click: add to the comparison"
+      }
+      fontFamily: root.fontFamily
     }
   }
 

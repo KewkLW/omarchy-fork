@@ -1,12 +1,14 @@
 #!/bin/bash
 
 # omarchy:summary=Launch the default coding agent in a terminal
-# omarchy:args=[--inline] [--pick] [--agent <name>]
-# omarchy:examples=omarchy agent | omarchy agent --inline | omarchy agent --agent claude
+# omarchy:args=[--inline] [--pick] [--agent <name>] [--project <project>] [--name <agent name>]
+# omarchy:examples=omarchy agent | omarchy agent --inline | omarchy agent --agent claude | omarchy agent --project alchemist --name Mercury
 
 inline=false
 pick=false
 agent=""
+project=${OMARCHY_PROJECT:-}
+agent_name=${OMARCHY_AGENT_NAME:-}
 
 # Flags only. A bare prompt would shadow the subcommands under this group, so
 # prompts go through omarchy-agent-prompt, which passes one here as --prompt.
@@ -26,6 +28,14 @@ while (($#)); do
       ;;
     --prompt)
       prompt=${2:?--prompt needs a value}
+      shift 2
+      ;;
+    --project)
+      project=${2:?--project needs a value}
+      shift 2
+      ;;
+    --name)
+      agent_name=${2:?--name needs a value}
       shift 2
       ;;
     *)
@@ -54,6 +64,19 @@ if [[ ${agent:-} == claude-* ]]; then
   agent=claude
 fi
 [[ -n ${agent:-} ]] || agent=$(omarchy-default-agent)
+
+# Every agent spawns with a specific, stable name for its project's life, and
+# the two ride on its telemetry (project and agent.name resource attributes)
+# so the agent stats window can add cost and tokens up per project and per
+# agent. The board dispatcher tags its slots the same way. A launch without a
+# name still runs; its spend lands as untagged, which the stats show as such.
+if [[ -n $project || -n $agent_name ]]; then
+  tags=()
+  [[ -n $project ]] && tags+=("project=$project")
+  [[ -n $agent_name ]] && tags+=("agent.name=$agent_name")
+  export OMARCHY_PROJECT=$project OMARCHY_AGENT_NAME=$agent_name
+  export OTEL_RESOURCE_ATTRIBUTES=$(IFS=,; echo "${OTEL_RESOURCE_ATTRIBUTES:+$OTEL_RESOURCE_ATTRIBUTES,}${tags[*]}")
+fi
 
 # Omarchy ships without a default, so there is nothing to launch until one is
 # picked. --pick offers the choice instead of the error, which is what the

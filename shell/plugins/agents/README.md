@@ -42,23 +42,31 @@ other. `shell/agent-stats.qml` runs as its own Quickshell process (the
 launcher sets `QS_APP_ID`) around `Stats.qml`, with the panel's theme,
 fonts and controls, and the process ends when the window closes.
 
-An account switch like the panel's, a range of 7 days, 30 days or all, and:
+An account switch like the panel's, a range of 7 days, 30 days or all, a
+Cost / Tokens switch (key `t`) that the bounty and agent views follow, and:
 
-- **Tiles** — today and the last 7 days at API list prices, live sessions,
-  and how many of them are looping.
-- **Live sessions** — every field the receiver reports, one row each; a
-  looping one is drawn urgent with its reason.
+- **Tiles** — today and the last 7 days at API list prices with their
+  tokens, live sessions, and how many of them are looping.
+- **Live sessions** — every field the receiver reports, one row each, titled
+  by agent name, project and bounty; a looping one is drawn urgent with its
+  reason.
 - **Cost per day** and **tokens per day**, stacked by model (the top three
   and Other, in steps of the theme's foreground and accent).
-- **Cost by bounty** — the top 12 bounties or tickets in the range.
-- **Cost per bounty by model** — a model's tagged spend over the bounties it
-  worked. Telemetry does not know which bounties landed, so this is per
-  bounty worked, not per landing.
+- **Cost (or tokens) by bounty** — the top 12 bounties or tickets in the
+  range, each under its project.
+- **Cost (or tokens) per bounty by model** — a model's tagged spend over the
+  bounties it worked. Telemetry does not know which bounties landed, so this
+  is per bounty worked, not per landing.
+- **Agents** — one row per named agent over the range (project, model, cost,
+  tokens, requests, sessions, live or idle), filterable by project. Click a
+  row to chart that agent alone, Ctrl+click to add others to the chart, `c`
+  to clear; with nothing picked the chart shows the three biggest. One agent
+  draws as bars per day, several as one line each.
 - **Limits over time** — weekly and model-scoped weekly percentages as step
   lines, the 5-hour session as a faint area, with the panel's 90% line.
 
-Keys: `h`/`l` account, `1` `2` `3` range, `r` refresh, `j`/`k` scroll, Esc
-closes. Everything comes from one call, `omarchy-agent-otel history
+Keys: `h`/`l` account, `1` `2` `3` range, `t` cost or tokens, `c` clear the
+picked agents, `r` refresh, `j`/`k` scroll, Esc closes. Everything comes from one call, `omarchy-agent-otel history
 --range 7d|30d|all`, rerun every 30 seconds and when `summary.json` changes.
 
 A subscription appears only when it is enabled in settings and has actually
@@ -128,8 +136,14 @@ OTEL_EXPORTER_OTLP_PROTOCOL=http/json
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
 ```
 
-Tag a run with `OTEL_RESOURCE_ATTRIBUTES=bounty.id=…,bounty.slot=…,bounty.attempt=…`
-(or `ticket=…`) to have its cost attributed. The receiver keeps only the
+Tag a run with `OTEL_RESOURCE_ATTRIBUTES=project=…,agent.name=…,bounty.id=…,bounty.slot=…,bounty.attempt=…`
+(or `ticket=…`) to have its cost attributed. `project` keeps boards apart
+(bounty and slot ids repeat from one board to the next: bounties and agents
+are keyed `<project>/<id>`), and `agent.name` is the agent's name for the
+project's life, so every agent must spawn with a specific, stable name. The
+bounty board tags its slots this way from each slot's `name` in `board.json`;
+`omarchy agent --project <p> --name <n>` (or `OMARCHY_PROJECT` and
+`OMARCHY_AGENT_NAME` in the environment) tags a session started by hand. The receiver keeps only the
 `api_request` and `tool_result` events, and of those only timestamps,
 session and account ids, model, cost, token counts, tool name, success and
 duration, plus those tags. Prompts are never logged: Claude Code redacts them
@@ -157,7 +171,7 @@ window draws:
 
 | File | Written by | One line per |
 |---|---|---|
-| `~/.local/state/omarchy/agents/otel/history/YYYY-MM.jsonl` | `omarchy-agent-otel` | day × account: cost, tokens and requests in total, by model, and by bounty (with each bounty's cost by model) |
+| `~/.local/state/omarchy/agents/otel/history/YYYY-MM.jsonl` | `omarchy-agent-otel` | day × account: cost, tokens and requests in total, by model, by bounty and by named agent (each bounty and agent with its cost, tokens and requests by model) |
 | `~/.local/state/omarchy/agents/history/limits-YYYY-MM.jsonl` | `omarchy-agent-limits-history`, after every record `omarchy-agent-usage-update` writes | change in an agent's limits: `ts`, `agent`, `session`, `weekly`, and model-scoped weekly percentages under `models` |
 
 The receiver backfills the daily rollup from every event file still on disk
