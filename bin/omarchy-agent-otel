@@ -85,7 +85,7 @@ MAX_BODY_BYTES = 32 * 1024 * 1024
 COST_BASIS = "API list price equivalent"
 TAG_KEYS = {"bounty.id": "bounty", "bounty.slot": "slot", "bounty.attempt": "attempt", "ticket": "ticket", "slot": "slot",
             "project": "project", "agent.name": "agent"}
-TAG_FIELDS = ("project", "agent", "bounty", "slot", "attempt", "ticket")
+TAG_FIELDS = ("project", "agent", "subagent", "bounty", "slot", "attempt", "ticket")
 
 
 def state_dir() -> Path:
@@ -269,9 +269,23 @@ def extract_events(payload: dict[str, Any], now: float) -> list[dict[str, Any]]:
           "session": short(attrs.get("session.id")),
           "account": short(attrs.get("user.account_uuid")),
         }
-        # Tags ride on both the resource and every record; the record wins.
+        # Tags ride on both the resource and every record; the record wins,
+        # except that an agent's name is the resource's alone: Claude Code
+        # puts its own agent.name on a subagent's records (the subagent type),
+        # which is not the agent the board named. That goes under subagent.
         for key, field in TAG_KEYS.items():
-          value = attrs.get(key, resource.get(key))
+          if key == "agent.name":
+            value = resource.get(key)
+            own = attrs.get(key)
+            if own not in (None, "") and own != value:
+              # Ours only when the record carries a project tag too, which
+              # Claude Code never sets itself.
+              if value in (None, "") and attrs.get("project") not in (None, ""):
+                value = own
+              else:
+                event["subagent"] = short(own, 80)
+          else:
+            value = attrs.get(key, resource.get(key))
           if value not in (None, "") and field not in event:
             event[field] = short(value, 80)
         if name == "api_request":

@@ -118,6 +118,11 @@ for i in range(41):
 c = ident("cccccccc-0000-4000-8000-00000000000c", extra_uuid, tags_c)
 records.append(record("claude_code.api_request", t + 200, dict(c, cost_usd={"doubleValue": 2.0}, model=s("claude-sonnet-5"))))
 
+# Session E (main, untagged): Claude Code's own agent.name on a subagent's
+# record names the subagent type, not an agent of ours.
+e = ident("eeeeeeee-0000-4000-8000-00000000000e", main_uuid, dict(tags_b, **{"agent.name": s("general-purpose")}))
+records.append(record("claude_code.api_request", t + 400, dict(e, cost_usd={"doubleValue": 0.05}, model=s("claude-haiku-4-5-20251001"))))
+
 # The resource carries no tags of its own here, so attribution has to come
 # from the record attributes; session B must not inherit A's bounty.
 resource_logs["resource"]["attributes"] = [x for x in resource_logs["resource"]["attributes"] if x["key"] not in ("project", "agent.name", "bounty.id", "bounty.slot", "bounty.attempt", "ticket")]
@@ -143,7 +148,7 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/x-pr
 pass "receiver refuses protobuf logs it cannot read"
 
 for _ in $(seq 1 50); do
-  [[ -f $summary ]] && jq -e '.accounts.claude.live | length == 3' "$summary" >/dev/null 2>&1 && break
+  [[ -f $summary ]] && jq -e '.accounts.claude.live | length == 4' "$summary" >/dev/null 2>&1 && break
   sleep 0.1
 done
 [[ -f $summary ]] || fail "receiver writes summary.json" "$(cat "$log")"
@@ -157,11 +162,12 @@ check() {
 
 check "summary labels costs as API list price equivalent" '.costBasis == "API list price equivalent"'
 check "accounts map to the panel's record ids" '(.accounts | keys) == ["claude", "claude-extra"]'
-check "today's cost totals every account" '(.todayCostUsd * 1000 | round) == 2850'
-check "today's cost per account" '(.accounts.claude.today.costUsd * 1000 | round) == 850 and .accounts.claude.today.requests == 3'
+check "today's cost totals every account" '(.todayCostUsd * 1000 | round) == 2900'
+check "today's cost per account" '(.accounts.claude.today.costUsd * 1000 | round) == 900 and .accounts.claude.today.requests == 4'
 check "cost is attributed to the bounty id under its project" '.accounts.claude.byBounty[0] | .bounty == "alpha/B-101" and (.costUsd * 100 | round) == 75 and .sessions == 1'
 check "cost and tokens are attributed to the named agent under its project" \
   '.accounts.claude.byAgent[0] | .agent == "alpha/Mercury" and .project == "alpha" and .name == "Mercury" and (.costUsd * 100 | round) == 75 and .tokens >= 150 and .sessions == 1 and .live == true and .model == "claude-opus-4-8"'
+check "a subagent's own agent.name is not an agent of ours" '([.accounts.claude.byAgent[] | select(.agent == "general-purpose")] | length) == 0 and ([.accounts.claude.live[] | select(.session == "eeeeeeee")][0] | .subagent == "general-purpose" and .agent == null)'
 check "a live session carries its project and agent name" '[.accounts.claude.live[] | select(.session == "aaaaaaaa")][0] | .project == "alpha" and .agent == "Mercury"'
 check "a ticket stands in for a missing bounty id" '[.accounts.claude.byBounty[] | select(.bounty == "T-7")] | length == 1'
 check "the extra account keeps its own bounty" '.accounts["claude-extra"].byBounty | length == 1 and .[0].bounty == "beta/B-202" and .[0].costUsd == 2'
@@ -171,7 +177,7 @@ check "a session failing the same tool over and over is flagged looping" \
   '[.accounts.claude.live[] | select(.session == "aaaaaaaa")][0] | .looping == true and .toolCalls == 12 and .toolFailures == 12 and .bounty == "B-101" and .slot == "s2" and .attempt == "3"'
 check "a burst of tool calls with no API cost is flagged looping" \
   '[.accounts.claude.live[] | select(.session == "dddddddd")][0] | .looping == true and (.loopReason | test("41 tool calls"))'
-check "looping sessions sort first" '[.accounts.claude.live[].looping] == [true, true, false]'
+check "looping sessions sort first" '[.accounts.claude.live[].looping] == [true, true, false, false]'
 check "a healthy session is not flagged" \
   '[.accounts.claude.live[] | select(.session == "bbbbbbbb")][0] | .looping == false and .ticket == "T-7" and (has("bounty") | not) and .toolCalls == 1'
 
@@ -198,7 +204,7 @@ rm -f "$summary"
 "$ROOT/bin/omarchy-agent-otel" rollup
 [[ ! -e $otel_dir/events-2000-01-01.jsonl ]] || fail "event files older than 14 days are pruned"
 pass "event files older than 14 days are pruned"
-check "rollup rebuilds the summary from the event files" '.accounts.claude.live[0].looping == true and (.todayCostUsd * 1000 | round) == 2850'
+check "rollup rebuilds the summary from the event files" '.accounts.claude.live[0].looping == true and (.todayCostUsd * 1000 | round) == 2900'
 
 "$ROOT/bin/omarchy-agent-otel" status | jq -e '.accounts.claude' >/dev/null ||
   fail "status prints the summary"
