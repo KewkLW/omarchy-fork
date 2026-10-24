@@ -25,6 +25,8 @@ FocusScope {
   // one, and the agent chart draws every picked one side by side.
   property var selectedAgents: []
   property string projectFilter: ""
+  // TOKENS BY MODEL lists the range by day or by Monday-started week.
+  property string modelPeriod: "days"
   property var report: null
   property string errorText: ""
   property double nowMs: Date.now()
@@ -56,6 +58,7 @@ FocusScope {
   readonly property var costSeries: daySeries(account, "costUsd")
   readonly property var tokenSeries: daySeries(account, "tokens")
   readonly property var limitSeries: buildLimitSeries(account)
+  readonly property var modelTable: buildModelTable(account, modelPeriod)
   readonly property var live: account && Array.isArray(account.live) ? account.live : []
   readonly property bool hasTelemetry: !!account && account.hasTelemetry === true
   readonly property var agents: account && Array.isArray(account.byAgent) ? account.byAgent : []
@@ -245,6 +248,79 @@ FocusScope {
     return out
   }
 
+  // The range's days, or its Monday-started weeks, newest first, with every
+  // model's tokens. Up to five models get a column, ranked by tokens over
+  // the range; the rest pool into Other.
+  function buildModelTable(acc, period) {
+    var perDay = acc && Array.isArray(acc.perDay) ? acc.perDay : []
+    var groups = []
+    for (var i = perDay.length - 1; i >= 0; i--) {
+      var day = perDay[i]
+      var key = String(day.day)
+      if (period === "weeks") {
+        var d = dayDate(key)
+        if (!d) continue
+        d.setDate(d.getDate() - (d.getDay() + 6) % 7)
+        key = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0")
+      }
+      var group = groups.length > 0 && groups[groups.length - 1].key === key ? groups[groups.length - 1] : null
+      if (!group) {
+        group = { key: key, days: 0, tokens: 0, costUsd: 0, byModel: {} }
+        groups.push(group)
+      }
+      group.days++
+      group.tokens += Number(day.tokens || 0)
+      group.costUsd += Number(day.costUsd || 0)
+      var byModel = day.byModel || {}
+      for (var m in byModel) {
+        var bucket = group.byModel[m] || (group.byModel[m] = { tokens: 0, costUsd: 0 })
+        bucket.tokens += Number(byModel[m].tokens || 0)
+        bucket.costUsd += Number(byModel[m].costUsd || 0)
+      }
+    }
+
+    // Nothing before telemetry began: drop the empty tail of the oldest rows.
+    while (groups.length > 0 && groups[groups.length - 1].tokens <= 0) groups.pop()
+
+    var totals = {}
+    for (var g = 0; g < groups.length; g++)
+      for (var name in groups[g].byModel) totals[name] = (totals[name] || 0) + groups[g].byModel[name].tokens
+    var ranked = Object.keys(totals).filter(function(n) { return totals[n] > 0 })
+    ranked.sort(function(a, b) { return totals[b] - totals[a] })
+    var keys = ranked.length > 6 ? ranked.slice(0, 5) : ranked
+    var others = ranked.length > 6 ? ranked.slice(5) : []
+    var columns = keys.map(function(k) { return Format.friendlyModelName(k) })
+    if (others.length > 0) columns.push("Other")
+
+    var today = String(report && report.today || "")
+    var peak = 1
+    for (var r = 0; r < groups.length; r++) peak = Math.max(peak, groups[r].tokens)
+    var rows = []
+    for (var gi = 0; gi < groups.length; gi++) {
+      var row = groups[gi]
+      var cells = keys.map(function(k) { return row.byModel[k] ? row.byModel[k].tokens : 0 })
+      if (others.length > 0) {
+        var rest = 0
+        for (var o = 0; o < others.length; o++) rest += row.byModel[others[o]] ? row.byModel[others[o]].tokens : 0
+        cells.push(rest)
+      }
+      var current = period === "weeks" ? gi === 0 && today >= row.key : row.key === today
+      var label = period === "weeks" ? (gi === 0 ? "This week" : "Week of " + shortDay(row.key)) : (row.key === today ? "Today" : longDay(row.key))
+      rows.push({ label: label, current: current, cells: cells, tokens: row.tokens, share: row.tokens / peak, tooltip: modelPeriodTooltip(row, period) })
+    }
+    return { columns: columns, rows: rows }
+  }
+
+  function modelPeriodTooltip(row, period) {
+    var title = period === "weeks" ? "Week of " + longDay(row.key) + (row.days < 7 ? " · " + row.days + " of 7 days in range" : "") : longDay(row.key)
+    var lines = [title + " · " + Format.formatTokenCount(row.tokens) + " tokens · " + formatMoney(row.costUsd)]
+    var names = Object.keys(row.byModel).filter(function(n) { return row.byModel[n].tokens > 0 })
+    names.sort(function(a, b) { return row.byModel[b].tokens - row.byModel[a].tokens })
+    for (var i = 0; i < names.length; i++)
+      lines.push(Format.friendlyModelName(names[i]) + " " + Format.formatTokenCount(row.byModel[names[i]].tokens) + " · " + formatMoney(row.byModel[names[i]].costUsd))
+    return lines.join("\n")
+  }
+
   function buildLimitSeries(acc) {
     var points = acc && Array.isArray(acc.limits) ? acc.limits : []
     var weekly = [], session = [], models = {}, modelOrder = []
@@ -367,6 +443,7 @@ FocusScope {
     else if (t === "r") root.refresh()
     else if (t === "t") root.toggleMetric()
     else if (t === "c") root.clearAgents()
+    else if (t === "w") root.modelPeriod = root.modelPeriod === "days" ? "weeks" : "days"
     else return
     event.accepted = true
   }
@@ -684,6 +761,66 @@ FocusScope {
         }
       }
 
+      // ---------- Tokens by model ----------
+      PanelSeparator {
+        visible: modelSection.visible
+        width: parent.width
+        foreground: root.foreground
+      }
+
+      Column {
+        id: modelSection
+        visible: root.hasTelemetry && root.modelTable.rows.length > 0
+        width: parent.width
+        spacing: Style.spacing.md
+
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(modelHeader.implicitHeight, periodGroup.implicitHeight)
+
+          PanelSectionHeader {
+            id: modelHeader
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: "TOKENS BY MODEL · PER " + (root.modelPeriod === "weeks" ? "WEEK" : "DAY") + " · " + root.rangeLabel().toUpperCase()
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          ButtonGroup {
+            id: periodGroup
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.spacing.md
+            options: [
+              { value: "days", label: "Days", tooltip: "Key w toggles" },
+              { value: "weeks", label: "Weeks", tooltip: "Weeks start on Monday · key w toggles" }
+            ]
+            value: root.modelPeriod
+            focusable: false
+            foreground: root.foreground
+            background: root.surface
+            fontFamily: root.fontFamily
+            onChanged: function(value) { root.modelPeriod = value }
+          }
+        }
+
+        ModelPeriodHeader {
+          width: parent.width
+          columns: root.modelTable.columns
+        }
+
+        Repeater {
+          model: root.modelTable.rows
+
+          ModelPeriodRow {
+            required property var modelData
+            width: modelSection.width
+            row: modelData
+          }
+        }
+      }
+
       // ---------- Agents ----------
       PanelSeparator {
         visible: charts.visible
@@ -830,7 +967,7 @@ FocusScope {
       Text {
         width: parent.width
         textFormat: Text.PlainText
-        text: "h / l account · 1 2 3 range · t cost / tokens · c clear agents · r refresh · Esc close"
+        text: "h / l account · 1 2 3 range · t cost / tokens · w days / weeks · c clear agents · r refresh · Esc close"
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -1494,6 +1631,120 @@ FocusScope {
           fontFamily: root.fontFamily
         }
       }
+    }
+  }
+
+  // The tokens by model table: a period column, one per model, the total.
+  readonly property real periodLabelWidth: Style.space(150)
+
+  component ModelPeriodHeader: Row {
+    id: periodHeader
+    property var columns: []
+    readonly property var titles: columns.concat(["TOTAL"])
+    readonly property real cellWidth: (width - root.periodLabelWidth) / Math.max(1, titles.length)
+
+    Text {
+      width: root.periodLabelWidth
+      leftPadding: Style.space(14)
+      textFormat: Text.PlainText
+      text: "PERIOD"
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      font.letterSpacing: 0.6
+    }
+
+    Repeater {
+      model: periodHeader.titles
+      Text {
+        required property var modelData
+        width: periodHeader.cellWidth
+        rightPadding: Style.space(14)
+        textFormat: Text.PlainText
+        text: String(modelData).toUpperCase()
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.letterSpacing: 0.6
+        horizontalAlignment: Text.AlignRight
+        elide: Text.ElideRight
+      }
+    }
+  }
+
+  // One day or week. The share bar behind the row is scaled to the busiest
+  // row; the tooltip lists every model with its cost.
+  component ModelPeriodRow: BorderSurface {
+    id: periodRow
+    property var row: null
+    readonly property var values: row ? row.cells.concat([row.tokens]) : []
+    readonly property real cellWidth: (width - root.periodLabelWidth) / Math.max(1, values.length)
+
+    implicitHeight: Math.max(Style.spacing.controlHeight, periodLabel.implicitHeight + Style.spacing.md * 2)
+    radius: Style.cornerRadius
+    color: root.alpha(root.foreground, periodHover.containsMouse ? 0.07 : 0.04)
+    borderSpec: Border.none()
+
+    Rectangle {
+      anchors.left: parent.left
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      width: parent.width * root.clamp(periodRow.row ? periodRow.row.share : 0, 0, 1)
+      radius: Style.cornerRadius
+      color: root.alpha(root.foreground, 0.08)
+    }
+
+    Text {
+      id: periodLabel
+      width: root.periodLabelWidth
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      leftPadding: Style.space(14)
+      textFormat: Text.PlainText
+      text: periodRow.row ? periodRow.row.label : ""
+      color: periodRow.row && periodRow.row.current ? root.foreground : root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      font.bold: !!periodRow.row && periodRow.row.current
+      elide: Text.ElideRight
+    }
+
+    Row {
+      anchors.left: parent.left
+      anchors.leftMargin: root.periodLabelWidth
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+
+      Repeater {
+        model: periodRow.values
+        Text {
+          required property var modelData
+          required property int index
+          readonly property bool total: index === periodRow.values.length - 1
+          width: periodRow.cellWidth
+          rightPadding: Style.space(14)
+          textFormat: Text.PlainText
+          text: Number(modelData) > 0 ? Format.formatTokenCount(Number(modelData)) : "—"
+          color: total ? root.foreground : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: total
+          horizontalAlignment: Text.AlignRight
+        }
+      }
+    }
+
+    MouseArea {
+      id: periodHover
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.NoButton
+    }
+
+    PanelToolTip {
+      visible: periodHover.containsMouse
+      text: periodRow.row ? periodRow.row.tooltip : ""
+      fontFamily: root.fontFamily
     }
   }
 
