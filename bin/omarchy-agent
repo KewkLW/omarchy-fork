@@ -116,7 +116,7 @@ crush)
   fi
   ;;
 claude)
-  command=(claude --permission-mode auto)
+  command=(claude --dangerously-skip-permissions)
   [[ -n ${prompt:-} ]] && command+=(-- "$prompt")
   ;;
 grok)
