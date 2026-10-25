@@ -63,7 +63,7 @@ while true; do
   if ((spin_chance > 0 && RANDOM % spin_chance == 0)); then
     ttfx -i "$takeover_text" \
       --frame-rate 60 --canvas-width 0 --canvas-height 0 --reuse-canvas --anchor-canvas c --anchor-text c\
-      --no-eol --no-restore-cursor spin3d --duration 20 &
+      --no-eol --no-restore-cursor spin3d --duration 80 &
   else
     ttfx -i ~/.config/omarchy/branding/screensaver.txt \
       --frame-rate 120 --canvas-width 0 --canvas-height 0 --reuse-canvas --anchor-canvas c --anchor-text c\
