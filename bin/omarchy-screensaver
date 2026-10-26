@@ -59,11 +59,22 @@ if [[ -n ${takeover_args[*]} ]] && ttfx --help 2>&1 | grep -q '^  spin3d '; then
   spin_chance=${OMARCHY_SCREENSAVER_SPIN_CHANCE:-4}
 fi
 
+# Now and then lightning erodes OMARCHY revealing KEWK.
+erode_chance=0
+if ttfx --help 2>&1 | grep -q -- '--erode'; then
+  erode_chance=${OMARCHY_SCREENSAVER_ERODE_CHANCE:-6}
+fi
+
 while true; do
   if ((spin_chance > 0 && RANDOM % spin_chance == 0)); then
     ttfx -i "$takeover_text" \
       --frame-rate 60 --canvas-width 0 --canvas-height 0 --reuse-canvas --anchor-canvas c --anchor-text c\
       --no-eol --no-restore-cursor spin3d --duration 80 &
+  elif ((erode_chance > 0 && RANDOM % erode_chance == 0)); then
+    ttfx -i ~/.config/omarchy/branding/screensaver.txt \
+      --frame-rate 120 --canvas-width 0 --canvas-height 0 --reuse-canvas --anchor-canvas c --anchor-text c\
+      --no-eol --no-restore-cursor "${audio_args[@]}" "${takeover_args[@]}" \
+      thunderstorm --storm-time 30 --erode &
   else
     ttfx -i ~/.config/omarchy/branding/screensaver.txt \
       --frame-rate 120 --canvas-width 0 --canvas-height 0 --reuse-canvas --anchor-canvas c --anchor-text c\
