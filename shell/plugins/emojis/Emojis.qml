@@ -40,7 +40,8 @@ Item {
 
   property int cellWidth: Math.max(Style.space(44), Style.font.display + Style.spacing.md)
   property int cellHeight: Math.max(Style.space(44), Style.font.display + Style.spacing.md)
-  property int columns: Math.floor((cardWidth - contentMargin * 2) / cellWidth)
+  // An image frame's side insets are wider than a colour border's.
+  property int columns: Math.floor((cardWidth - contentMargin * 2 - (Border.hasFrame(borderSpec) ? Border.left(borderSpec) + Border.right(borderSpec) : 0)) / cellWidth)
 
   function open(payloadJson) {
     root.opened = true

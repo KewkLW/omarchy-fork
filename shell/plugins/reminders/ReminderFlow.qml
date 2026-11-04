@@ -27,7 +27,7 @@ Item {
   property int contentMargin: Style.spacing.panelPadding
   property int headerHeight: Math.max(Style.space(34), Style.font.title + Style.spacing.controlPaddingY * 2)
   property int cardWidth: Math.min(Style.space(300), panel.width - Style.gapsOut * 2)
-  property int cardHeight: Math.min(contentMargin * 2 + headerHeight, panel.height - Style.gapsOut * 2)
+  property int cardHeight: Math.min(contentMargin * 2 + headerHeight + Border.frameChrome(borderSpec), panel.height - Style.gapsOut * 2)
   readonly property string promptText: root.step === "message" ? "Reminder message" : "Remind in minutes"
 
   function open(payloadJson) {
