@@ -45,7 +45,8 @@ Item {
   // a password — including immediately when the lid is shut and the clamshell
   // gate skips pam_fprintd — we switch to the password field instead.
   readonly property bool fingerprintMode: fingerprintConfigured && !laptopClosed && dialogVisible && !responseRequired && !submitted && !errorFlash
-  readonly property int cardHeight: panel.height > 0 ? Math.min(fieldHeight + contentMargin * 2, panel.height - Style.gapsOut * 2) : fieldHeight + contentMargin * 2
+  readonly property int cardChrome: Border.frameChrome(borderSpec)
+  readonly property int cardHeight: panel.height > 0 ? Math.min(fieldHeight + contentMargin * 2 + cardChrome, panel.height - Style.gapsOut * 2) : fieldHeight + contentMargin * 2 + cardChrome
   // Password mode is a wide field; fingerprint mode collapses to a square that
   // just frames the centered sensor icon.
   readonly property int cardWidth: fingerprintMode ? cardHeight : Math.min(Style.space(312), Math.max(Style.space(260), panel.width - Style.gapsOut * 2))
@@ -339,7 +340,7 @@ Item {
             text: root.errorFlash ? "Wrong" : (root.submitted ? "Checking..." : "Enter password")
             color: root.errorFlash ? Color.polkit.textError : root.foreground
             opacity: root.errorFlash ? 1 : 0.36
-            font.family: root.fontFamily
+            font.family: Style.textFamilyOr(root.fontFamily)
             font.pixelSize: Style.font.iconLarge
             elide: Text.ElideRight
             visible: passwordInput.text.length === 0
@@ -364,25 +365,38 @@ Item {
       }
     }
 
+    // [polkit] title-image puts the request label on a theme plate
+    // (title-image-height px tall, at least title-image-width px wide).
     Rectangle {
-      width: Math.min(justificationText.implicitWidth + Style.space(24), panel.width - Style.gapsOut * 2)
-      height: Style.space(28)
+      readonly property string plate: Border.image("polkit", "title-image")
+      width: Math.min(Math.max(justificationText.implicitWidth + Style.space(plate !== "" ? 64 : 24), plate !== "" ? Border.number("polkit", "title-image-width", 0) : 0), panel.width - Style.gapsOut * 2)
+      height: plate !== "" ? Border.number("polkit", "title-image-height", Style.space(48)) : Style.space(28)
       anchors.horizontalCenter: card.horizontalCenter
       anchors.bottom: card.top
       anchors.bottomMargin: Style.space(10)
       radius: root.cornerRadius
-      color: root.background
+      color: plate !== "" ? "transparent" : root.background
+
+      Image {
+        anchors.fill: parent
+        visible: parent.plate !== ""
+        source: visible ? parent.plate : ""
+        fillMode: Image.Stretch
+        smooth: true
+      }
 
       Text {
         id: justificationText
         textFormat: Text.PlainText
         anchors.fill: parent
-        anchors.leftMargin: Style.space(12)
-        anchors.rightMargin: Style.space(12)
+        anchors.leftMargin: Style.space(parent.plate !== "" ? 32 : 12)
+        anchors.rightMargin: Style.space(parent.plate !== "" ? 32 : 12)
         text: root.authorizationLabel(root.currentMessage)
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
+        color: parent.plate !== "" ? root.accent : root.foreground
+        style: Style.font.shadowStyle
+        styleColor: Style.font.shadowColor
+        font.family: Style.titleFamilyOr(root.fontFamily)
+        font.pixelSize: parent.plate !== "" ? Style.font.body : Style.font.bodySmall
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter
         elide: Text.ElideMiddle
