@@ -344,8 +344,8 @@ Item {
         property real _anchorY: 0
         property real _availableBelow: 0
         readonly property real _windowHeight: parent ? parent.height : 0
-        readonly property real _idealContent: resultList.contentHeight + Style.space(50)
-        readonly property real _maxRowsHeight: root.popupRowHeight * 6 + 5 * Style.spacing.labelGap + Style.space(50)
+        readonly property real _idealContent: resultList.contentHeight + Style.space(50) + Border.frameChrome(root.popupBorderSpec)
+        readonly property real _maxRowsHeight: root.popupRowHeight * 6 + 5 * Style.spacing.labelGap + Style.space(50) + Border.frameChrome(root.popupBorderSpec)
 
         function reposition() {
           if (!parent) return

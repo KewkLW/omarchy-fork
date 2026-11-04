@@ -174,6 +174,7 @@ Item {
         implicitHeight: Math.max(root.popupMinHeight,
                                  Math.min(resultList.contentHeight + Style.space(50),
                                           root.popupRowHeight * 6 + 5 * Style.spacing.labelGap + Style.space(50)))
+          + Border.frameChrome(root.popupBorderSpec)
         padding: Style.spacing.hairline
         leftPadding: Border.left(root.popupBorderSpec) + Style.spacing.hairline
         rightPadding: Border.right(root.popupBorderSpec) + Style.spacing.hairline
