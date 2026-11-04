@@ -410,7 +410,9 @@ the art. That mode only runs through its passwordless sudoers rule and never
 asks polkit; where the rule is missing the theme keeps its policy colour and
 the art stays out. The art reaches Chromium at its next start, which also
 shows Chromium's "Installed theme" bar. A theme without `chromium/` behaves as
-before.
+before. While an art theme is active, `chromium-flags.conf` carries the
+extra path, so Omarchy updates that refresh an unmodified flags file pass it by
+until a theme without art takes the path back out.
 
 The format is images and colours: frame, toolbar, tab and new-tab backgrounds.
 Chromium themes cannot frame menus or draw button art; KewkyFox's
