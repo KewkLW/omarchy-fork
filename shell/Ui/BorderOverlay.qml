@@ -43,7 +43,7 @@ Item {
     horizontalTileMode: BorderImage.Stretch
     verticalTileMode: BorderImage.Stretch
     smooth: true
-    cache: true
+    cache: false
   }
 
   Shape {

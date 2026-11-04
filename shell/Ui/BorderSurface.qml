@@ -39,7 +39,7 @@ Rectangle {
     fillMode: Image.Tile
     opacity: root.frameSpec ? root.frameSpec.fillAlpha : 1
     smooth: true
-    cache: true
+    cache: false
   }
 
   Loader {
