@@ -36,6 +36,7 @@ User-installed plugins live alongside these conceptually but on disk under
 | Lock screen   | `omarchy.lock`            | `service`               | `lock/Service.qml`                    |
 | OSD           | `omarchy.osd`             | `panel`                 | `osd/Osd.qml`                         |
 | Polkit agent  | `omarchy.polkit`          | `service`               | `polkit/PolkitAgent.qml`              |
+| Window frames | `omarchy.window-frames`   | `service`               | `window-frames/WindowFrames.qml`      |
 
 First-party bar-only widgets also carry manifests next to their QML files,
 e.g. `bar/widgets/Workspaces.manifest.json`. Rich popup widgets live in their
@@ -93,6 +94,25 @@ Theme-aware authentication dialog for privileged actions. It uses
 Quickshell's native `Quickshell.Services.Polkit.PolkitAgent` backend and
 runs inside the long-lived `omarchy-shell` process, replacing the old
 `polkit-gnome-authentication-agent-1` autostart.
+
+## Window frames
+
+Draws the theme's image frame, and an optional title plate with the window
+title, around every Hyprland window. A theme opts in with a `[windows]`
+section in `shell.toml` (`frame`, `frame-slice`, `frame-width`,
+`frame-inset`, `title-image`, `title-image-slice`, `title-image-height`,
+`title-overlap`, `title-padding`, `title-text`, `title-size`; see the header
+of `WindowFrames.qml`). Themes without `[windows] frame` get no surfaces.
+
+The frames live on a click-through top layer, outside each window, and are
+cut out wherever a window stacked higher covers them. Hyprland sends no
+event for drags and resizes, so the focused window's geometry is probed
+every 100 ms and the rest once a second; a window that moves hides its
+frame until it settles. Fullscreen and maximized windows hide the frames on
+their workspace. The theme leaves room for the frame with Hyprland gaps
+and should set `decoration.rounding` to 0. Tag a window `no-window-frame`
+to leave it bare, or turn the feature off with
+`"disabledPlugins": ["omarchy.window-frames"]` in `shell.json`.
 
 ## Omarchy menu
 

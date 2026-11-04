@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy.window-frames",
+  "name": "Window frames",
+  "version": "1.0.0",
+  "author": "Omarchy",
+  "description": "Draws the theme's [windows] image frame and title plate around Hyprland windows.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "WindowFrames.qml"
+  }
+}
