@@ -318,8 +318,50 @@ QtObject {
     return (override && override.length > 0) ? override : fontFamily
   }
 
+  // Theme typefaces for words, as opposed to glyphs. [font] text-family is
+  // used for labels and body text on themed surfaces (notifications, OSD,
+  // menu rows, tooltips, buttons); title-family for headings and title
+  // plates. text-file / title-file load a font shipped in the theme
+  // directory, so it needs no system install. Unset, both follow the shell
+  // font. Icons keep `family`, which carries the Nerd Font glyphs.
+  // text-shadow = "#000000" adds a 1px drop shadow to that text.
+  function themeFontFile(key) {
+    var rel = String(Color.shellValues["font." + key] || "").replace(/^\s+|\s+$/g, "")
+    if (rel.length === 0) return ""
+    return rel.charAt(0) === "/" ? "file://" + rel : "file://" + Color.currentThemePath + "/" + rel
+  }
+
+  function themeFontFamily(key, loader, fallback) {
+    var named = String(Color.shellValues["font." + key + "-family"] || "").replace(/^\s+|\s+$/g, "")
+    if (loader.source.toString().length > 0) {
+      // Until the file loads, keep the fallback rather than a missing face.
+      if (loader.status !== FontLoader.Ready) return fallback
+      return named.length > 0 ? named : loader.name
+    }
+    return named.length > 0 ? named : fallback
+  }
+
+  property FontLoader textFontLoader: FontLoader { source: root.themeFontFile("text-file") }
+  property FontLoader titleFontLoader: FontLoader { source: root.themeFontFile("title-file") }
+  // "" when the theme sets no face of its own.
+  readonly property string themeTextFamily: themeFontFamily("text", textFontLoader, "")
+  readonly property string themeTitleFamily: themeFontFamily("title", titleFontLoader, themeTextFamily)
+  readonly property string textFamily: themeTextFamily.length > 0 ? themeTextFamily : fontFamily
+  readonly property string titleFamily: themeTitleFamily.length > 0 ? themeTitleFamily : textFamily
+
+  // For surfaces whose own default face is not the shell font.
+  function textFamilyOr(fallback) { return themeTextFamily.length > 0 ? themeTextFamily : fallback }
+  function titleFamilyOr(fallback) { return themeTitleFamily.length > 0 ? themeTitleFamily : fallback }
+  readonly property string textShadowRaw: String(Color.shellValues["font.text-shadow"] || "")
+
   readonly property QtObject font: QtObject {
     readonly property string family: root.fontFamily
+    // Theme typefaces and shadow (see textFamily above).
+    readonly property string textFamily: root.textFamily
+    readonly property string titleFamily: root.titleFamily
+    readonly property bool shadow: root.textShadowRaw.length > 0
+    readonly property color shadowColor: root.shadow ? Color.flatColor(root.textShadowRaw, "#000000") : "transparent"
+    readonly property int shadowStyle: root.shadow ? Text.Raised : Text.Normal
     readonly property string resolvedFamily: root.resolvedFontFamily
     readonly property string menuFamily: root.menuFontFamily
     readonly property int baseSize: root.fontBaseSize

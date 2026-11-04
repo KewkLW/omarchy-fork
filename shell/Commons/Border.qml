@@ -146,6 +146,16 @@ QtObject {
   //   frame-fill   = "frames/fill.png"    optional tiled fill under content
   //   frame-fill-inset = 19               fill inset from the outer edge
   //   frame-fill-alpha = 0.95
+  //   frame-mode   = "stretch"            draw the whole image scaled to the
+  //                                       surface instead of 9-slicing it
+  //   frame-outset = 7                    draw the frame this many px past the
+  //                                       surface edge, for art with a
+  //                                       transparent margin or outer glow
+  // frame-inset also takes a CSS-style list ("T R B L") for art whose
+  // content area is not centred.
+  //
+  // Other image tokens reuse the same keys under their own prefix, e.g.
+  // [osd] progress-frame, progress-frame-slice, progress-frame-mode.
   function themeFile(rel) {
     var s = String(rel || "").replace(/^\s+|\s+$/g, "")
     if (s.length === 0) return ""
@@ -153,25 +163,66 @@ QtObject {
     return "file://" + Color.currentThemePath + "/" + s
   }
 
+  // A theme image token ([section] key = "path"), as a file URL or "".
+  function image(section, key) {
+    return themeFile(value(section, key))
+  }
+
   function number(section, key, fallback) {
     var n = Number(value(section, key))
     return String(value(section, key)).length > 0 && isFinite(n) && n >= 0 ? n : fallback
   }
 
-  function frameSpec(section) {
-    var source = themeFile(value(section, "frame"))
+  function frameSpec(section, prefix) {
+    var p = prefix || "frame"
+    var source = themeFile(value(section, p))
     if (source.length === 0) return null
-    var slice = number(section, "frame-slice", 16)
-    var width = number(section, "frame-width", slice)
+    var slice = number(section, p + "-slice", 16)
+    var width = number(section, p + "-width", slice)
+    var inset = value(section, p + "-inset")
     return {
       source: source,
+      stretch: String(value(section, p + "-mode")) === "stretch",
       slice: slice,
       width: width,
-      inset: number(section, "frame-inset", width),
-      fill: themeFile(value(section, "frame-fill")),
-      fillInset: number(section, "frame-fill-inset", 0),
-      fillAlpha: alpha(section, "frame-fill-alpha", 1.0),
+      inset: String(inset).length > 0 ? inset : width,
+      outset: number(section, p + "-outset", 0),
+      fill: themeFile(value(section, p + "-fill")),
+      fillInset: number(section, p + "-fill-inset", 0),
+      fillAlpha: alpha(section, p + "-fill-alpha", 1.0),
     }
+  }
+
+  // A border spec that is only an image frame, for controls and parts that
+  // have no colour border of their own (null when the theme sets no image).
+  function frameOnlySpec(section, prefix) {
+    var frame = frameSpec(section, prefix)
+    if (!frame) return null
+    return {
+      color: "transparent",
+      widths: Geometry.parseWidthSpec(frame.inset, 0),
+      gradient: { colors: [], angle: 0, enabled: false },
+      frame: frame,
+    }
+  }
+
+  // Theme art for text buttons ([controls] button-frame, with the usual
+  // frame keys, plus button-frame-hover and button-frame-pressed images for
+  // those states). null when the theme sets none. state: "normal", "hover"
+  // or "pressed".
+  function buttonSpec(state) {
+    var spec = frameOnlySpec("controls", "button-frame")
+    if (!spec) return null
+    var alt = state === "hover" ? image("controls", "button-frame-hover")
+      : state === "pressed" ? image("controls", "button-frame-pressed")
+      : ""
+    if (alt.length > 0) {
+      var frame = {}
+      for (var k in spec.frame) frame[k] = spec.frame[k]
+      frame.source = alt
+      spec.frame = frame
+    }
+    return spec
   }
 
   function surfaceSpec(section, token, fallbackColor, fallbackWidth, alphaKey) {
@@ -271,6 +322,11 @@ QtObject {
 
   function isNone(spec) { return !spec || Geometry.maxWidth(spec.widths) <= 0 }
   function hasFrame(spec) { return !!(spec && spec.frame) }
+  // Vertical room an image frame takes. Surfaces sized from their content
+  // add it: a frame inset is far thicker than the colour border their
+  // height math was written for. 0 without a frame, so colour borders keep
+  // their old sizes.
+  function frameChrome(spec) { return hasFrame(spec) ? top(spec) + bottom(spec) : 0 }
   function needsOverlay(spec) { return hasFrame(spec) || Geometry.needsOverlay(spec) }
   function canUseNative(spec) { return !hasFrame(spec) && Geometry.canUseNative(spec) }
   function top(spec) { return spec && spec.widths ? spec.widths.top : 0 }
