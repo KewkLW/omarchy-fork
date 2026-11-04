@@ -69,13 +69,17 @@ sudo_grants_passwordless() {
 require_root() {
   if (( EUID == 0 )); then
     return
-  elif [[ -t 0 ]] || sudo_grants_passwordless "$@"; then
-    exec sudo "$PACKAGED_PATH" "$@"
   elif [[ $1 == chromium-art ]]; then
     # Theme art is optional: where the grant does not reach, Chromium keeps the
-    # policy colour rather than stopping a theme switch for a password.
+    # policy colour rather than stopping a theme switch for a password, even in
+    # a terminal.
+    if sudo_grants_passwordless "$@"; then
+      exec sudo "$PACKAGED_PATH" "$@"
+    fi
     echo "omarchy-theme-set-browser-policy: no passwordless grant for chromium-art" >&2
     exit 1
+  elif [[ -t 0 ]] || sudo_grants_passwordless "$@"; then
+    exec sudo "$PACKAGED_PATH" "$@"
   else
     exec pkexec "$PACKAGED_PATH" "$@"
   fi
