@@ -137,15 +137,54 @@ QtObject {
     return { color: color, gradient: gradient }
   }
 
+  // Image frame for a surface section: a 9-slice PNG drawn instead of the
+  // colour border. Paths are relative to the current theme directory.
+  //   frame        = "frames/dialog.png"  9-slice source image
+  //   frame-slice  = 32                   source px cut from each edge
+  //   frame-width  = 56                   rendered edge thickness
+  //   frame-inset  = 30                   content inset (default frame-width)
+  //   frame-fill   = "frames/fill.png"    optional tiled fill under content
+  //   frame-fill-inset = 19               fill inset from the outer edge
+  //   frame-fill-alpha = 0.95
+  function themeFile(rel) {
+    var s = String(rel || "").replace(/^\s+|\s+$/g, "")
+    if (s.length === 0) return ""
+    if (s.charAt(0) === "/") return "file://" + s
+    return "file://" + Color.currentThemePath + "/" + s
+  }
+
+  function number(section, key, fallback) {
+    var n = Number(value(section, key))
+    return String(value(section, key)).length > 0 && isFinite(n) && n >= 0 ? n : fallback
+  }
+
+  function frameSpec(section) {
+    var source = themeFile(value(section, "frame"))
+    if (source.length === 0) return null
+    var slice = number(section, "frame-slice", 16)
+    var width = number(section, "frame-width", slice)
+    return {
+      source: source,
+      slice: slice,
+      width: width,
+      inset: number(section, "frame-inset", width),
+      fill: themeFile(value(section, "frame-fill")),
+      fillInset: number(section, "frame-fill-inset", 0),
+      fillAlpha: alpha(section, "frame-fill-alpha", 1.0),
+    }
+  }
+
   function surfaceSpec(section, token, fallbackColor, fallbackWidth, alphaKey) {
     var opacity = alpha(section, alphaKey || token + "-alpha", 1.0)
     var legacyGradientRaw = valueOr(section, token === "border" ? ["border-gradient"] : [token + "-gradient", "border-gradient"])
     var resolved = borderValue(resolveValueRef(value(section, token)), fallbackColor, opacity, legacyGradientRaw)
+    var frame = (token === "border" || token.indexOf("border-") === 0) ? frameSpec(section) : null
 
     return {
       color: resolved.color,
-      widths: surfaceWidths(section, token, fallbackWidth),
+      widths: frame ? Geometry.parseWidthSpec(frame.inset, 0) : surfaceWidths(section, token, fallbackWidth),
       gradient: resolved.gradient,
+      frame: frame,
     }
   }
 
@@ -227,12 +266,13 @@ QtObject {
 
   function withWidth(spec, width) {
     if (!spec) return flat("transparent", 0)
-    return { color: spec.color, gradient: spec.gradient, widths: Geometry.parseWidthSpec(width, 0) }
+    return { color: spec.color, gradient: spec.gradient, widths: Geometry.parseWidthSpec(width, 0), frame: spec.frame }
   }
 
   function isNone(spec) { return !spec || Geometry.maxWidth(spec.widths) <= 0 }
-  function needsOverlay(spec) { return Geometry.needsOverlay(spec) }
-  function canUseNative(spec) { return Geometry.canUseNative(spec) }
+  function hasFrame(spec) { return !!(spec && spec.frame) }
+  function needsOverlay(spec) { return hasFrame(spec) || Geometry.needsOverlay(spec) }
+  function canUseNative(spec) { return !hasFrame(spec) && Geometry.canUseNative(spec) }
   function top(spec) { return spec && spec.widths ? spec.widths.top : 0 }
   function right(spec) { return spec && spec.widths ? spec.widths.right : 0 }
   function bottom(spec) { return spec && spec.widths ? spec.widths.bottom : 0 }

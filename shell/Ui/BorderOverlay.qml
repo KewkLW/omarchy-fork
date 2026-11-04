@@ -18,12 +18,36 @@ Item {
   readonly property var _colors: _gradient.enabled ? _gradient.colors : [Border.color(borderSpec), Border.color(borderSpec)]
   readonly property var _endpoints: Geometry.gradientEndpoints(width, height, _gradient.angle || 0)
   readonly property string _path: Geometry.ringPath(width, height, radius, _widths)
+  readonly property var _frame: borderSpec && borderSpec.frame ? borderSpec.frame : null
+  readonly property real _frameScale: _frame && _frame.slice > 0 ? _frame.width / _frame.slice : 1
 
-  visible: hasBorder && width > 0 && height > 0
+  visible: (hasBorder || _frame !== null) && width > 0 && height > 0
   anchors.fill: parent
   z: 100000
 
+  // Theme image frame: a 9-slice drawn at source size, then scaled so its
+  // edges render frame-width px thick.
+  BorderImage {
+    visible: root._frame !== null
+    x: 0
+    y: 0
+    width: root.width / root._frameScale
+    height: root.height / root._frameScale
+    scale: root._frameScale
+    transformOrigin: Item.TopLeft
+    source: root._frame ? root._frame.source : ""
+    border.left: root._frame ? root._frame.slice : 0
+    border.right: root._frame ? root._frame.slice : 0
+    border.top: root._frame ? root._frame.slice : 0
+    border.bottom: root._frame ? root._frame.slice : 0
+    horizontalTileMode: BorderImage.Stretch
+    verticalTileMode: BorderImage.Stretch
+    smooth: true
+    cache: true
+  }
+
   Shape {
+    visible: root._frame === null
     anchors.fill: parent
     preferredRendererType: Shape.CurveRenderer
 

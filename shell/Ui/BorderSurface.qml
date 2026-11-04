@@ -24,8 +24,23 @@ Rectangle {
   readonly property real contentLeftInset: borderLeft + leftPadding
   readonly property bool usesOverlayBorder: Border.needsOverlay(borderSpec)
 
+  readonly property var frameSpec: borderSpec && borderSpec.frame ? borderSpec.frame : null
+
   border.color: Border.canUseNative(borderSpec) ? Border.color(borderSpec) : "transparent"
   border.width: Border.canUseNative(borderSpec) ? Border.uniformWidth(borderSpec) : 0
+
+  // Theme image fill under the content of a framed surface. Declared before
+  // any content child so it paints beneath it.
+  Image {
+    visible: !!(root.frameSpec && root.frameSpec.fill)
+    anchors.fill: parent
+    anchors.margins: root.frameSpec ? root.frameSpec.fillInset : 0
+    source: root.frameSpec && root.frameSpec.fill ? root.frameSpec.fill : ""
+    fillMode: Image.Tile
+    opacity: root.frameSpec ? root.frameSpec.fillAlpha : 1
+    smooth: true
+    cache: true
+  }
 
   Loader {
     anchors.fill: parent
