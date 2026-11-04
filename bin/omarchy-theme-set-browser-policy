@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # omarchy:summary=Write the current theme color into the browser policy directories
-# omarchy:args=<rrggbb>
+# omarchy:args=<rrggbb> | chromium-art
 # omarchy:hidden=true
 
 set -euo pipefail
@@ -33,7 +33,7 @@ POLICY_DIRS=(
 PACKAGED_PATH=/usr/bin/omarchy-theme-set-browser-policy
 
 usage() {
-  echo "Usage: omarchy-theme-set-browser-policy <rrggbb>" >&2
+  echo "Usage: omarchy-theme-set-browser-policy <rrggbb> | chromium-art" >&2
 }
 
 if (( $# != 1 )); then
@@ -47,8 +47,12 @@ color="$1"
 # is added when the JSON is written rather than passed in: "#" opens a comment
 # in sudoers, and keeping it out of argv lets the sudoers rule spell the
 # argument as a plain six-character glob.
-if [[ ! $color =~ ^[0-9a-f]{6}$ ]]; then
-  echo "omarchy-theme-set-browser-policy: expected six lowercase hex digits, got '$color'" >&2
+#
+# chromium-art is the one other argument: the theme brings its own Chromium art
+# (omarchy-theme-set-browser loads it as a theme extension), and a policy colour
+# would paint over it, so Chromium's policy keeps only the colour scheme.
+if [[ ! $color =~ ^[0-9a-f]{6}$ && $color != chromium-art ]]; then
+  echo "omarchy-theme-set-browser-policy: expected six lowercase hex digits or chromium-art, got '$color'" >&2
   exit 1
 fi
 
@@ -67,6 +71,11 @@ require_root() {
     return
   elif [[ -t 0 ]] || sudo_grants_passwordless "$@"; then
     exec sudo "$PACKAGED_PATH" "$@"
+  elif [[ $1 == chromium-art ]]; then
+    # Theme art is optional: where the grant does not reach, Chromium keeps the
+    # policy colour rather than stopping a theme switch for a password.
+    echo "omarchy-theme-set-browser-policy: no passwordless grant for chromium-art" >&2
+    exit 1
   else
     exec pkexec "$PACKAGED_PATH" "$@"
   fi
@@ -91,12 +100,19 @@ for policy_dir in "${POLICY_DIRS[@]}"; do
   # here would hand a browser a managed-policy root it does not otherwise have.
   [[ -d $policy_dir && ! -L $policy_dir ]] || continue
 
+  if [[ $color == chromium-art ]]; then
+    [[ $policy_dir == /etc/chromium/policies/managed ]] || continue
+    policy='{"BrowserColorScheme": "device"}'
+  else
+    policy=$(printf '{"BrowserThemeColor": "#%s", "BrowserColorScheme": "device"}' "$color")
+  fi
+
   dest=$policy_dir/color.json
   staged=$(mktemp) || {
     failed=1
     continue
   }
-  printf '{"BrowserThemeColor": "#%s", "BrowserColorScheme": "device"}\n' "$color" >"$staged"
+  printf '%s\n' "$policy" >"$staged"
 
   if [[ -L $dest || -d $dest ]]; then
     if ! rm -rf -- "$dest"; then

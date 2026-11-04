@@ -8,13 +8,14 @@ helper="$ROOT/bin/omarchy-theme-set-browser-policy"
 setter="$ROOT/bin/omarchy-theme-set-browser"
 sudoers_file="$ROOT/etc/sudoers.d/omarchy-theme-browser"
 rule='%wheel ALL=(root) NOPASSWD: /usr/bin/omarchy-theme-set-browser-policy [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+art_rule='%wheel ALL=(root) NOPASSWD: /usr/bin/omarchy-theme-set-browser-policy chromium-art'
 
-# Exactly one rule, matched whole. Dropping the argument -- which sudoers reads
-# as "any arguments" -- or widening the glob to `*` would let the grant carry
-# something other than a color while leaving this line looking right.
+# Exactly these two rules, matched whole. Dropping the argument -- which
+# sudoers reads as "any arguments" -- or widening the glob to `*` would let the
+# grant carry something other than a color while leaving this line looking right.
 rules=$(grep -vE '^[[:space:]]*(#|$)' "$sudoers_file")
-[[ $rules == "$rule" ]] ||
-  fail "browser policy sudoers file carries exactly the six-hex-digit rule and nothing else" "got: $rules"
+[[ $rules == "$rule"$'\n'"$art_rule" ]] ||
+  fail "browser policy sudoers file carries exactly the six-hex-digit rule and the chromium-art rule" "got: $rules"
 
 if command -v visudo >/dev/null; then
   visudo -cf "$sudoers_file" >/dev/null || fail "browser policy sudoers rule parses"
@@ -32,7 +33,7 @@ gated=$(grep -A1 -E '^if \(\( EUID == 0 \)\); then$' "$helper" || true)
 [[ $gated == *"export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin"* ]] ||
   fail "omarchy-theme-set-browser-policy gates the trusted-PATH pin on holding root"
 
-pass "browser policy sudoers rule is scoped to a single color argument"
+pass "browser policy sudoers rules are scoped to a single color argument or chromium-art"
 
 for dir in /etc/chromium/policies/managed /etc/opt/chrome/policies/managed \
   /etc/opt/edge/policies/managed /etc/brave/policies/managed; do
@@ -111,8 +112,18 @@ else
 
   pass "browser policy helper falls back to polkit wherever the grant does not reach"
 
+  art=$(elevation_for chromium-art)
+  [[ $art == "sudo /usr/bin/omarchy-theme-set-browser-policy chromium-art" ]] ||
+    fail "omarchy-theme-set-browser-policy takes the chromium-art grant without a terminal" "got: $art"
+
+  art_ungranted=$(STUB_GRANTED="" elevation_for chromium-art)
+  [[ -z $art_ungranted ]] ||
+    fail "omarchy-theme-set-browser-policy never asks polkit for chromium-art" "got: $art_ungranted"
+
+  pass "browser policy helper drops the Chromium colour only through the passwordless grant"
+
   for bad in "" "1C2027" "abc12" "abc1234" "1c202g" "../../etc/passwd" "1c2027 1c2027" \
-    '$(id)' "1c2027;id" "#1c2027"; do
+    '$(id)' "1c2027;id" "#1c2027" "chromium" "chromium-art2" "CHROMIUM-ART" " chromium-art"; do
     if PATH="$stub_bin:$PATH" ELEVATION_LOG="$test_tmp/elevation" \
       bash "$helper" "$bad" </dev/null >/dev/null 2>&1; then
       fail "omarchy-theme-set-browser-policy rejects '$bad'"
@@ -127,7 +138,7 @@ else
     fail "omarchy-theme-set-browser-policy rejects more than one argument"
   fi
 
-  pass "browser policy helper accepts nothing but six lowercase hex digits"
+  pass "browser policy helper accepts nothing but six lowercase hex digits or chromium-art"
 fi
 
 setter_bin="$test_tmp/setter-bin"
@@ -135,6 +146,10 @@ mkdir -p "$setter_bin"
 
 cat >"$setter_bin/omarchy-theme-set-browser-policy" <<'SH'
 #!/bin/bash
+if [[ $1 == chromium-art ]]; then
+  printf '%s\n' "$*" >>"$COLOR_LOG.art"
+  exit "${STUB_ART_FAILS:-0}"
+fi
 printf '%s\n' "$*" >"$COLOR_LOG"
 SH
 chmod +x "$setter_bin/omarchy-theme-set-browser-policy"
@@ -182,3 +197,62 @@ done
   fail "omarchy-theme-set-browser falls back to the stock colour with no theme file"
 
 pass "browser theme color is derived as six hex digits or falls back to the stock grey"
+
+# Chromium art: a theme's chromium/<image key>.png files become a theme
+# extension Omarchy writes itself, loaded through chromium-flags.conf.
+art_dir="$theme_dir/chromium"
+extension="$setter_home/.local/state/omarchy/current/chromium-theme"
+flags="$setter_home/.config/chromium-flags.conf"
+mkdir -p "$art_dir" "$setter_home/.config"
+printf 'mint = "#7aa2f7"\nbackground = "#1a1b26"\nforeground = "#c0caf5"\n' >"$theme_dir/colors.toml"
+printf 'art-theme\n' >"$setter_home/.local/state/omarchy/current/theme.name"
+printf '%s\n' --ozone-platform=wayland --load-extension=/usr/share/omarchy/default/chromium/extensions/copy-url >"$flags"
+printf 'png' >"$art_dir/theme_ntp_background.png"
+printf 'png' >"$art_dir/not_a_key.png"
+printf '{"background": {"scripts": ["x.js"]}}' >"$art_dir/manifest.json"
+
+run_setter() {
+  rm -f "$test_tmp/color.art"
+  HOME="$setter_home" XDG_CONFIG_HOME="$setter_home/.config" COLOR_LOG="$test_tmp/color" \
+    PATH="$setter_bin:$stub_bin:$PATH" OMARCHY_PATH="$ROOT" \
+    bash "$setter" </dev/null >/dev/null 2>&1 || true
+}
+
+run_setter
+[[ -f $extension/images/theme_ntp_background.png ]] ||
+  fail "omarchy-theme-set-browser copies a theme's Chromium image under its key"
+[[ ! -e $extension/images/not_a_key.png ]] ||
+  fail "omarchy-theme-set-browser copies only Chromium theme image keys"
+grep -q '"theme_ntp_background": "images/theme_ntp_background.png"' "$extension/manifest.json" ||
+  fail "omarchy-theme-set-browser names the image in the generated manifest"
+if grep -q 'scripts' "$extension/manifest.json"; then
+  fail "omarchy-theme-set-browser never loads a manifest the theme ships"
+fi
+grep -q '"background": \[26, 27, 38\]\|"toolbar": \[26, 27, 38\]' "$extension/manifest.json" ||
+  fail "omarchy-theme-set-browser colours the extension from colors.toml"
+[[ $(cat "$test_tmp/color.art") == "chromium-art" ]] ||
+  fail "omarchy-theme-set-browser drops the Chromium policy colour for a theme with art"
+[[ $(grep -c '^--load-extension=' "$flags") == 1 ]] &&
+  grep -qx -- "--load-extension=/usr/share/omarchy/default/chromium/extensions/copy-url,$extension" "$flags" ||
+  fail "omarchy-theme-set-browser adds the theme extension to the existing --load-extension line" "got: $(cat "$flags")"
+
+run_setter
+grep -qx -- "--load-extension=/usr/share/omarchy/default/chromium/extensions/copy-url,$extension" "$flags" ||
+  fail "omarchy-theme-set-browser adds the theme extension only once" "got: $(cat "$flags")"
+
+pass "a theme with Chromium art gets a generated theme extension and loses the policy colour"
+
+STUB_ART_FAILS=1 run_setter
+[[ ! -e $extension ]] ||
+  fail "omarchy-theme-set-browser drops the theme extension where the policy colour cannot go"
+grep -qx -- "--load-extension=/usr/share/omarchy/default/chromium/extensions/copy-url" "$flags" ||
+  fail "omarchy-theme-set-browser takes the theme extension back out of the flags" "got: $(cat "$flags")"
+
+rm -rf "$art_dir"
+run_setter
+[[ ! -e $extension && ! -e $test_tmp/color.art ]] ||
+  fail "a theme without Chromium art keeps the policy colour and loads no extension"
+grep -qx -- "--load-extension=/usr/share/omarchy/default/chromium/extensions/copy-url" "$flags" ||
+  fail "a theme without Chromium art leaves the flags as they were" "got: $(cat "$flags")"
+
+pass "a theme without Chromium art, or without the grant, keeps today's policy colour"

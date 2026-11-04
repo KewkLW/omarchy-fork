@@ -369,6 +369,53 @@ For a gradient it renders:
 local active_border_color = { colors = { "rgba(33ccffee)", "rgba(00ff99ee)" }, angle = 45 }
 ```
 
+## KewkyFox
+
+KewkyFox watches `~/.local/state/omarchy/current/theme` and restyles its open
+windows within a second of a theme change, no restart. Two files drive it:
+
+- `kewkyfox.css` styles the browser chrome: tabs, toolbars, the address bar,
+  menus, panels and tooltips. `default/themed/kewkyfox.css.tpl` generates it
+  from `colors.toml`. Rules sit under `:root[omarchy-theme]`, which KewkyFox
+  sets while a theme sheet is loaded.
+- `kewkyfox-content.css` styles pages, like `userContent.css`: wrap rules in
+  `@-moz-document`. The generated one puts the palette and the current
+  wallpaper (`../background`) behind the new-tab page.
+
+A theme can ship either file to replace the generated one, art included.
+`url()` and `@import` paths are relative to the theme directory, so a theme
+can reuse its `frames/` or bring its own images. KewkyFox makes chrome-sheet
+paths absolute and keys them to the theme, so two themes that both ship
+`frames/bar.png` never share a cached image. Pages cannot read the theme
+directory, so KewkyFox inlines the images a content sheet names, scaling
+large ones down to 1920 px.
+
+## Chromium art
+
+Every theme gives Chromium its colour through the `BrowserThemeColor` policy,
+live. A theme can also bring images: `chromium/<key>.png`, one file per image
+a Chromium theme takes (`theme_frame`, `theme_frame_inactive`,
+`theme_toolbar`, `theme_tab_background`, `theme_tab_background_inactive`,
+`theme_ntp_background`, `theme_ntp_attribution`, `theme_button_background`,
+`theme_window_control_background` and the frame overlays). PNG only: Chromium
+ignores a JPEG theme image.
+
+`omarchy-theme-set-browser` then writes a theme extension of its own to
+`~/.local/state/omarchy/current/chromium-theme`: those images, colours from
+`colors.toml`, and a manifest Omarchy generates, so nothing the theme ships is
+loaded as code. It adds that directory to the `--load-extension` line of
+`~/.config/chromium-flags.conf` and asks `omarchy-theme-set-browser-policy
+chromium-art` to drop Chromium's policy colour, which would otherwise paint over
+the art. That mode only runs through its passwordless sudoers rule and never
+asks polkit; where the rule is missing the theme keeps its policy colour and
+the art stays out. The art reaches Chromium at its next start, which also
+shows Chromium's "Installed theme" bar. A theme without `chromium/` behaves as
+before.
+
+The format is images and colours: frame, toolbar, tab and new-tab backgrounds.
+Chromium themes cannot frame menus or draw button art; KewkyFox's
+`kewkyfox.css` can.
+
 ## Adding or overriding theme files
 
 - Add palette values to `themes/<name>/colors.toml`.

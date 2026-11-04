@@ -4,5 +4,7 @@
 # a wildcard: the grant covers a color and nothing else, and sudoers matches a
 # command's arguments exactly, so it cannot be stretched into extra ones. The
 # helper revalidates the same shape, since the terminal path does not come
-# through this rule.
+# through this rule. The second rule is the one fixed word the helper takes
+# besides a color: a theme with its own Chromium art drops the policy colour.
 %wheel ALL=(root) NOPASSWD: /usr/bin/omarchy-theme-set-browser-policy [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]
+%wheel ALL=(root) NOPASSWD: /usr/bin/omarchy-theme-set-browser-policy chromium-art

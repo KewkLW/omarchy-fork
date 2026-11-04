@@ -8,6 +8,19 @@ source "$OMARCHY_PATH/install/helpers/browser-policy.sh"
 CHROMIUM_THEME=$HOME/.local/state/omarchy/current/theme/chromium.theme
 THEME_HEX_COLOR=$BROWSER_POLICY_DEFAULT_COLOR
 
+# A theme can bring Chromium art: chromium/<image key>.png, one file per image
+# a Chromium theme takes. Chromium loads it as a theme extension generated here,
+# outside the theme, so nothing the theme ships is ever loaded as a manifest.
+CHROMIUM_ART=$HOME/.local/state/omarchy/current/theme/chromium
+CHROMIUM_ART_EXTENSION=$HOME/.local/state/omarchy/current/chromium-theme
+CHROMIUM_FLAGS=${XDG_CONFIG_HOME:-$HOME/.config}/chromium-flags.conf
+CHROMIUM_ART_IMAGES=(
+  theme_frame theme_frame_inactive theme_frame_overlay theme_frame_overlay_inactive
+  theme_toolbar theme_tab_background theme_tab_background_inactive
+  theme_ntp_background theme_ntp_attribution theme_button_background
+  theme_window_control_background
+)
+
 if [[ -f $CHROMIUM_THEME ]]; then
   THEME_HEX_COLOR=$(browser_policy_theme_hex "$(<$CHROMIUM_THEME)")
 fi
@@ -22,8 +35,114 @@ refresh_running_browser() {
   fi
 }
 
+# "[r, g, b]" for a palette key, or nothing when the theme lacks it.
+chromium_art_rgb() {
+  local hex
+
+  hex=$(omarchy-theme-color "$1" 2>/dev/null) || return 1
+  [[ $hex =~ ^#[0-9A-Fa-f]{6}$ ]] || return 1
+  printf '[%d, %d, %d]' "0x${hex:1:2}" "0x${hex:3:2}" "0x${hex:5:2}"
+}
+
+# Writes the theme extension: the theme's own PNGs under their image keys, and
+# colours from colors.toml. Fails when the theme brings no art.
+build_chromium_art() {
+  local staging key rgb images="" colors="" sep=""
+  local -A palette=(
+    [frame]=dark_background [frame_inactive]=dark_background [toolbar]=background
+    [tab_text]=foreground [tab_background_text]=dark_foreground
+    [bookmark_text]=foreground [toolbar_text]=foreground [toolbar_button_icon]=foreground
+    [ntp_background]=background [ntp_text]=foreground [ntp_link]=accent
+    [omnibox_background]=darker_background [omnibox_text]=foreground
+  )
+
+  [[ -d $CHROMIUM_ART && ! -L $CHROMIUM_ART ]] || return 1
+
+  staging=$(mktemp -d "${CHROMIUM_ART_EXTENSION}.XXXXXX") || return 1
+  mkdir "$staging/images"
+
+  for key in "${CHROMIUM_ART_IMAGES[@]}"; do
+    [[ -f $CHROMIUM_ART/$key.png && ! -L $CHROMIUM_ART/$key.png ]] || continue
+    cp "$CHROMIUM_ART/$key.png" "$staging/images/$key.png"
+    images+="$sep\"$key\": \"images/$key.png\""
+    sep=", "
+  done
+
+  if [[ -z $images ]]; then
+    rm -rf "$staging"
+    return 1
+  fi
+
+  sep=""
+  for key in "${!palette[@]}"; do
+    rgb=$(chromium_art_rgb "${palette[$key]}") || continue
+    colors+="$sep\"$key\": $rgb"
+    sep=", "
+  done
+
+  cat >"$staging/manifest.json" <<EOF
+{
+  "manifest_version": 3,
+  "name": "Omarchy $(<"$HOME/.local/state/omarchy/current/theme.name")",
+  "version": "1.0",
+  "theme": {
+    "images": { $images },
+    "colors": { $colors },
+    "properties": { "ntp_background_alignment": "center", "ntp_background_repeat": "no-repeat" }
+  }
+}
+EOF
+
+  rm -rf "$CHROMIUM_ART_EXTENSION"
+  mv "$staging" "$CHROMIUM_ART_EXTENSION"
+}
+
+# Adds or removes the theme extension in the --load-extension line of
+# chromium-flags.conf, leaving every other flag and extension as it was.
+chromium_art_flag() {
+  local action="$1"
+  local tmp
+
+  [[ -f $CHROMIUM_FLAGS || $action == add ]] || return 0
+  touch "$CHROMIUM_FLAGS"
+  tmp=$(mktemp) || return 1
+
+  awk -v action="$action" -v path="$CHROMIUM_ART_EXTENSION" '
+    function emit(list,    n, i, parts, out) {
+      n = split(list, parts, ",")
+      out = ""
+      for (i = 1; i <= n; i++) {
+        if (parts[i] == "" || parts[i] == path) continue
+        out = out (out == "" ? "" : ",") parts[i]
+      }
+      if (action == "add") out = out (out == "" ? "" : ",") path
+      if (out != "") print "--load-extension=" out
+    }
+    /^--load-extension=/ { if (!seen) emit(substr($0, 18)); seen = 1; next }
+    { print }
+    END { if (!seen && action == "add") emit("") }
+  ' "$CHROMIUM_FLAGS" >"$tmp"
+
+  if cmp -s "$tmp" "$CHROMIUM_FLAGS"; then
+    rm -f "$tmp"
+  else
+    cat "$tmp" >"$CHROMIUM_FLAGS"
+    rm -f "$tmp"
+  fi
+}
+
 failed=0
 omarchy-theme-set-browser-policy "${THEME_HEX_COLOR#\#}" || failed=1
+
+# Theme art reaches Chromium at its next start, which reads the flag. The policy
+# colour would paint over it, so Chromium's goes; without that grant the theme
+# keeps its colour and the art stays out.
+if build_chromium_art && omarchy-theme-set-browser-policy chromium-art 2>/dev/null; then
+  chromium_art_flag add
+else
+  chromium_art_flag remove
+  rm -rf "$CHROMIUM_ART_EXTENSION"
+fi
 
 refresh_running_browser chromium chromium
 refresh_running_browser chrome google-chrome-stable || refresh_running_browser chrome google-chrome
