@@ -1283,6 +1283,7 @@ Item {
     }
 
     Image {
+      id: barCapLeft
       anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
       visible: root.hasBarImage && !root.transparent && root.barImageLeft !== ""
       source: visible ? root.barImageLeft : ""
@@ -1291,6 +1292,7 @@ Item {
     }
 
     Image {
+      id: barCapRight
       anchors { right: parent.right; top: parent.top; bottom: parent.bottom }
       visible: root.hasBarImage && !root.transparent && root.barImageRight !== ""
       source: visible ? root.barImageRight : ""
@@ -1300,6 +1302,8 @@ Item {
 
     Loader {
       anchors.fill: parent
+      anchors.leftMargin: barCapLeft.visible ? Math.round(barCapLeft.paintedWidth) : 0
+      anchors.rightMargin: barCapRight.visible ? Math.round(barCapRight.paintedWidth) : 0
       sourceComponent: root.vertical ? verticalBar : horizontalBar
 
       // A child of the loader, not a sibling of the sections: an ancestor stays
