@@ -66,7 +66,12 @@ if ttfx --help 2>&1 | grep -q -- '--erode'; then
 fi
 
 while true; do
-  if ((spin_chance > 0 && RANDOM % spin_chance == 0)); then
+  theme_effect=()
+  if mapfile -t theme_effect < <(omarchy-screensaver-theme-effect 2>/dev/null) && (( ${#theme_effect[@]} >= 2 )); then
+    ttfx -i "${theme_effect[0]}" \
+      --frame-rate 120 --canvas-width 0 --canvas-height 0 --reuse-canvas --anchor-canvas c --anchor-text c\
+      --no-eol --no-restore-cursor "${audio_args[@]}" "${theme_effect[@]:1}" &
+  elif ((spin_chance > 0 && RANDOM % spin_chance == 0)); then
     ttfx -i "$takeover_text" \
       --frame-rate 60 --canvas-width 0 --canvas-height 0 --reuse-canvas --anchor-canvas c --anchor-text c\
       --no-eol --no-restore-cursor spin3d --duration 80 &

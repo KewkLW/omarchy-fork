@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# omarchy:summary=Resolve a random screensaver effect from the current theme
+
+set -euo pipefail
+
+theme_dir="$HOME/.local/state/omarchy/current/theme"
+screensaver_dir="$theme_dir/screensaver"
+effects_file="$screensaver_dir/effects"
+
+if [[ ! -f $effects_file ]]; then
+  exit 1
+fi
+
+lines=()
+while IFS= read -r line; do
+  line=${line%%#*}
+  line=${line#"${line%%[![:space:]]*}"}
+  line=${line%"${line##*[![:space:]]}"}
+  [[ -n $line ]] || continue
+  lines+=("$line")
+done <"$effects_file"
+
+if (( ${#lines[@]} == 0 )); then
+  exit 1
+fi
+
+chosen=${lines[RANDOM % ${#lines[@]}]}
+read -r -a parts <<<"$chosen"
+
+art=${parts[0]}
+if [[ $art != /* ]]; then
+  art="$screensaver_dir/$art"
+fi
+
+if [[ ! -f $art ]]; then
+  exit 1
+fi
+
+printf '%s\n' "$art"
+for (( i = 1; i < ${#parts[@]}; i++ )); do
+  printf '%s\n' "${parts[i]}"
+done
