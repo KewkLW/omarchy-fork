@@ -78,6 +78,12 @@ Item {
   property color barForeground: useTransparentForeground ? transparentForeground : themeForeground
   property bool foregroundAnimationEnabled: true
   property color background: Color.bar.background
+  // Theme bar art ([bar] image, image-left, image-right in shell.toml): a
+  // strip tiled along the bar and end pieces drawn at each end.
+  readonly property string barImage: Border.themeFile(Border.value("bar", "image"))
+  readonly property string barImageLeft: Border.themeFile(Border.value("bar", "image-left"))
+  readonly property string barImageRight: Border.themeFile(Border.value("bar", "image-right"))
+  readonly property bool hasBarImage: barImage !== "" && !vertical
   property color urgent: Color.bar.active
 
   Behavior on barForeground { enabled: root.foregroundAnimationEnabled; ColorAnimation { duration: 420; easing.type: Easing.InOutCubic } }
@@ -1263,10 +1269,34 @@ Item {
 
     implicitWidth: root.vertical ? root.barSize : 0
     implicitHeight: root.vertical ? 0 : root.barSize
-    color: root.transparent ? "transparent" : root.background
+    color: root.transparent || root.hasBarImage ? "transparent" : root.background
     surfaceFormat.opaque: false
     WlrLayershell.namespace: "omarchy-bar"
     WlrLayershell.layer: WlrLayer.Top
+
+    Image {
+      anchors.fill: parent
+      visible: root.hasBarImage && !root.transparent
+      source: visible ? root.barImage : ""
+      fillMode: Image.TileHorizontally
+      smooth: true
+    }
+
+    Image {
+      anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
+      visible: root.hasBarImage && !root.transparent && root.barImageLeft !== ""
+      source: visible ? root.barImageLeft : ""
+      fillMode: Image.PreserveAspectFit
+      smooth: true
+    }
+
+    Image {
+      anchors { right: parent.right; top: parent.top; bottom: parent.bottom }
+      visible: root.hasBarImage && !root.transparent && root.barImageRight !== ""
+      source: visible ? root.barImageRight : ""
+      fillMode: Image.PreserveAspectFit
+      smooth: true
+    }
 
     Loader {
       anchors.fill: parent

@@ -35,6 +35,10 @@ BarWidget {
     root.bar.run("hyprctl dispatch " + Util.shellQuote("hl.dsp.focus({ workspace = \"" + id + "\" })"))
   }
 
+  // Theme slot art ([bar] button-image, button-active-image in shell.toml).
+  readonly property string buttonImage: Border.themeFile(Border.value("bar", "button-image"))
+  readonly property string buttonActiveImage: Border.themeFile(Border.value("bar", "button-active-image"))
+
   readonly property real trailingGap: root.vertical ? 0 : Style.spaceReal(1.5)
 
   implicitWidth: grid.implicitWidth + trailingGap
@@ -52,6 +56,7 @@ BarWidget {
       model: root.workspaceIds()
 
       WidgetButton {
+        id: workspaceButton
         required property int modelData
 
         readonly property var workspace: root.workspaceById(modelData)
@@ -66,6 +71,25 @@ BarWidget {
         fixedWidth: root.vertical ? root.barSize : Style.space(20)
         fixedHeight: root.barSize
         onPressed: function() { root.focusWorkspace(modelData) }
+
+        Image {
+          z: -1
+          anchors.centerIn: workspaceButton
+          width: Math.min(workspaceButton.width, workspaceButton.height) - 4
+          height: width
+          visible: root.buttonImage !== ""
+          source: visible ? root.buttonImage : ""
+          smooth: true
+        }
+
+        Image {
+          anchors.centerIn: workspaceButton
+          width: Math.min(workspaceButton.width, workspaceButton.height) + 6
+          height: width
+          visible: workspaceButton.focused && root.buttonActiveImage !== ""
+          source: visible ? root.buttonActiveImage : ""
+          smooth: true
+        }
       }
     }
   }
