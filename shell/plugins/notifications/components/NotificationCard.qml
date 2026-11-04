@@ -51,6 +51,23 @@ BorderSurface {
   readonly property color accentColor: urgency === 2 ? Color.urgent : (urgency === 0 ? dimColor : Color.notifications.countdown)
   readonly property var cardBorderSpec: Border.surfaceSpec("notifications", "border", Color.notifications.border, Math.max(1, Style.space(2)))
 
+  // Theme art for the card ([notifications] in shell.toml):
+  //   caption        small line above the summary, e.g. "New message"
+  //   caption-color  its colour (defaults to countdown)
+  //   summary-color  the summary line (defaults to text)
+  //   text-align     "center" centres caption, summary and body
+  //   icon-frame     image drawn over the icon slot, icon-frame-outset px
+  //                  larger than the icon on each side
+  //   badge          image at the right end of the card, badge-width px
+  readonly property string caption: String(Border.value("notifications", "caption"))
+  readonly property color captionColor: Color.pick("notifications.caption-color", Color.notifications.countdown)
+  readonly property color summaryColor: Color.pick("notifications.summary-color", Color.notifications.text)
+  readonly property int textAlign: String(Border.value("notifications", "text-align")) === "center" ? Text.AlignHCenter : Text.AlignLeft
+  readonly property string iconFrame: Border.image("notifications", "icon-frame")
+  readonly property int iconFrameOutset: Math.round(Border.number("notifications", "icon-frame-outset", 0))
+  readonly property string badge: Border.image("notifications", "badge")
+  readonly property int badgeWidth: Math.round(Border.number("notifications", "badge-width", Style.space(48)))
+
   function sanitizeBody(s) {
     return NotificationLogic.sanitizeBody(s, app, appIcon)
   }
@@ -99,12 +116,29 @@ BorderSurface {
     anchors.rightMargin: root.borderRight
     spacing: 0
 
+    Text {
+      textFormat: Text.PlainText
+      Layout.fillWidth: true
+      Layout.topMargin: Style.space(6)
+      Layout.leftMargin: Style.space(12)
+      Layout.rightMargin: Style.space(12)
+      visible: root.caption.length > 0
+      text: root.caption
+      horizontalAlignment: Text.AlignHCenter
+      color: root.captionColor
+      font.family: Style.font.titleFamily
+      font.pixelSize: Style.font.body
+      style: Style.font.shadowStyle
+      styleColor: Style.font.shadowColor
+      elide: Text.ElideRight
+    }
+
     // Text content.
     RowLayout {
       Layout.fillWidth: true
       Layout.leftMargin: Style.space(12)
       Layout.rightMargin: Style.space(12)
-      Layout.topMargin: root.singleLineToast ? Style.space(7) : Style.space(10)
+      Layout.topMargin: root.caption.length > 0 ? Style.space(2) : (root.singleLineToast ? Style.space(7) : Style.space(10))
       Layout.bottomMargin: root.singleLineToast ? Style.space(7) : Style.space(10)
       spacing: root.collapseRedundantIcon ? 0 : (root.compactGlyph ? Style.space(8) : Style.space(12))
 
@@ -128,6 +162,16 @@ BorderSurface {
           asynchronous: true
           smooth: true
           visible: !root.hasGlyph || smallIconImage.status === Image.Ready
+        }
+
+        Image {
+          anchors.fill: parent
+          anchors.margins: -root.iconFrameOutset
+          visible: root.iconFrame !== ""
+          source: visible ? root.iconFrame : ""
+          fillMode: Image.Stretch
+          smooth: true
+          z: 1
         }
 
         // Glyph fallback (Nerd Font character) when no image icon is
@@ -167,10 +211,13 @@ BorderSurface {
           Layout.fillWidth: true
           visible: root.summary.length > 0
           text: root.summary
-          font.family: "Liberation Sans"
-          color: Color.notifications.text
-          font.pixelSize: Style.font.title
-          font.bold: true
+          horizontalAlignment: root.textAlign
+          font.family: Style.textFamilyOr("Liberation Sans")
+          color: root.summaryColor
+          style: Style.font.shadowStyle
+          styleColor: Style.font.shadowColor
+          font.pixelSize: Style.themeTextFamily.length > 0 ? Style.font.heading : Style.font.title
+          font.bold: Style.themeTextFamily.length === 0
           wrapMode: Text.WordWrap
           elide: Text.ElideRight
           maximumLineCount: 2
@@ -182,13 +229,26 @@ BorderSurface {
           visible: root.sanitizedBody.length > 0
           text: root.styledBody
           textFormat: Text.StyledText
-          font.family: "Liberation Sans"
+          horizontalAlignment: root.textAlign
+          font.family: Style.textFamilyOr("Liberation Sans")
           color: root.bodyColor
+          style: Style.font.shadowStyle
+          styleColor: Style.font.shadowColor
           font.pixelSize: Style.font.title
           wrapMode: Text.WordWrap
           elide: Text.ElideRight
           maximumLineCount: 3
         }
+      }
+
+      Image {
+        Layout.preferredWidth: visible ? root.badgeWidth : 0
+        Layout.preferredHeight: visible ? root.badgeWidth * (implicitWidth > 0 ? implicitHeight / implicitWidth : 1) : 0
+        Layout.alignment: Qt.AlignVCenter
+        visible: root.badge !== ""
+        source: visible ? root.badge : ""
+        fillMode: Image.PreserveAspectFit
+        smooth: true
       }
     }
   }
