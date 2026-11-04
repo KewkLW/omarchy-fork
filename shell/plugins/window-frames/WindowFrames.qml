@@ -349,6 +349,8 @@ Item {
               anchors.centerIn: parent
               width: Math.min(implicitWidth, plate.width - 2 * root.platePadding - 2 * root.plateSlice * plate.plateScale)
               text: frameItem.frame ? frameItem.frame.title : ""
+              // Window titles come from any client; never parse them as markup.
+              textFormat: Text.PlainText
               color: root.titleColor
               font.family: Style.font.titleFamily
               font.pixelSize: root.titleSize
