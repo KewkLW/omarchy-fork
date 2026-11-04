@@ -18,7 +18,7 @@ import "WindowFramesModel.js" as Model
 //   title-image        = "frames/title.png"   optional plate above the window
 //   title-image-slice  = 24                   source px kept unstretched at each end
 //   title-image-height = 30
-//   title-overlap      = 0                    px the plate reaches down over the window
+//   title-overlap      = 30                   px the plate rises above the window (default its height)
 //   title-padding      = 20                   text padding inside the plate
 //   title-text         = "#ffd100"
 //   title-size         = 13
@@ -42,7 +42,7 @@ Item {
   readonly property bool hasPlate: enabled && plateSource.length > 0
   readonly property int plateSlice: Border.number("windows", "title-image-slice", 16)
   readonly property int plateHeight: Border.number("windows", "title-image-height", 28)
-  readonly property int plateOverlap: Border.number("windows", "title-overlap", 0)
+  readonly property int plateRise: Border.number("windows", "title-overlap", plateHeight)
   readonly property int platePadding: Border.number("windows", "title-padding", 20)
   readonly property color titleColor: Color.flatColor(Border.value("windows", "title-text"), Color.foreground)
   readonly property int titleSize: Border.number("windows", "title-size", Style.font.body)
@@ -51,7 +51,7 @@ Item {
     left: inset,
     right: inset,
     bottom: inset,
-    top: Math.max(inset, hasPlate ? plateHeight - plateOverlap : 0),
+    top: Math.max(inset, hasPlate ? plateRise : 0),
   })
 
   // Window geometry settles this long after its last change before the frame
@@ -327,7 +327,7 @@ Item {
             width: Math.min(wanted, windowWidth - 2 * root.inset)
             height: root.plateHeight
             x: root.reach.left + (windowWidth - width) / 2
-            y: root.reach.top + root.plateOverlap - height
+            y: root.reach.top - root.plateRise
 
             BorderImage {
               id: plateImage

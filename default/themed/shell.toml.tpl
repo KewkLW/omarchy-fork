@@ -312,3 +312,22 @@ selected-border         = "{{ accent }}"
 selected-border-alpha   = 1.0
 unselected-border       = "{{ foreground }}"
 unselected-border-alpha = 0.28
+
+[windows]
+# Image frame around every Hyprland window, drawn by the shell outside the
+# window, with an optional title plate. Paths are relative to the theme
+# directory. Leave room for it with Hyprland gaps in the theme's
+# hyprland.lua, and set decoration.rounding to 0. A window tagged
+# no-window-frame stays bare.
+# frame              = "frames/dialog.png"       # 9-slice image
+# frame-active       = "frames/dialog-gold.png"  # for the focused window
+# frame-slice        = 32       # source px cut from each edge
+# frame-width        = 40       # rendered edge thickness
+# frame-inset        = 19       # px the frame reaches outside the window
+# title-image        = "frames/plate.png"        # plate above the window
+# title-image-slice  = 32       # source px kept unstretched at each end
+# title-image-height = 34
+# title-overlap      = 34       # px the plate rises above the window
+# title-padding      = 12
+# title-text         = "{{ accent }}"
+# title-size         = 15
