@@ -1361,8 +1361,10 @@ Item {
 
       BorderSurface {
         id: tooltipBubble
-        implicitWidth: tooltipLabel.implicitWidth + 20
-        implicitHeight: tooltipLabel.implicitHeight + 14
+        // Leave room for a theme frame, whose inset can be wider than the
+        // plain padding.
+        implicitWidth: tooltipLabel.implicitWidth + 20 + (frameSpec ? borderLeft + borderRight : 0)
+        implicitHeight: tooltipLabel.implicitHeight + 14 + (frameSpec ? borderTop + borderBottom : 0)
         color: Color.tooltip.background
         borderSpec: Border.surfaceSpec("tooltip", "border", Color.tooltip.border, 1)
         radius: Style.cornerRadius
@@ -1373,7 +1375,9 @@ Item {
           anchors.centerIn: parent
           text: root.tooltipText
           color: Color.tooltip.text
-          font.family: root.fontFamily
+          style: Style.font.shadowStyle
+          styleColor: Style.font.shadowColor
+          font.family: Style.textFamilyOr(root.fontFamily)
           font.pixelSize: Style.font.body
           horizontalAlignment: Text.AlignHCenter
           verticalAlignment: Text.AlignVCenter

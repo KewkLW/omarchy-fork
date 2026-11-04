@@ -21,7 +21,7 @@ ToolTip {
   property color panelForeground: Color.tooltip.text
   property color panelBackground: Color.tooltip.background
   property color panelBorder: Color.tooltip.border
-  property string fontFamily: Style.font.family
+  property string fontFamily: Style.font.textFamily
   property real fontSize: Style.font.bodySmall
 
   readonly property var panelBorderSpec: Border.localOrSurfaceSpec("tooltip", "border", panelBorder, Color.tooltip.border, Style.normalBorderWidth)
@@ -41,6 +41,8 @@ ToolTip {
     color: root.panelForeground
     font.family: root.fontFamily
     font.pixelSize: root.fontSize
+    style: Style.font.shadowStyle
+    styleColor: Style.font.shadowColor
     leftPadding: Border.left(root.panelBorderSpec) + Style.spacing.controlPaddingX
     rightPadding: Border.right(root.panelBorderSpec) + Style.spacing.controlPaddingX
     topPadding: Border.top(root.panelBorderSpec) + Style.spacing.controlPaddingY
