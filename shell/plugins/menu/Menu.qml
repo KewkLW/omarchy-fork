@@ -93,14 +93,49 @@ Item {
   property color selectedText: Color.menu.selectedText
   property color selectedBorder: Color.menu.selectedBorder
   property var selectedBorderSpec: Border.surfaceSpec("menu", "selected-border", selectedBorder, 0)
+  // Theme art ([menu] in shell.toml):
+  //   title            title-plate text for the root menu (submenus show
+  //                    their own title)
+  //   title-image      plate drawn centred across the top edge of the card,
+  //                    title-image-width x title-image-height px, raised
+  //                    title-overlap px above the card
+  //   search-background / search-border (+ -alpha)  box the search line
+  //   icon-size        row icon size in px
+  //   icon-frame       image drawn over each row icon, icon-frame-outset px
+  //                    larger on each side
+  //   selected-image   image stretched under the cursor row
+  //   selected-icon-image  image over the cursor row's icon (a glow),
+  //                    selected-icon-outset px larger on each side
+  readonly property string labelFamily: Style.textFamilyOr(root.fontFamily)
+  readonly property string titleImage: Border.image("menu", "title-image")
+  readonly property int titleImageWidth: Math.round(Border.number("menu", "title-image-width", Style.space(240)))
+  readonly property int titleImageHeight: Math.round(Border.number("menu", "title-image-height", Style.space(60)))
+  readonly property int titleOverlap: Math.round(Border.number("menu", "title-overlap", root.titleImageHeight / 2))
+  readonly property string plateTitle: root.dmenuActive ? root.dmenuPrompt
+    : (root.activeMenu === "root" && String(Border.value("menu", "title")).length > 0) ? String(Border.value("menu", "title"))
+    : (root.item(root.activeMenu) ? (root.item(root.activeMenu).title || root.item(root.activeMenu).label) : "")
+  // Room the plate takes inside the card, below its top edge.
+  readonly property int frameChrome: Border.frameChrome(root.borderSpec)
+  readonly property int titlePlateSpace: root.titleImage !== "" ? Math.max(0, root.titleImageHeight - root.titleOverlap - root.borderTopInset) : 0
+  readonly property int borderTopInset: Border.top(root.borderSpec)
+  // How far the plate rises above the card, kept clear of the screen edge.
+  readonly property int titleRaise: root.titleImage !== "" ? root.titleOverlap : 0
+  readonly property bool searchBoxed: String(Border.value("menu", "search-background")).length > 0
+  readonly property int iconSize: Math.round(Border.number("menu", "icon-size", Style.font.iconLarge))
+  readonly property string iconFrame: Border.image("menu", "icon-frame")
+  readonly property int iconFrameOutset: Math.round(Border.number("menu", "icon-frame-outset", 0))
+  readonly property int iconColumnWidth: Math.max(Style.space(36), root.iconSize + root.iconFrameOutset * 2 + Style.space(4))
+  readonly property string selectedImage: Border.image("menu", "selected-image")
+  readonly property string selectedIconImage: Border.image("menu", "selected-icon-image")
+  readonly property int selectedIconOutset: Math.round(Border.number("menu", "selected-icon-outset", 0))
   readonly property real rowReservedBorderLeft: Border.left(selectedBorderSpec)
   readonly property real rowReservedBorderRight: Border.right(selectedBorderSpec)
   readonly property int cornerRadius: Style.cornerRadius
   property int contentMargin: Style.spacing.panelPadding
   property int headerHeight: Math.max(Style.space(34), Style.font.title + Style.spacing.controlPaddingY * 2)
   property int contentSpacing: Style.spacing.md
-  property int baseRowHeight: Math.max(Style.space(50), Style.font.body + Style.spacing.rowPaddingX * 2)
-  property int detailRowHeight: Math.max(Style.space(58), Style.font.body + Style.font.caption + Style.spacing.rowPaddingX * 2)
+  property int baseRowHeight: Math.max(Style.space(50), Style.font.body + Style.spacing.rowPaddingX * 2, root.iconSize + root.iconFrameOutset * 2 + Style.space(8))
+  property int detailRowHeight: Math.max(Style.space(58), Style.font.body + Style.font.caption + Style.spacing.rowPaddingX * 2, baseRowHeight)
   // How much of the first hidden row stays visible at the fold — enough to
   // read as a cut-off row rather than a bottom border.
   property int rowPeek: Math.round(baseRowHeight * 0.55)
@@ -111,8 +146,8 @@ Item {
   property int cardWidth: Math.min(root.dmenuActive ? Style.space(root.dmenuWidth) : ((root.activeMenu === "trigger.capture.screenrecord" || root.activeMenu === "style.font") ? Style.space(520) : Style.space(300)), panel.width - Style.gapsOut * 2)
   property int visibleRowsHeight: root.dmenuActive ? dmenuRowListHeight(layoutSerial, displayModel.count, filterText) : rowListHeight(layoutSerial, displayModel.count, filterText, searchDivider)
   property int cardHeight: root.dmenuActive
-    ? Math.min(contentMargin * 2 + headerHeight + (mode === "input" ? 0 : contentSpacing + visibleRowsHeight), panel.height - Style.gapsOut * 2)
-    : Math.min(contentMargin * 2 + headerHeight + contentSpacing + visibleRowsHeight, panel.height - Style.gapsOut * 2)
+    ? Math.min(frameChrome + titlePlateSpace + contentMargin * 2 + headerHeight + (mode === "input" ? 0 : contentSpacing + visibleRowsHeight), panel.height - Style.gapsOut * 2)
+    : Math.min(frameChrome + titlePlateSpace + contentMargin * 2 + headerHeight + contentSpacing + visibleRowsHeight, panel.height - Style.gapsOut * 2)
 
   function finishRequest(selection) {
     if (!root.requestActive || !root.doneFile) {
@@ -152,8 +187,8 @@ Item {
   // Uses panel.cardTop rather than effectiveCardTop: the centered top is
   // derived from the card height, which this value feeds.
   function availableRowsHeight() {
-    var top = panel.cardTop >= 0 ? panel.cardTop : Style.gapsOut
-    var available = panel.height - top - Style.gapsOut - root.contentMargin * 2 - root.headerHeight - root.contentSpacing
+    var top = panel.cardTop >= 0 ? panel.cardTop : Style.gapsOut + root.titleRaise
+    var available = panel.height - top - Style.gapsOut - root.frameChrome - root.titlePlateSpace - root.contentMargin * 2 - root.headerHeight - root.contentSpacing
     // The starting menu sets the ceiling along with the offset: drilling into
     // a longer submenu scrolls behind the fold instead of growing the card.
     if (panel.maxRowsHeight >= 0) available = Math.min(available, panel.maxRowsHeight)
@@ -1032,7 +1067,7 @@ Item {
     // card may grow from there. Closing unfreezes both.
     property int cardTop: -1
     property int maxRowsHeight: -1
-    readonly property int centeredTop: Math.max(Style.gapsOut, Math.round((height - root.cardHeight) / 2))
+    readonly property int centeredTop: Math.max(Style.gapsOut + root.titleRaise, Math.round((height - root.cardHeight) / 2))
     readonly property int effectiveCardTop: cardTop >= 0 ? cardTop : centeredTop
     function freezeCardTop() {
       if (visible && cardTop < 0) {
@@ -1136,29 +1171,61 @@ Item {
         }
       }
 
+      // Title plate across the top edge, over the frame.
+      Image {
+        visible: root.titleImage !== ""
+        source: visible ? root.titleImage : ""
+        width: root.titleImageWidth
+        height: root.titleImageHeight
+        anchors.horizontalCenter: parent.horizontalCenter
+        y: -root.titleOverlap
+        z: 200000
+        fillMode: Image.Stretch
+        smooth: true
+
+        Text {
+          textFormat: Text.PlainText
+          anchors.centerIn: parent
+          width: parent.width - Style.space(24)
+          horizontalAlignment: Text.AlignHCenter
+          text: root.plateTitle
+          color: root.selectedText
+          style: Style.font.shadowStyle
+          styleColor: Style.font.shadowColor
+          font.family: Style.font.titleFamily
+          font.pixelSize: Style.font.heading
+          elide: Text.ElideRight
+        }
+      }
+
       Column {
         anchors.fill: parent
-        anchors.topMargin: card.contentTopInset
+        anchors.topMargin: card.contentTopInset + root.titlePlateSpace
         anchors.rightMargin: card.contentRightInset
         anchors.bottomMargin: card.contentBottomInset
         anchors.leftMargin: card.contentLeftInset
         spacing: root.contentSpacing
 
-        Rectangle {
+        BorderSurface {
           width: parent.width
           height: root.headerHeight
           radius: root.cornerRadius
-          color: "transparent"
+          color: root.searchBoxed ? Color.composed("menu.search-background", "menu.search-background-alpha", root.background, 1.0) : "transparent"
+          borderSpec: root.searchBoxed ? Border.surfaceSpec("menu", "search-border", root.border, 1) : Border.none()
 
           Text {
             textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.right: parent.right
+            anchors.leftMargin: root.searchBoxed ? Style.spacing.controlPaddingX : 0
+            anchors.rightMargin: root.searchBoxed ? Style.spacing.controlPaddingX : 0
             anchors.verticalCenter: parent.verticalCenter
             text: root.filterText || (root.dmenuActive ? (root.dmenuPrompt + "…") : ((root.item(root.activeMenu) ? (root.item(root.activeMenu).title || root.item(root.activeMenu).label) : "Go") + "…"))
             color: root.foreground
             opacity: root.filterText ? 1 : 0.58
-            font.family: root.fontFamily
+            font.family: root.labelFamily
+            style: Style.font.shadowStyle
+            styleColor: Style.font.shadowColor
             font.pixelSize: Style.font.heading
             elide: Text.ElideRight
           }
@@ -1223,6 +1290,14 @@ Item {
               color: row.hasCursor ? root.selectedBackground : "transparent"
               borderSpec: row.hasCursor ? root.selectedBorderSpec : Border.none()
 
+              Image {
+                anchors.fill: parent
+                visible: row.hasCursor && root.selectedImage !== ""
+                source: visible ? root.selectedImage : ""
+                fillMode: Image.Stretch
+                smooth: true
+              }
+
               Rectangle {
                 visible: false
                 width: Style.space(4)
@@ -1241,8 +1316,8 @@ Item {
                 text: row.icon
                 color: row.hasCursor ? root.selectedText : root.foreground
                 font.family: row.iconFont.length > 0 ? row.iconFont : root.fontFamily
-                font.pixelSize: Style.font.iconLarge
-                width: Style.space(36)
+                font.pixelSize: root.iconSize
+                width: root.iconColumnWidth
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
                 anchors.left: parent.left
@@ -1253,8 +1328,8 @@ Item {
               Image {
                 id: appIconImage
                 visible: row.isApp
-                width: Style.font.iconLarge
-                height: Style.font.iconLarge
+                width: root.iconSize
+                height: root.iconSize
                 fillMode: Image.PreserveAspectFit
                 // Decode at physical pixels — a logical-size decode leaves
                 // PNG icons upscaled and blurry on HiDPI displays.
@@ -1263,8 +1338,36 @@ Item {
                 source: row.isApp && root.appLibrary ? root.appLibrary.iconSource(row.appIcon) : ""
                 asynchronous: true
                 anchors.left: parent.left
-                anchors.leftMargin: root.rowReservedBorderLeft + Style.space(8) + (Style.space(36) - width) / 2
+                anchors.leftMargin: root.rowReservedBorderLeft + Style.space(8) + (root.iconColumnWidth - width) / 2
                 y: contentColumn.y + labelText.y + (labelText.height - height) / 2
+              }
+
+              // Theme slot frame and cursor glow around the row icon, sized
+              // from the icon box so glyph and app icons get the same slot.
+              Item {
+                id: iconBox
+                visible: row.hasIcon && (root.iconFrame !== "" || root.selectedIconImage !== "")
+                width: root.iconSize
+                height: root.iconSize
+                x: root.rowReservedBorderLeft + Style.space(8) + (root.iconColumnWidth - width) / 2
+                y: contentColumn.y + labelText.y + (labelText.height - height) / 2
+                z: 1
+
+                Image {
+                  anchors.fill: parent
+                  anchors.margins: -root.iconFrameOutset
+                  visible: root.iconFrame !== ""
+                  source: visible ? root.iconFrame : ""
+                  smooth: true
+                }
+
+                Image {
+                  anchors.fill: parent
+                  anchors.margins: -root.selectedIconOutset
+                  visible: row.hasCursor && root.selectedIconImage !== ""
+                  source: visible ? root.selectedIconImage : ""
+                  smooth: true
+                }
               }
 
               Column {
@@ -1282,7 +1385,9 @@ Item {
                   width: parent.width
                   text: row.label
                   color: row.hasCursor ? root.selectedText : root.foreground
-                  font.family: root.fontFamily
+                  style: Style.font.shadowStyle
+                  styleColor: Style.font.shadowColor
+                  font.family: root.labelFamily
                   font.pixelSize: Style.font.heading
                   font.weight: Font.Medium
                   elide: Text.ElideRight
@@ -1295,7 +1400,7 @@ Item {
                   visible: (root.filterText || row.kind === "dmenu") && row.detail.length > 0
                   color: root.foreground
                   opacity: 0.52
-                  font.family: root.fontFamily
+                  font.family: root.labelFamily
                   font.pixelSize: Style.font.bodySmall
                   elide: Text.ElideRight
                 }
