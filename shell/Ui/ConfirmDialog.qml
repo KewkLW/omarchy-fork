@@ -75,7 +75,7 @@ Item {
           anchors.top: parent.top
           text: root.message
           color: root.foreground
-          font.family: root.fontFamily
+          font.family: Style.textFamilyOr(root.fontFamily)
           font.pixelSize: Style.font.title
           wrapMode: Text.WordWrap
         }
@@ -95,12 +95,16 @@ Item {
               readonly property bool selected: root.selectedIndex === index
               readonly property bool destructive: index === 1
 
+              // Theme button art ([controls] button-frame) replaces the
+              // colour chrome; the selected button shows the hover image.
+              readonly property var artSpec: Border.buttonSpec(selected ? "hover" : "normal")
+
               width: Style.space(88)
               height: Style.space(34)
-              color: selected
+              color: artSpec ? "transparent" : selected
                 ? (destructive ? Util.alpha(Color.urgent, 0.22) : root.selectedBackground)
                 : "transparent"
-              borderSpec: Border.flat(destructive
+              borderSpec: artSpec ? artSpec : Border.flat(destructive
                 ? (selected ? Color.urgent : Util.alpha(Color.urgent, 0.56))
                 : (selected ? root.selectedText : Util.alpha(root.foreground, 0.38)), Style.normalBorderWidth)
               radius: 0
@@ -109,8 +113,11 @@ Item {
                 textFormat: Text.PlainText
                 anchors.centerIn: parent
                 text: modelData
-                color: destructive ? (selected ? Color.urgent : root.foreground) : (selected ? root.selectedText : root.foreground)
-                font.family: root.fontFamily
+                color: artSpec ? Color.pick("controls.button-text", root.foreground)
+                  : destructive ? (selected ? Color.urgent : root.foreground) : (selected ? root.selectedText : root.foreground)
+                style: Style.font.shadowStyle
+                styleColor: Style.font.shadowColor
+                font.family: Style.textFamilyOr(root.fontFamily)
                 font.pixelSize: Style.font.caption
               }
 

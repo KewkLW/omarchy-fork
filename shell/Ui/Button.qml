@@ -75,6 +75,15 @@ BorderSurface {
   radius: Style.cornerRadius
 
   readonly property bool hot: mouseArea.containsMouse || hasCursor
+  // Bordered text buttons take the theme's button art when it has any
+  // ([controls] button-frame); hover and focus show the hover image,
+  // pressed, selected and active the pressed one.
+  readonly property var _artSpec: bordered && text !== "" ? Border.buttonSpec("normal") : null
+  readonly property bool artButton: _artSpec !== null
+  readonly property var _artHoverSpec: artButton ? Border.buttonSpec("hover") : null
+  readonly property var _artPressedSpec: artButton ? Border.buttonSpec("pressed") : null
+  readonly property color _artText: artButton ? Color.pick("controls.button-text", root.foreground) : root.foreground
+  readonly property string _labelFamily: root.fontFamily === Style.font.family ? Style.font.textFamily : root.fontFamily
   readonly property bool _showFocusRing: focusable && activeFocus
   readonly property color _selectedColor: Style.selectedStateColor(root.foreground, root.accent)
   readonly property var _tooltipBorderSpec: Border.localOrSurfaceSpec("tooltip", "border", root.tooltipBorder, Color.tooltip.border, Math.max(1, Style.normalBorderWidth))
@@ -82,34 +91,37 @@ BorderSurface {
   readonly property var _hoverBorderSpec: Border.controlSpec("hover-cursor", root.foreground, root.accent)
   readonly property var _selectedBorderSpec: Border.controlSpec("selected", root.foreground, root.accent)
   readonly property var _normalBorderSpec: Border.controlSpec("normal", root.foreground, root.accent)
-  readonly property real _reservedBorderTop: Math.max(
+  readonly property real _reservedBorderTop: artButton ? Border.top(_artSpec) : Math.max(
     focusable ? Border.top(_focusBorderSpec) : 0,
     Border.top(_hoverBorderSpec),
     Border.top(_selectedBorderSpec),
     bordered ? Border.top(_normalBorderSpec) : 0)
-  readonly property real _reservedBorderRight: Math.max(
+  readonly property real _reservedBorderRight: artButton ? Border.right(_artSpec) : Math.max(
     focusable ? Border.right(_focusBorderSpec) : 0,
     Border.right(_hoverBorderSpec),
     Border.right(_selectedBorderSpec),
     bordered ? Border.right(_normalBorderSpec) : 0)
-  readonly property real _reservedBorderBottom: Math.max(
+  readonly property real _reservedBorderBottom: artButton ? Border.bottom(_artSpec) : Math.max(
     focusable ? Border.bottom(_focusBorderSpec) : 0,
     Border.bottom(_hoverBorderSpec),
     Border.bottom(_selectedBorderSpec),
     bordered ? Border.bottom(_normalBorderSpec) : 0)
-  readonly property real _reservedBorderLeft: Math.max(
+  readonly property real _reservedBorderLeft: artButton ? Border.left(_artSpec) : Math.max(
     focusable ? Border.left(_focusBorderSpec) : 0,
     Border.left(_hoverBorderSpec),
     Border.left(_selectedBorderSpec),
     bordered ? Border.left(_normalBorderSpec) : 0)
   readonly property real _reservedContentLeftInset: _reservedBorderLeft + leftPadding
-  readonly property var _borderSpec: _showFocusRing ? _focusBorderSpec
+  readonly property var _borderSpec: artButton
+    ? (mouseArea.pressed || selected || active ? _artPressedSpec : (hot || _showFocusRing ? _artHoverSpec : _artSpec))
+    : _showFocusRing ? _focusBorderSpec
     : hot                      ? _hoverBorderSpec
     : selected                 ? (Border.controlHasWidth("selected") ? _selectedBorderSpec : (bordered ? _normalBorderSpec : Border.none()))
     : bordered                 ? _normalBorderSpec
     : Border.none()
 
-  color: mouseArea.pressed ? Style.pressedFillFor(root.foreground, root.accent)
+  color: artButton ? "transparent"
+    : mouseArea.pressed ? Style.pressedFillFor(root.foreground, root.accent)
     : _showFocusRing       ? Style.focusFillFor(root.foreground, root.accent)
     : hot                  ? Style.hoverFillFor(root.foreground, root.accent)
     : selected             ? Style.selectedFillFor(root.foreground, root.accent)
@@ -141,8 +153,10 @@ BorderSurface {
       textFormat: Text.PlainText
       text: root.tooltipText
       color: root.tooltipForeground
-      font.family: root.fontFamily
+      font.family: root._labelFamily
       font.pixelSize: Style.font.bodySmall
+      style: Style.font.shadowStyle
+      styleColor: Style.font.shadowColor
       leftPadding: Border.left(root._tooltipBorderSpec) + Style.spacing.controlPaddingX
       rightPadding: Border.right(root._tooltipBorderSpec) + Style.spacing.controlPaddingX
       topPadding: Border.top(root._tooltipBorderSpec) + Style.spacing.controlPaddingY
@@ -182,8 +196,10 @@ BorderSurface {
       textFormat: Text.PlainText
       visible: root.text !== ""
       text: root.text
-      color: root.selected ? root._selectedColor : root.foreground
-      font.family: root.fontFamily
+      color: root.selected ? root._selectedColor : root._artText
+      font.family: root._labelFamily
+      style: Style.font.shadowStyle
+      styleColor: Style.font.shadowColor
       font.pixelSize: root.fontSize
       font.bold: root.selected
       anchors.verticalCenter: parent.verticalCenter
