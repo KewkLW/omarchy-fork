@@ -64,6 +64,17 @@ selected-border-alpha = 1.0
 pressed-fill-alpha   = 0.22
 selection-fill-alpha = 0.35
 
+# Button art for bordered text buttons: a 9-slice image per state, paths
+# relative to the theme directory. It replaces the colour chrome above;
+# hover and focus show the hover image, pressed and selected the pressed one.
+# button-frame         = "frames/button.png"
+# button-frame-hover   = "frames/button-hover.png"
+# button-frame-pressed = "frames/button-pressed.png"
+# button-frame-slice   = 8
+# button-frame-width   = 8
+# button-frame-inset   = "3 8"
+# button-text          = "#ffd100"
+
 [spacing]
 # `scale` multiplies shared margins, gaps, padding, controls, and panel
 # dimensions; components keep their proportions. With scale-with-font
@@ -118,6 +129,15 @@ base-size = 12
 # icon-small    = 11
 # icon          = 14
 # icon-large    = 18
+# Typefaces for words on themed surfaces (notifications, OSD, menu rows,
+# tooltips, buttons); title-* for headings and title plates. *-file loads a
+# font shipped in the theme directory, *-family names an installed one.
+# Icons keep the system font, which carries the Nerd Font glyphs.
+# text-file     = "fonts/MyFace-Regular.ttf"
+# text-family   = "My Face"
+# title-file    = "fonts/MyFace-Caps.ttf"
+# title-family  = "My Face Caps"
+# text-shadow   = "#000000"   # 1px drop shadow under that text
 
 [popups]
 # Shared by every bar flyout (dropdowns, OSD, popup cards).
@@ -130,6 +150,18 @@ text             = "{{ foreground }}"
 border           = "hyprland.active-border"
 border-alpha     = 1.0
 # border-width     = 2
+# Image frame instead of the colour border, in this and every surface
+# section (tooltip, notifications, menu, polkit, osd). Paths are relative
+# to the theme directory.
+# frame            = "frames/dialog.png"  # 9-slice image
+# frame-slice      = 32       # source px cut from each edge
+# frame-width      = 48       # rendered edge thickness
+# frame-inset      = 24       # content inset, N or "T R B L"
+# frame-outset     = 7        # draw past the edge (art with a clear margin)
+# frame-mode       = "stretch"  # draw the whole image scaled, no slicing
+# frame-fill       = "frames/fill.png"    # tiled under the content
+# frame-fill-inset = 16
+# frame-fill-alpha = 0.92
 
 [tooltip]
 # Hover tooltips across the bar, panels, and buttons. background-alpha of
@@ -150,6 +182,14 @@ border           = "hyprland.active-border"
 border-alpha     = 1.0
 # border-width     = 2
 countdown        = "{{ accent }}"
+# caption          = "New message"  # small line above the summary
+# caption-color    = "{{ accent }}"
+# summary-color    = "{{ foreground }}"
+# text-align       = "center"
+# icon-frame       = "frames/slot.png"   # drawn over the icon
+# icon-frame-outset = 4
+# badge            = "frames/badge.png"  # image at the right end
+# badge-width      = 56
 
 [launcher]
 # Same six tokens as [menu], applied to the launcher overlay. Alpha
@@ -185,6 +225,20 @@ selected-background-alpha = 0.08
 selected-text             = "{{ accent }}"
 selected-border           = "hyprland.active-border-foreground"
 selected-border-alpha     = 0.25
+# title                = "Applications"  # title-plate text on the root menu
+# title-image          = "frames/plate.png"  # plate across the top edge
+# title-image-width    = 250
+# title-image-height   = 66
+# title-overlap        = 34      # px the plate rises above the card
+# search-background    = "#000000"
+# search-background-alpha = 0.7
+# search-border        = "#6f6f6f"
+# icon-size            = 30
+# icon-frame           = "frames/slot.png"   # drawn over each row icon
+# icon-frame-outset    = 4
+# selected-image       = "frames/row.png"    # stretched under the cursor row
+# selected-icon-image  = "frames/glow.png"   # over the cursor row's icon
+# selected-icon-outset = 12
 
 [polkit]
 # Polkit authentication prompt (sudo/password dialogs). scrim is the
@@ -203,6 +257,29 @@ scrim            = "{{ background }}"
 scrim-alpha      = 0.5
 # accent is the lock-icon glyph color + text-selection tint.
 accent           = "{{ accent }}"
+# title-image        = "frames/plate.png"  # plate behind the request label
+# title-image-width  = 260
+# title-image-height = 58
+
+# [osd]
+# Volume, brightness and progress OSD. Without this section the OSD uses
+# [popups]; with it, the card reads background, text, border and frame keys
+# from here instead.
+# background       = "{{ background }}"
+# background-alpha = 0.97
+# text             = "{{ foreground }}"
+# border-width     = 0
+# progress-fill    = "frames/bar-fill.png"   # stretched over the filled part
+# progress-spark   = "frames/spark.png"      # at the fill edge
+# progress-track   = "#000000"               # the empty part
+# progress-track-alpha = 0.85
+# progress-frame   = "frames/bar.png"        # frame around the bar, with
+# progress-frame-slice = 16                  # the usual frame keys
+# progress-frame-width = 24
+# progress-frame-inset = 17
+# progress-width   = 300
+# progress-height  = 22
+# label-on-bar     = true                    # readout centred on the bar
 
 [lock]
 # Lock screen password input. background/background-alpha control the
