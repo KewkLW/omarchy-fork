@@ -8,8 +8,10 @@
 # agent seat broker. It gets no Hyprland IPC, no user Wayland or X11 socket, no
 # user D-Bus (only a private bus of its own, so no keyring and no portals), no
 # /dev/uinput, no GPU and its own home, so it can neither drive nor read the
-# user's seat. That home is one directory shared by every app on the seat and
-# kept across stop, so logins and cookies made in it persist.
+# user's seat. That home is one directory shared by every app in the agent's
+# lane (see omarchy-agent-seat-lane) and kept across stop, so logins and
+# cookies made in it persist. A new lane's home starts as a copy of the default
+# lane's, so sites the user signed in to there are signed in for every agent.
 #
 # It does share the host's network: besides the internet it reaches every
 # service listening on the host's localhost (databases, dev servers, browser
@@ -264,11 +266,12 @@ if [[ -n $executable && $executable != /usr/* ]]; then
   set -- "$executable" "${@:2}"
 fi
 
-runtime="$XDG_RUNTIME_DIR/omarchy/agent-seat"
+runtime=$(omarchy-agent-seat-lane --runtime)
 # The seat's home is Omarchy state, kept beside the agent accounts. It never
 # lives under ~/.local/share/omarchy: an upgrade to Omarchy 4 turns that into a
 # link to the read-only /usr/share/omarchy, or to a shim it later removes.
-agent_home="$HOME/.local/state/omarchy/agent-seat/home"
+agent_home=$(omarchy-agent-seat-lane --home)
+default_home=$(OMARCHY_AGENT_SEAT=default omarchy-agent-seat-lane --home)
 old_agent_home="$HOME/.local/share/omarchy/agent-seat/home"
 sandbox_supervisor=$(realpath -e "$OMARCHY_PATH/bin/omarchy-agent-seat-sandbox")
 
@@ -318,7 +321,7 @@ flock 9
 # behind a link to the upgrade's tree it is not the user's to move. It moves
 # under the launch lock, so two launches cannot both try, and only by rename:
 # a copy across filesystems could be cut short and leave two half homes.
-if [[ ! -e $agent_home && ! -L $HOME/.local/share/omarchy && ! -L ${old_agent_home%/*} && -d $old_agent_home && ! -L $old_agent_home ]]; then
+if [[ $agent_home == "$default_home" && ! -e $agent_home && ! -L $HOME/.local/share/omarchy && ! -L ${old_agent_home%/*} && -d $old_agent_home && ! -L $old_agent_home ]]; then
   if ! error=$(mkdir -p -- "${agent_home%/*}" 2>&1); then
     echo "Could not create ${agent_home%/*} for the agent seat's home: ${error#*: }" >&2
     exit 1
@@ -332,6 +335,23 @@ if [[ ! -e $agent_home && ! -L $HOME/.local/share/omarchy && ! -L ${old_agent_ho
     exit 1
   fi
   rmdir -- "${old_agent_home%/*}" 2>/dev/null
+fi
+# A lane's first launch copies the default lane's home, without its caches, so
+# the agent starts signed in wherever the user signed in on the seat. The copy
+# is made beside the home and renamed into place, so a launch cut short never
+# leaves half a home; after that the two homes go their own ways.
+if [[ $agent_home != "$default_home" && ! -e $agent_home && -d $default_home && ! -L $default_home ]]; then
+  if ! error=$(mkdir -p -- "${agent_home%/*}" 2>&1); then
+    echo "Could not create ${agent_home%/*} for the agent seat's home: ${error#*: }" >&2
+    exit 1
+  fi
+  seed=$(mktemp -d "${agent_home%/*}/home.XXXXXX")
+  if tar -C "$default_home" --exclude=./.cache --exclude='./.config/*/Singleton*' -cf - . 2>/dev/null | tar -C "$seed" -xf - 2>/dev/null; then
+    mv -T -- "$seed" "$agent_home" 2>/dev/null || rm -rf -- "$seed"
+  else
+    echo "Could not copy the default seat home into this lane's; starting it empty" >&2
+    rm -rf -- "$seed"
+  fi
 fi
 if ! error=$(mkdir -p -- "$agent_home" 2>&1); then
   echo "Could not create the agent seat's home at $agent_home: ${error#*: }" >&2

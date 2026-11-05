@@ -443,6 +443,28 @@ run_headless --share "$test_dir/out" /usr/bin/bash -c 'cat "$HOME/cookie" >"$1/c
 [[ -f $seat_home/cookie && ! -e $old_seat_home ]] || fail "a home made at the old place moves to Omarchy's state" "$(ls -laR "$home/.local" 2>&1)"
 pass "a home made under ~/.local/share/omarchy moves once to ~/.local/state/omarchy"
 
+# An agent's own lane starts with a copy of the default lane's home, without
+# its caches or a browser's locks, and goes its own way from there.
+mkdir -p "$seat_home/.cache/chromium" "$seat_home/.config/chromium"
+echo "cache" >"$seat_home/.cache/chromium/blob"
+ln -s "otherhost-123" "$seat_home/.config/chromium/SingletonLock"
+echo "prefs" >"$seat_home/.config/chromium/Preferences"
+lane_home="$home/.local/state/omarchy/agent-seat@murloc/home"
+rm -f "$test_dir/out/lane"
+output=$(OMARCHY_AGENT_NAME=Murloc "${on_seat[@]}" omarchy-agent-seat-run --no-wait --share "$test_dir/out" /usr/bin/bash -c '
+  { cat "$HOME/cookie" "$HOME/.config/chromium/Preferences"; ls -A "$HOME/.cache" 2>&1; ls "$HOME/.config/chromium"; } >"$1/lane.part"
+  echo "lane cookie" >"$HOME/cookie"
+  mv "$1/lane.part" "$1/lane"
+' _ "$test_dir/out" 2>&1) || fail "an app runs in an agent's own lane" "$output"
+for _ in {1..100}; do [[ -s $test_dir/out/lane ]] && break; sleep 0.05; done
+lane_seen=$(cat "$test_dir/out/lane" 2>/dev/null)
+[[ $(head -2 <<<"$lane_seen") == $'cookie\nprefs' ]] || fail "a new lane's home starts as a copy of the default lane's" "$lane_seen $(cat "$runtime/omarchy/agent-seat@murloc/apps.log" 2>/dev/null)"
+[[ $lane_seen != *blob* && $lane_seen != *SingletonLock* ]] || fail "a new lane's home leaves out caches and browser locks" "$lane_seen"
+[[ $(cat "$seat_home/cookie") == "cookie" && $(cat "$lane_home/cookie" 2>/dev/null) == "lane cookie" ]] || fail "a lane's home goes its own way after the copy" "$(ls -laR "$home/.local/state/omarchy" 2>&1)"
+OMARCHY_AGENT_NAME=Murloc "${on_seat[@]}" omarchy-agent-seat-stop >/dev/null 2>&1 || true
+rm -rf "$seat_home/.cache" "$seat_home/.config"
+pass "a new lane's home starts as a copy of the default lane's, without caches or locks"
+
 # An upgrade to Omarchy 4 turns ~/.local/share/omarchy into a link to the
 # read-only /usr/share/omarchy. Launches still work, and a home found behind
 # that link is not the user's to move.

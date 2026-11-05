@@ -14,7 +14,7 @@ if (($# < 1)); then
 fi
 
 window=$1
-output="$XDG_RUNTIME_DIR/omarchy/agent-seat/window-$window.png"
+output="$(omarchy-agent-seat-lane --runtime)/window-$window.png"
 [[ $2 == "--output" ]] && output=$(realpath -m "$3")
 
 result=$(omarchy-agent-seat-broker call "$(jq -cn --argjson window "$window" --arg path "$output" '{command: "screenshot", args: {window: $window, path: $path}}')") || exit 1

@@ -10,6 +10,10 @@ SHELL_TEST_DIR="$ROOT/test/shell.d"
 
 export ROOT
 
+# Tests never inherit the calling agent's seat lane, so seat paths are the
+# default lane's unless a test picks one.
+unset OMARCHY_AGENT_NAME OMARCHY_AGENT_SEAT
+
 pass() {
   printf 'ok - %s\n' "$1"
 }

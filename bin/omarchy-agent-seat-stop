@@ -1,8 +1,20 @@
 #!/bin/bash
 
 # omarchy:summary=Stop the agent seat, closing every app on it
+# omarchy:args=[--all]
 
-runtime="$XDG_RUNTIME_DIR/omarchy/agent-seat"
+# Stops the calling agent's lane, its broker and its apps; --all stops every
+# lane, which is what the user's menu entry runs.
+if [[ $1 == "--all" ]]; then
+  code=0
+  for lane in $(omarchy-agent-seat-lane --list); do
+    OMARCHY_AGENT_SEAT=$lane "$0" >/dev/null || code=1
+  done
+  ((code == 0)) && echo "Agent seat: stopped"
+  exit $code
+fi
+
+runtime=$(omarchy-agent-seat-lane --runtime)
 sandbox_supervisor=$(realpath -e "$OMARCHY_PATH/bin/omarchy-agent-seat-sandbox")
 
 process_start_time() {

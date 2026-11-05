@@ -1,9 +1,20 @@
 #!/bin/bash
 
 # omarchy:summary=List the agent seat's windows as JSON
+# omarchy:args=[--all]
 
 # A broker that is not running (or fails) fails the command, rather than jq
 # printing nothing and succeeding.
 set -o pipefail
+
+# --all lists every lane's windows, each marked with its lane, for the user's
+# own commands; a lane whose broker is not running is left out.
+if [[ $1 == "--all" ]]; then
+  for lane in $(omarchy-agent-seat-lane --list); do
+    [[ -S $(OMARCHY_AGENT_SEAT=$lane omarchy-agent-seat-lane --runtime)/control ]] || continue  # no broker in that lane
+    OMARCHY_AGENT_SEAT=$lane timeout 10 omarchy-agent-seat-broker call '{"command":"windows"}' 2>/dev/null | jq --arg lane "$lane" '.windows | map(. + {lane: $lane})'
+  done | jq -s 'add // []'
+  exit
+fi
 
 omarchy-agent-seat-broker call '{"command":"windows"}' | jq '.windows'

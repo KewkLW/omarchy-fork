@@ -20,8 +20,9 @@
 # - The clipboard is the user's. An app reads it only while the user's keyboard
 #   is in it and the user acted last, and sets it only from the user's own
 #   input since the agent last acted in it, never the agent's.
-# - Every agent window gets the class "agent-<n>.<app id>", so Hyprland rules
-#   can put it on the agent seat's workspace and outline it.
+# - Every agent window gets the class "agent-<n>.<app id>", or
+#   "agent-<lane>-<n>.<app id>" in an agent's own lane, so Hyprland rules can
+#   put it on the agent seat's workspace and outline it.
 # - Apps get no GPU unless the user allows it. An agent asks for it per launch;
 #   the user answers in their own menu, once or for the rest of the session,
 #   and an allowed app connects through a socket of its own that also offers
@@ -56,7 +57,21 @@ import weakref
 import xml.etree.ElementTree as ET
 import zlib
 
-RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy", "agent-seat")
+
+
+def seat_lane(environ=os.environ):
+  """The agent's seat lane, as omarchy-agent-seat-lane names it: "" for the default lane."""
+  name = environ["OMARCHY_AGENT_SEAT"] if "OMARCHY_AGENT_SEAT" in environ else environ.get("OMARCHY_AGENT_NAME", "")
+  lane = re.sub(r"-+", "-", re.sub(r"[^a-z0-9]", "-", re.sub(r"[A-Z]", lambda letter: letter[0].lower(), name))).removeprefix("-")[:32].removesuffix("-")
+  return "" if lane == "default" else lane
+
+
+# Each agent has a lane of its own, with its own broker, runtime directory and
+# window numbers, so two agents never share a window or its pointer.
+LANE = seat_lane()
+RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy", "agent-seat" + (f"@{LANE}" if LANE else ""))
+WINDOW_CLASS = f"agent-{LANE}-" if LANE else "agent-"  # then the window number, as "agent-<n>.<app id>" in the default lane
+IDLE_EXIT_SECONDS = 600  # a named lane's broker with no app and no sandbox left exits after this
 WAYLAND_SOCKET = os.path.join(RUNTIME_DIR, "wayland-0")
 CONTROL_SOCKET = os.path.join(RUNTIME_DIR, "control")
 MAX_FDS_PER_MESSAGE = 28  # libwayland's receive limit
@@ -1072,7 +1087,7 @@ class Client:
   def request_xdg_toplevel_set_app_id(self, toplevel, args):
     window = self.toplevels[toplevel]
     window["app_id"] = args[0] or ""
-    args[0] = f"agent-{window['window']}.{window['app_id']}"
+    args[0] = f"{WINDOW_CLASS}{window['window']}.{window['app_id']}"
     return True
 
   def request_xdg_toplevel_set_title(self, toplevel, args):
@@ -1084,7 +1099,7 @@ class Client:
     self.toplevels[args[0]] = {"xdg": xdg, "window": window, "title": "", "app_id": ""}
     # Name the window before the app can, so Hyprland's rules always see it.
     self.up.queue(*encode(xdg, 1, [("new_id", "xdg_toplevel")], [args[0]]))
-    self.up.queue(*encode(*self.find_request("xdg_toplevel", "set_app_id", args[0]), [f"agent-{window}"]))
+    self.up.queue(*encode(*self.find_request("xdg_toplevel", "set_app_id", args[0]), [f"{WINDOW_CLASS}{window}"]))
     return False
 
   def request_xdg_surface_get_popup(self, xdg, args):
@@ -1859,6 +1874,7 @@ class Broker:
     self.refusals = [0, 0]  # when to log a refused connection again, and how many were not logged
     self.jobs = []
     self.requests = []
+    self.busy = time.monotonic()  # when it last had an app, a sandbox or a request
 
   def listen(self, path, mode):
     if os.path.exists(path):
@@ -1921,6 +1937,21 @@ class Broker:
       self.resume_listeners()
       self.expire_requests()
       self.expire_grants()
+      if LANE and self.idle():
+        log(f"nothing on lane {LANE} for {IDLE_EXIT_SECONDS}s, exiting")
+        self.stop()
+
+  def idle(self):
+    """Whether a lane's broker has served nothing for IDLE_EXIT_SECONDS.
+
+    One broker runs per agent, so a lane whose agent is done must not stay
+    resident. A launch counts as busy from its first request, and its sandbox
+    from its record, before its app connects.
+    """
+    now = time.monotonic()
+    if self.clients or self.requests or self.jobs or self.shots or self.grants or self.gpu_requests or glob.glob(os.path.join(RUNTIME_DIR, "sandboxes", "sandbox.*")):
+      self.busy = now
+    return now - self.busy > IDLE_EXIT_SECONDS
 
   def accept(self, listener):
     """A new connection, or None while the broker is out of file descriptors."""
@@ -2043,6 +2074,7 @@ class Broker:
       return
     conn.setblocking(False)
     request = Request(conn, caller)
+    self.busy = time.monotonic()
     self.requests.append(request)
     self.selector.register(conn, selectors.EVENT_READ, ("request", request))
 
@@ -2249,7 +2281,7 @@ class Broker:
       return {}
     found = {}
     for client in clients:
-      match = re.fullmatch(r"agent-([0-9]+)(\..*)?", client.get("class", ""))
+      match = re.fullmatch(rf"{re.escape(WINDOW_CLASS)}([0-9]+)(\..*)?", client.get("class", ""))
       if match:
         found[int(match[1])] = {"address": client["address"], "workspace": client["workspace"]["id"]}
     return found
@@ -2596,7 +2628,7 @@ def capture(window, path, identifier=False):
       continue
     if identifier and name == "identifier" and args[0] == window:
       handle = object_id
-    elif not identifier and name == "app_id" and re.fullmatch(rf"agent-{window}(\..*)?", args[0] or ""):
+    elif not identifier and name == "app_id" and re.fullmatch(rf"{re.escape(WINDOW_CLASS)}{window}(\..*)?", args[0] or ""):
       handle = object_id
   if not handle:
     kind = "desktop window" if identifier else "agent window"

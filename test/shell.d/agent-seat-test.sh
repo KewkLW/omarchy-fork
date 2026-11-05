@@ -766,6 +766,36 @@ read -r -t 5 ready <&"${APP[0]}"
 grep -q "app_id agent-1.foot" "$test_dir/compositor.log" || fail "agent windows are named for Hyprland rules" "$(cat "$test_dir/compositor.log")"
 pass "agent windows are named for Hyprland rules"
 
+# A second agent gets a lane of its own: its own broker and sockets, windows
+# numbered from 1 again, and a class Hyprland and its broker tell apart. Its
+# app talks to a compositor of its own, so the counts below see only the first.
+python3 "$test_dir/compositor.py" "$test_dir/runtime/lane-compositor" "$test_dir/lane-compositor.log" &
+lane_compositor_pid=$!
+for _ in {1..50}; do [[ -S $test_dir/runtime/lane-compositor ]] && break; sleep 0.1; done
+run_broker env OMARCHY_AGENT_NAME=Murloc WAYLAND_DISPLAY=lane-compositor omarchy-agent-seat-broker serve 2>"$test_dir/lane-broker.log" &
+lane_broker_pid=$!
+lane_socket="$test_dir/runtime/omarchy/agent-seat@murloc/wayland-0"
+for _ in {1..50}; do [[ -S $lane_socket ]] && break; sleep 0.1; done
+[[ -S $lane_socket ]] || fail "an agent's lane has a broker of its own" "$(cat "$test_dir/lane-broker.log")"
+coproc LANE_APP { python3 "$test_dir/app.py" "$lane_socket" window; }
+read -r -t 5 ready <&"${LANE_APP[0]}"
+[[ $ready == "ready" ]] || fail "an app in another lane maps a window"
+grep -q "app_id agent-murloc-1.foot" "$test_dir/lane-compositor.log" || fail "a lane's windows are named for their lane" "$(cat "$test_dir/lane-compositor.log")"
+lane_windows=$(OMARCHY_AGENT_NAME=Murloc run_broker omarchy-agent-seat-windows)
+[[ $(jq -r 'map(.window) | join(",")' <<<"$lane_windows") == "1" ]] || fail "a lane numbers its own windows from 1" "$lane_windows"
+[[ $(run_broker omarchy-agent-seat-windows | jq -r 'map(.window) | join(",")') == "1" ]] || fail "the default lane keeps its own window 1"
+all_windows=$(run_broker omarchy-agent-seat-windows --all)
+[[ $(jq -r 'map("\(.lane):\(.window)") | sort | join(",")' <<<"$all_windows") == "default:1,murloc:1" ]] || fail "windows --all lists every lane's windows by lane" "$all_windows"
+all_status=$(run_broker omarchy-agent-seat-status --all --json) || fail "status --all reports a running seat" "$all_status"
+[[ $(jq -r '.lanes | join(",")' <<<"$all_status") == "default,murloc" && $(jq -r '.windows' <<<"$all_status") == "2" ]] || fail "status --all counts every lane" "$all_status"
+OMARCHY_AGENT_SEAT=murloc run_broker omarchy-agent-seat-broker call '{"command":"stop"}' >/dev/null || fail "a lane's broker stops on its own"
+kill "$LANE_APP_PID" 2>/dev/null || true
+wait "$lane_broker_pid" 2>/dev/null || true
+kill "$lane_compositor_pid" 2>/dev/null || true
+[[ ! -S $lane_socket ]] || fail "a stopped lane removes its sockets"
+[[ $(run_broker omarchy-agent-seat-windows | jq -r 'length') == "1" ]] || fail "stopping one lane leaves the default lane's windows"
+pass "each agent's lane has its own broker, window numbers and window classes"
+
 
 windows=$(run_broker omarchy-agent-seat-windows)
 [[ $(jq -r '.[0].app_id' <<<"$windows") == "foot" ]] || fail "windows lists the agent window" "$windows"

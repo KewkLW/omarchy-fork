@@ -50,7 +50,17 @@ import sys
 import urllib.parse
 import urllib.request
 
-RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy", "agent-seat")
+
+
+def seat_lane(environ=os.environ):
+  """The agent's seat lane, as omarchy-agent-seat-lane names it: "" for the default lane."""
+  name = environ["OMARCHY_AGENT_SEAT"] if "OMARCHY_AGENT_SEAT" in environ else environ.get("OMARCHY_AGENT_NAME", "")
+  lane = re.sub(r"-+", "-", re.sub(r"[^a-z0-9]", "-", re.sub(r"[A-Z]", lambda letter: letter[0].lower(), name))).removeprefix("-")[:32].removesuffix("-")
+  return "" if lane == "default" else lane
+
+
+LANE = seat_lane()
+RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "omarchy", "agent-seat" + (f"@{LANE}" if LANE else ""))
 SANDBOXES = os.path.join(RUNTIME_DIR, "sandboxes")
 MAX_NODES = 5000
 # Logical pixels of a control that must show for it to be listed.

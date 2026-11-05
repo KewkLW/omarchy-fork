@@ -1,0 +1,68 @@
+#!/bin/bash
+
+# omarchy:summary=Show which agent seat lane this agent works in, or list the running lanes
+# omarchy:args=[--runtime | --home | --class | --list]
+# omarchy:examples=omarchy agent seat lane | omarchy agent seat lane --list
+
+# Every agent gets a seat of its own, a lane: its own broker, windows numbered
+# from 1, its own pointer and keyboard in each of them, and its own home. The
+# lane is named after the agent (OMARCHY_AGENT_NAME, which omarchy agent sets),
+# or OMARCHY_AGENT_SEAT when that is set, so an agent can pick one explicitly
+# and the user's own commands can reach a given lane. An agent with neither,
+# like a session started by hand, uses the default lane, whose paths are the
+# seat's original ones.
+#
+# The broker (omarchy-agent-seat-broker) and omarchy-agent-seat-ui resolve the
+# lane the same way; agent-seat-lanes-test.sh checks that all three agree.
+
+# Bytes, not characters, so only ASCII letters are lowered and anything else
+# becomes a dash, as the Python copies do.
+export LC_ALL=C
+
+lane_of() {
+  local name=$1
+
+  name=${name,,}
+  name=${name//[^a-z0-9]/-}
+  while [[ $name == *--* ]]; do name=${name//--/-}; done
+  name=${name#-}
+  name=${name:0:32}
+  name=${name%-}
+  [[ $name == "default" ]] && name=""
+  printf '%s\n' "$name"
+}
+
+if [[ -v OMARCHY_AGENT_SEAT ]]; then
+  lane=$(lane_of "$OMARCHY_AGENT_SEAT")
+else
+  lane=$(lane_of "${OMARCHY_AGENT_NAME:-}")
+fi
+
+runtime_base="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy/agent-seat"
+state_base="$HOME/.local/state/omarchy/agent-seat"
+
+case ${1:-} in
+"") echo "${lane:-default}" ;;
+--runtime) echo "$runtime_base${lane:+@$lane}" ;;
+--home)
+  if [[ -n $lane ]]; then
+    echo "$state_base@$lane/home"
+  else
+    echo "$state_base/home"
+  fi
+  ;;
+--class) echo "agent-${lane:+$lane-}" ;;
+--list)
+  # Every lane with a runtime directory, running or not; the default lane first.
+  shopt -s nullglob
+  [[ -d $runtime_base ]] && echo default
+  for dir in "$runtime_base"@*/; do
+    dir=${dir%/}
+    echo "${dir##*@}"
+  done
+  ;;
+*)
+  echo "Usage: omarchy agent seat lane [--runtime | --home | --class | --list]" >&2
+  exit 1
+  ;;
+esac

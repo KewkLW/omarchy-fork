@@ -1,5 +1,6 @@
 -- Apps launched with omarchy agent seat run reach Hyprland through the agent
--- seat broker, which names every window "agent-<n>.<app id>". They open on the
+-- seat broker, which names every window "agent-<n>.<app id>", or
+-- "agent-<lane>-<n>.<app id>" in an agent's own lane. They open on the
 -- agent seat's workspace (set in agent-workspaces.lua) without taking you there,
 -- keep rendering while it is hidden (so agents can capture them), never take
 -- the user's focus, and are outlined in the agent colour so they never read as
@@ -17,7 +18,7 @@
 -- picture-in-picture tag rule in that second pass.
 local agent_workspaces = require("default.hypr.agent-workspaces")
 
-local AGENT_CLASS = "agent-[0-9]+(\\..*)?"
+local AGENT_CLASS = "agent-([a-z0-9-]+-)?[0-9]+(\\..*)?"
 local AGENT_BORDER = "rgba(ff8a00ff) rgba(ffc266ff) 45deg"
 
 agent_workspaces.place("agent-seat-apps", "seat", { class = AGENT_CLASS }, true)

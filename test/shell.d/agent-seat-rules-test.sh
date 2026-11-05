@@ -114,7 +114,7 @@ PY
 expected='{"border_color": "rgba(ff8a00ff) rgba(ffc266ff) 45deg", "border_size": 3, "no_initial_focus": true, "pin": false, "workspace": "10 silent"}'
 
 for title in "Picture-in-Picture" "Picture in picture" "Meet - hostile" "omarchy.org is sharing your screen" "Plain page"; do
-  for class in agent-1.chromium agent-2.firefox agent-3; do
+  for class in agent-1.chromium agent-2.firefox agent-3 agent-murloc-1.chromium agent-kewky-opus-1-2.firefox agent-x-3; do
     output=$(effective "$class" "$title")
     [[ $output == "$expected" ]] || fail "an agent window titled \"$title\" keeps the agent markings ($class)" "$output"
   done

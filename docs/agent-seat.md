@@ -199,7 +199,7 @@ Agent apps share your network namespace, so besides the internet they reach ever
 
 ## What it does not do
 
-- **One agent lane.** The seat has one agent identity. Several agents can use it at once, but it doesn't tell them apart (see the FAQ).
+- **Lanes are separation, not security.** Each agent's lane has its own control socket, but every socket is yours, so any process of yours, an agent in another lane included, can reach any lane on purpose (see the FAQ).
 - **No audio, file pickers, drag-and-drop into agent apps, or clipboard of the agent's own.** Portals aren't reachable from the sandbox. A drop needs your keyboard in the target app, and during a drag it is in the source.
 - **No clicks in your own windows.** The agent's input reaches only seat apps.
 - **No characters outside your keyboard layout.** They are refused; an input-method fallback would mean advertising one more protocol.
@@ -239,7 +239,7 @@ Agent apps share your network namespace, so besides the internet they reach ever
 
 **What about the GPU?** Agent apps get none and draw in software, unless the agent launches one with `--gpu` and you allow it in the menu that asks you, once or for the rest of the session.
 
-**Can two agents share it?** They can use it at the same time, but the seat doesn't tell them apart: any process of yours can call the control socket, window numbers are shared, and launches take turns. Two agents in different windows work, since each app has its own focus. Two in the same window fight over it, last actor wins.
+**Can two agents share it?** Each gets a lane of its own, named after the agent (`OMARCHY_AGENT_NAME`, or `OMARCHY_AGENT_SEAT` to choose one): its own broker, control socket, windows numbered from 1, launch lock, sandboxes and home, and its windows are classed `agent-<lane>-<n>.<app id>`, so Hyprland and every seat command keep them apart. Agents without a name share the default lane, whose paths and classes are the seat's original ones, and there two agents in the same window still fight over it, last actor wins. A new lane's home starts as a copy of the default lane's, without caches or browser locks, so logins made there carry over once and then diverge. A lane's broker with no app, sandbox or request for ten minutes exits, so finished agents leave nothing running; the default lane's runs until stopped. `status`, `windows` and `stop` take `--all` to cover every lane, which is what the menu and `Super + Ctrl + Alt + A` use. Lanes keep honest agents apart; they don't fence a hostile one, since every lane's socket is yours.
 
 **Why Python?** It is on every Omarchy install, the broker needs nothing beyond its standard library and libxkbcommon, and there is no build step or compiled code to keep in step with Hyprland.
 
