@@ -42,9 +42,6 @@ env_args=(
   PROTONPATH=GE-Proton
   GAMEID=umu-battlenet
   PROTON_VERB=run
-  # Wine's XIM bridge to fcitx/ibus swallows typing in the launcher's text fields
-  # (chat, friend search), so the launcher and its games skip the input method.
-  XMODIFIERS=@im=none
 )
 (( with_mangohud )) && env_args+=(MANGOHUD=1)
 
