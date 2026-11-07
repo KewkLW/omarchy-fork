@@ -1,0 +1,410 @@
+#!/usr/bin/python3
+# omarchy:summary=Ask idle Claude Code sessions if they are done, close the done ones, and report
+# omarchy:args=[--dry-run] [--only <session>] [--idle <minutes>] [--min-mb <MB>] [--timeout <seconds>]
+# omarchy:examples=omarchy memory idle | omarchy memory idle --dry-run | omarchy memory idle --idle 60
+
+# The watcher runs this when a session has sat idle past its limit, or memory
+# runs short. Every local Claude session at least --idle minutes idle and
+# --min-mb big is asked, through omarchy-memory-message, whether its work is
+# finished and saved to the vault (saving it first if not), and answers with a
+# fixed IDLE-REPLY block read back from its transcript. A session whose answer
+# is "done" with its work saved, or not worth saving, is closed: its claude
+# process gets SIGTERM, and its terminal goes too unless it is the window in
+# focus. Everything else keeps running. A closed session stays resumable with
+# claude --resume, and the report gives the command.
+#
+# No answer within --timeout leaves the session running, unless
+# OMARCHY_MEMORY_IDLE_CLOSE_SILENT=1. Sessions working right now, frozen by the
+# brake, or that answered "working" or "waiting" within the last
+# OMARCHY_MEMORY_IDLE_REASK hours (default 6) are not asked; the report lists
+# them with what they last did, and the other agents too.
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+
+STATE = os.path.expanduser("~/.local/state/omarchy/memory-watch")
+IDLE_DIR = os.path.join(STATE, "idle")
+ANSWERS = os.path.join(IDLE_DIR, "answers.json")
+LOG = os.path.join(STATE, "watch.log")
+CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+TERMINALS = {"foot", "alacritty", "ghostty", "kitty", "wezterm-gui", "konsole", "xterm"}
+SHELLS = {"bash", "zsh", "fish", "sh", "dash"}
+FIELDS = ("vault", "doing", "left", "waiting-on")
+MEMORY_GLYPH = "\U000f035b"
+
+
+def arg(name, default):
+    if name in sys.argv:
+        try:
+            return float(sys.argv[sys.argv.index(name) + 1])
+        except (IndexError, ValueError):
+            sys.exit(f"omarchy-memory-idle: {name} needs a number")
+    return default
+
+
+DRY = "--dry-run" in sys.argv
+ONLY = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv[:-1] else None
+IDLE_MIN = arg("--idle", float(os.environ.get("OMARCHY_MEMORY_IDLE_ASK_MIN", 30)))
+MIN_MB = arg("--min-mb", float(os.environ.get("OMARCHY_MEMORY_IDLE_MIN_MB", 100)))
+TIMEOUT = arg("--timeout", float(os.environ.get("OMARCHY_MEMORY_IDLE_TIMEOUT", 600)))
+REASK = float(os.environ.get("OMARCHY_MEMORY_IDLE_REASK", 6)) * 3600
+CLOSE_SILENT = os.environ.get("OMARCHY_MEMORY_IDLE_CLOSE_SILENT") == "1"
+POLL = float(os.environ.get("OMARCHY_MEMORY_IDLE_POLL", 5))
+
+
+def log(line):
+    line = f"{datetime.now():%F %T} idle: {line}"
+    print(line, file=sys.stderr)
+    try:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def ago(seconds):
+    seconds = int(seconds or 0)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
+
+
+def stat(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            s = f.read()
+    except OSError:
+        return None
+    rest = s[s.rindex(")") + 2:].split()
+    return {"comm": s[s.index("(") + 1: s.rindex(")")], "ppid": int(rest[1]), "start": rest[19]}
+
+
+def session_file(pid):
+    try:
+        with open(os.path.join(CLAUDE_HOME, "sessions", f"{pid}.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def ancestors():
+    out, pid = set(), os.getpid()
+    while pid and pid > 1:
+        out.add(pid)
+        s = stat(pid)
+        pid = s["ppid"] if s else 0
+    return out
+
+
+def frozen_pids():
+    pids = set()
+    try:
+        with open(os.path.join(STATE, "frozen.tsv")) as f:
+            for line in f:
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) > 5:
+                    pids.update(int(p) for p in cols[5].split(",") if p.isdigit())
+    except OSError:
+        pass
+    return pids
+
+
+def load_answers():
+    try:
+        with open(ANSWERS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_answers(answers):
+    tmp = ANSWERS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(answers, f, indent=1)
+    os.replace(tmp, ANSWERS)
+
+
+def entries(path, offset=0):
+    # Whole JSON lines only: one still being written is read on the next poll.
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except (OSError, TypeError):
+        return []
+    out = []
+    for line in data.split(b"\n")[:-1]:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def texts(entry, role):
+    if entry.get("type") != role:
+        return []
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return [content]
+    out = []
+    for block in content or []:
+        if block.get("type") == "text":
+            out.append(block.get("text") or "")
+        elif role == "assistant" and block.get("type") == "tool_use":
+            # A session may answer the sender with SendMessage instead.
+            out += [v for v in (block.get("input") or {}).values() if isinstance(v, str)]
+    return out
+
+
+def parse_reply(text):
+    at = text.rfind("IDLE-REPLY:")
+    if at < 0:
+        return None
+    lines = text[at:].splitlines()
+    verdict = lines[0].split(":", 1)[1].strip().strip("*`").lower()
+    verdict = next((w for w in ("done", "working", "waiting") if verdict.startswith(w)), verdict)
+    reply = {"verdict": verdict}
+    for line in lines[1:]:
+        key, _, value = line.strip().strip("*`").partition(":")
+        if key.strip().lower() in FIELDS:
+            reply[key.strip().lower()] = value.strip().strip("*`")
+    return reply
+
+
+def last_said(path):
+    # What a session was last asked and last said, for the ones not asked now.
+    asked = said = ""
+    for e in entries(path, max(0, (os.path.getsize(path) if path and os.path.exists(path) else 0) - 400_000)):
+        for t in texts(e, "user"):
+            if t.strip() and not t.lstrip().startswith("<"):
+                asked = t
+        for t in texts(e, "assistant"):
+            if t.strip():
+                said = t
+    clip = lambda s: " ".join(s.split())[:240]
+    return clip(asked), clip(said)
+
+
+def question(run):
+    return f"""[Memory watchdog idle sweep, run {run}] Kewk set this up: when sessions sit idle or memory runs short, every idle Claude session is asked whether it is done, and the done ones are closed to free memory. Please answer now:
+1. If your work is finished and worth keeping in the vault but not saved there yet, save it to the vault first.
+2. Then end your reply with this block, exactly, filled in:
+IDLE-REPLY: done | working | waiting
+vault: saved | not needed | not saved
+doing: <one line: what this session was for>
+left: <one line: what is still open, or none>
+waiting-on: <one line: who or what you are waiting on, or nothing>
+Answer done only if nothing is left for you; the session will then be closed (it stays resumable with claude --resume)."""
+
+
+def ask(agent, run):
+    path = agent["transcript"]
+    offset = os.path.getsize(path) if path and os.path.exists(path) else 0
+    agent["asked_at"] = time.time()
+    sent = subprocess.run(["omarchy-memory-message", agent["name"], question(run)],
+                          capture_output=True, text=True, timeout=180)
+    if sent.returncode != 0 or "sent" not in sent.stdout.lower():
+        agent["outcome"] = "not reached"
+        agent["note"] = (sent.stdout + sent.stderr).strip()[:200]
+        return
+    deadline = agent["asked_at"] + TIMEOUT
+    reply = None
+    while time.time() < deadline:
+        time.sleep(POLL)
+        if stat(agent["pid"]) is None:
+            agent["outcome"] = "exited"
+            return
+        for e in entries(path, offset):
+            for t in texts(e, "assistant"):
+                reply = parse_reply(t) or reply
+        # Answered and back to idle: any vault saving it did is over.
+        if reply and session_file(agent["pid"]).get("status") == "idle":
+            break
+    agent["reply"] = reply
+    if not reply:
+        agent["outcome"] = "no answer"
+
+
+def close(agent):
+    pid, s = agent["pid"], stat(agent["pid"])
+    # The same process that was asked, not a new one on a reused pid.
+    if not s or s["start"] != str(session_file(pid).get("procStart", s["start"])) or s["start"] != agent["start"]:
+        return "gone already"
+    shell = stat(s["ppid"])
+    term = stat(shell["ppid"]) if shell else None
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(30):
+        if stat(pid) is None:
+            break
+        time.sleep(0.5)
+    else:
+        return "still running after SIGTERM"
+    window = "terminal left open"
+    if shell and shell["comm"] in TERMINALS:
+        window = "terminal closed with it"
+    elif shell and term and shell["comm"] in SHELLS and term["comm"] in TERMINALS:
+        try:
+            active = json.loads(subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True,
+                                               text=True, timeout=5).stdout or "{}").get("pid")
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            active = None
+        others = subprocess.run(["pgrep", "-P", str(s["ppid"])], capture_output=True, text=True).stdout.split()
+        if active == shell["ppid"]:
+            window = "terminal left open: it is the window in focus"
+        elif others:
+            window = "terminal left open: its shell runs something else"
+        else:
+            os.kill(s["ppid"], signal.SIGHUP)
+            window = "terminal closed"
+    return f"closed, {window}"
+
+
+def html_report(run, rows, others):
+    esc = lambda s: (str(s or "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    colors = {"closed": "#3fb950", "left running": "#d29922", "not asked": "#8b949e"}
+
+    def table(items):
+        head = "<tr><th>Session</th><th>Memory</th><th>Idle</th><th>Answer</th><th>Vault</th><th>Doing</th><th>Left</th><th>Waiting on</th><th>Action</th></tr>"
+        body = ""
+        for a in items:
+            r = a.get("reply") or {}
+            body += (f"<tr><td><b>{esc(a['name'])}</b><br><small>{esc(a['cwd'])}</small></td><td>{a['total_mb']}M</td>"
+                     f"<td>{ago(a.get('idle_s'))}</td><td>{esc(r.get('verdict') or a.get('outcome'))}</td>"
+                     f"<td>{esc(r.get('vault'))}</td><td>{esc(r.get('doing') or a.get('last_asked'))}</td>"
+                     f"<td>{esc(r.get('left'))}</td><td>{esc(r.get('waiting-on'))}</td>"
+                     f"<td>{esc(a.get('action'))}{'<br><code>' + esc(a['resume']) + '</code>' if a.get('resume') else ''}</td></tr>")
+        return f"<table>{head}{body}</table>"
+
+    sections = ""
+    for group in ("closed", "left running", "not asked"):
+        items = [a for a in rows if a["group"] == group]
+        if items:
+            sections += f"<h2 style='color:{colors[group]}'>{group.capitalize()} ({len(items)}, {sum(a['total_mb'] for a in items)}M)</h2>{table(items)}"
+    if others:
+        sections += "<h2>Other agents (not Claude, not asked)</h2><ul>" + "".join(
+            f"<li><b>{esc(o['id'])}</b> {o['total_mb']}M, {esc(o['cwd'])}: {esc(o['what'])}</li>" for o in others) + "</ul>"
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Idle sweep {run}</title>
+<style>body{{background:#0d1117;color:#e6edf3;font:14px system-ui;margin:24px}}table{{border-collapse:collapse;width:100%;margin-bottom:24px}}
+td,th{{border:1px solid #30363d;padding:6px 8px;vertical-align:top;text-align:left}}th{{background:#161b22}}code{{color:#79c0ff;font-size:12px}}</style></head>
+<body><h1>Idle session sweep {run}</h1><p>Freed about {sum(a['total_mb'] for a in rows if a['group'] == 'closed')}M.</p>{sections}</body></html>"""
+
+
+def md_report(run, rows, others):
+    out = [f"# Idle session sweep {run}", ""]
+    for group in ("closed", "left running", "not asked"):
+        items = [a for a in rows if a["group"] == group]
+        if not items:
+            continue
+        out += [f"## {group.capitalize()}", ""]
+        for a in items:
+            r = a.get("reply") or {}
+            out.append(f"- **{a['name']}** {a['total_mb']}M, idle {ago(a.get('idle_s'))}, {a['cwd']}: "
+                       f"{r.get('verdict') or a.get('outcome')}; vault {r.get('vault', '-')}; "
+                       f"doing: {r.get('doing') or a.get('last_asked') or '-'}; left: {r.get('left', '-')}; "
+                       f"waiting on: {r.get('waiting-on', '-')}. {a.get('action', '')}"
+                       f"{' Resume: `' + a['resume'] + '`' if a.get('resume') else ''}")
+        out.append("")
+    if others:
+        out += ["## Other agents (not asked)", ""] + [f"- {o['id']} {o['total_mb']}M {o['cwd']}: {o['what']}" for o in others]
+    return "\n".join(out) + "\n"
+
+
+def main():
+    os.makedirs(IDLE_DIR, exist_ok=True)
+    os.makedirs(os.path.join(STATE, "reports"), exist_ok=True)
+    run = datetime.now().strftime("%Y%m%d-%H%M%S")
+    found = json.loads(subprocess.run(["omarchy-memory-agents", "--json"], capture_output=True,
+                                      text=True, check=True).stdout)
+    mine, frozen, answers, now = ancestors(), frozen_pids(), load_answers(), time.time()
+    rows, others, targets = [], [], []
+    for a in found:
+        if a["pid"] in mine:
+            continue
+        if a["kind"] != "claude" or a["route"] != "claude-peer":
+            if a["total_mb"] >= MIN_MB:
+                first = (a.get("groups") or [{}])[0]
+                others.append({**a, "what": first.get("cmd") or first.get("leader") or a["kind"]})
+            continue
+        if a["total_mb"] < MIN_MB or (ONLY and a["name"] != ONLY):
+            continue
+        s = stat(a["pid"])
+        sid = session_file(a["pid"]).get("sessionId")
+        a.update(start=s["start"] if s else "", session_id=sid, group="not asked")
+        a["last_asked"], a["last_said"] = last_said(a["transcript"])
+        prior = answers.get(sid or "")
+        if a["pid"] in frozen:
+            a["outcome"] = "paused by the brake"
+        elif a["status"] != "idle" or not a["idle_s"]:
+            a["outcome"] = "working"
+        elif a["idle_s"] < IDLE_MIN * 60:
+            a["outcome"] = f"idle {ago(a['idle_s'])}, under {ago(IDLE_MIN * 60)}"
+        elif prior and now - prior["at"] < REASK and prior["verdict"] in ("working", "waiting"):
+            a["outcome"] = f"answered {prior['verdict']} {ago(now - prior['at'])} ago"
+            a["reply"] = prior
+        else:
+            targets.append(a)
+        rows.append(a)
+
+    (print if DRY else log)(f"run {run}: asking {len(targets)} of {len(rows)} Claude sessions"
+        f" ({', '.join(a['name'] for a in targets) or 'none'})")
+    if DRY:
+        for a in rows:
+            print(f"{'ask' if a in targets else 'skip':<5}{a['name']:<20}{a['total_mb']:>6}M  idle {ago(a['idle_s']):<5} {a.get('outcome', '')}")
+        return
+
+    threads = [threading.Thread(target=ask, args=(a, run)) for a in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for a in targets:
+        r = a.get("reply")
+        if r:
+            answers[a["session_id"] or a["name"]] = {**r, "at": time.time(), "name": a["name"]}
+        closable = r and r["verdict"] == "done" and r.get("vault", "").lower().startswith(("saved", "not needed"))
+        if closable or (CLOSE_SILENT and a.get("outcome") == "no answer"):
+            a["action"] = close(a)
+            if a["action"].startswith("closed"):
+                a["group"] = "closed"
+                a["resume"] = f"cd {a['cwd']} && claude --resume {a['session_id']}"
+                answers.pop(a["session_id"] or a["name"], None)
+            else:
+                a["group"] = "left running"
+        else:
+            a["group"] = "left running"
+            a["action"] = ("done, but its work is not in the vault yet" if r and r["verdict"] == "done"
+                           else a.get("outcome") or f"kept: {r['verdict']}")
+        log(f"run {run}: {a['name']} {a['total_mb']}M answered "
+            f"{(r or {}).get('verdict') or a.get('outcome')}: {a['action']}")
+    save_answers(answers)
+
+    base = os.path.join(STATE, "reports", f"idle-{run}")
+    with open(base + ".md", "w") as f:
+        f.write(md_report(run, rows, others))
+    with open(base + ".html", "w") as f:
+        f.write(html_report(run, rows, others))
+    closed = [a for a in rows if a["group"] == "closed"]
+    left = [a for a in rows if a["group"] != "closed"]
+    summary = (f"Closed {len(closed)} ({sum(a['total_mb'] for a in closed)}M): "
+               f"{', '.join(a['name'] for a in closed) or 'none'}. {len(left)} left running.")
+    log(f"run {run}: {summary} Report: {base}.html")
+    print(base + ".html")
+    if targets and shutil.which("omarchy-notification-send"):
+        subprocess.run(["omarchy-notification-send", "--glyph", MEMORY_GLYPH, "Idle Claude sessions swept",
+                        summary + " Click for the report.", "--exec", "xdg-open", base + ".html"],
+                       capture_output=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -17,7 +17,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$TMPDIR/bin"
+mkdir -p "$TMPDIR/bin" "$TMPDIR/relay"
 SYSTEMCTL_LOG="$TMPDIR/systemctl-log"
 NOTIFY_LOG="$TMPDIR/notify-log"
 SYSTEMD_RUN_LOG="$TMPDIR/systemd-run-log"
@@ -72,6 +72,13 @@ else
   [[ -n ${JOURNAL_SYSTEM:-} ]] && printf '%s\n' "$JOURNAL_SYSTEM"
 fi
 exit 0
+SH
+
+# The watcher's sweep only records that it started; the sweep itself is
+# tested on its own below.
+cat >"$TMPDIR/bin/omarchy-memory-idle" <<'SH'
+#!/bin/bash
+echo "sweep" >>"$NOTIFY_LOG.sweeps"
 SH
 
 chmod +x "$TMPDIR/bin/"*
@@ -803,7 +810,7 @@ idle_toast() {
   done
   return 1
 }
-rm -f "$state/idle-seen" "$state/idle-agents.json"
+rm -rf "$state/idle-seen" "$state/idle-agents.json" "$state/idle" "$NOTIFY_LOG.sweeps"
 watch OMARCHY_MEMORY_IDLE_HOURS=12
 idle_toast || fail "the watcher calls out a session idle over 12h with memory to spare" "$(cat "$NOTIFY_LOG")"
 grep -Fq 'memtest-idle 2d' "$NOTIFY_LOG" || fail "the idle callout names the session and how long" "$(cat "$NOTIFY_LOG")"
@@ -811,8 +818,58 @@ watch OMARCHY_MEMORY_IDLE_HOURS=12
 ! idle_toast || fail "the idle callout does not repeat for sessions it already named" "$(cat "$NOTIFY_LOG")"
 pass "memory watchdog calls out idle Claude sessions once"
 
+grep -c sweep "$NOTIFY_LOG.sweeps" 2>/dev/null | grep -qx 1 ||
+  fail "the watcher starts one sweep for idle sessions, then waits out the cooldown" "$(cat "$NOTIFY_LOG.sweeps" 2>/dev/null)"
+pass "memory watchdog starts an idle sweep once per cooldown"
+
+# The sweep asks through a relay that answers for the session: it writes the
+# reply into the transcript and turns the session idle again.
+cat >"$TMPDIR/relay/omarchy-memory-message" <<'SH'
+#!/bin/bash
+printf '%s\n' "$1" >>"$RELAY_LOG"
+session=$(grep -l "\"name\":\"$1\"" "$HOME/.claude/sessions/"*.json)
+jq -cn --arg t "Sure.
+IDLE-REPLY: $IDLE_ANSWER
+vault: ${IDLE_VAULT:-not needed}
+doing: memtest
+left: none
+waiting-on: nothing" '{type: "assistant", message: {content: [{type: "text", text: $t}]}}' \
+  >>"$HOME/.claude/projects/memtest/memtest-idle.jsonl"
+echo sent
+SH
+chmod +x "$TMPDIR/relay/omarchy-memory-message"
+sweep_run() {
+  run env PATH="$TMPDIR/relay:$ROOT/bin:$PATH" RELAY_LOG="$TMPDIR/relay-log" OMARCHY_MEMORY_IDLE_POLL=0.2 "$@" \
+    "$ROOT/bin/omarchy-memory-idle" --idle 60 --min-mb 0 --timeout 10 >/dev/null 2>&1
+}
+
+idle_session idle
+IDLE_ANSWER=working sweep_run
+grep -Fqx memtest-idle "$TMPDIR/relay-log" || fail "the sweep asks an idle session"
+kill -0 "$idle_agent" 2>/dev/null || fail "the sweep leaves a session that answered working"
+ls "$state/reports/"idle-*.md >/dev/null 2>&1 || fail "the sweep writes a report"
+grep -Fq 'memtest-idle' "$state/reports/"idle-*.md || fail "the report names the session" "$(cat "$state/reports/"idle-*.md)"
+idle_session idle
+: >"$TMPDIR/relay-log"
+IDLE_ANSWER=done sweep_run
+[[ ! -s $TMPDIR/relay-log ]] || fail "the sweep does not ask again a session that just answered working"
+pass "memory idle sweep keeps sessions still working and does not re-ask them"
+
+rm -f "$state/idle/answers.json"
+idle_session idle
+IDLE_ANSWER=done IDLE_VAULT="not saved" sweep_run
+kill -0 "$idle_agent" 2>/dev/null || fail "the sweep keeps a done session whose work is not in the vault"
+rm -f "$state/idle/answers.json"
+idle_session idle
+IDLE_ANSWER=done sweep_run
+for _ in {1..30}; do kill -0 "$idle_agent" 2>/dev/null || break; sleep 0.1; done
+! kill -0 "$idle_agent" 2>/dev/null || fail "the sweep closes a session that answered done with its work saved" "$(grep " idle: " "$state/watch.log" | tail -4)"
+grep -Fq 'claude --resume memtest-idle' "$state/reports/"idle-*.md ||
+  fail "the report says how to resume a closed session" "$(cat "$state/reports/"idle-*.md)"
+pass "memory idle sweep closes done sessions and reports how to resume them"
+
 kill "$idle_child" "$idle_agent" 2>/dev/null || true
-rm -rf "$test_home/.claude" "$state/idle-seen" "$state/idle-agents.json"
+rm -rf "$test_home/.claude" "$state/idle-seen" "$state/idle-agents.json" "$state/idle" "$state/reports/"idle-*
 
 # A game's own binary often has a bland name (under gamescope, or a Proton
 # helper), so the brake protects everything under a game, as memory kill does:
