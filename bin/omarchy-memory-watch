@@ -43,6 +43,11 @@
 #          does not drain just because RAM is free again. A toast says when
 #          it lifts.
 #   kills  after oomd kills, a toast naming what it took (omarchy-memory-oomd-kills).
+#   idle   every half hour, whatever memory looks like: a toast naming the
+#          Claude Code sessions idle 12 hours or more, which hold their memory
+#          until closed (omarchy-memory-agents --idle). Only when a session
+#          joins that list, so it does not nag; the warning names them again
+#          when memory runs short. Callout only: closing them is the user's.
 #
 # Thresholds are environment variables; change them with a drop-in from
 # `systemctl --user edit omarchy-memory-watch`.
@@ -66,6 +71,10 @@ readonly STANDDOWN=$STATE/standdown
 readonly LAST_SPAWN=$STATE/last-spawn
 # A handoff the brake still owes the responder; kept across restarts.
 readonly BRAKE_PENDING=$STATE/brake-pending
+# The sessions the last idle check found, for the warning; and which of them
+# were already called out.
+readonly IDLE=$STATE/idle-agents.json
+readonly IDLE_SEEN=$STATE/idle-seen
 # nf-md-memory, escaped so this file reads without a Nerd Font.
 readonly MEMORY_GLYPH=$'\U000f035b'
 
@@ -95,6 +104,8 @@ agent_psi=${OMARCHY_MEMORY_AGENT_PSI:-30}
 cooldown=${OMARCHY_MEMORY_COOLDOWN:-900}
 retry=${OMARCHY_MEMORY_RETRY:-30} # after a responder that could not start
 standdown_min=${OMARCHY_MEMORY_STANDDOWN_MIN:-30}
+idle_hours=${OMARCHY_MEMORY_IDLE_HOURS:-12} # 0 turns the idle callout off
+idle_check=${OMARCHY_MEMORY_IDLE_CHECK:-1800}
 
 mkdir -p "$STATE/reports"
 
@@ -134,8 +145,13 @@ snapshot() {
 }
 
 warn() {
-  local largest line
+  local largest line idle=
   largest=$(jq -r 'first(.[]) | "\(.leader), \(.total_mb)M"' "$LAST_TOP" 2>/dev/null)
+  # Only from a recent check: a stale list names sessions closed since.
+  if ((EPOCHSECONDS - $(stat -c %Y "$IDLE" 2>/dev/null || echo 0) <= idle_check + 60)); then
+    idle=$(jq -r --arg h "$idle_hours" \
+      'select(length > 0) | "Idle over \($h)h: \(length) Claude sessions, \(map(.total_mb) | add)M. "' "$IDLE" 2>/dev/null)
+  fi
   if ((swap_pct >= warn_swap_pct && mem_pct >= warn_swap_mem_pct)); then
     line="Swap ${swap_pct}% and RAM ${mem_pct}% used; systemd-oomd kills an app once both pass 90%."
   else
@@ -144,7 +160,26 @@ warn() {
   log "warn: $(metrics), largest ${largest:-unknown}"
   omarchy-notification-send --urgency critical --glyph "$MEMORY_GLYPH" \
     "Memory is running out" \
-    "$line Largest: ${largest:-unknown}. See: omarchy memory top" >/dev/null 2>&1 &
+    "$line Largest: ${largest:-unknown}. ${idle}See: omarchy memory top" >/dev/null 2>&1 &
+}
+
+# Run in the background: the scan takes longer than a sample, and the brake
+# must not wait on it.
+check_idle() {
+  local found ids new names mb
+  found=$(omarchy-memory-agents --json --idle $((idle_hours * 60)) 2>/dev/null) || return
+  jq -c '[.[] | {id, name, total_mb, idle_s}]' <<<"$found" >"$IDLE.tmp" 2>/dev/null && mv "$IDLE.tmp" "$IDLE" || return
+  ids=$(jq -r '.[].id' "$IDLE" | sort)
+  new=$(comm -23 <(printf '%s\n' "$ids") <(sort "$IDLE_SEEN" 2>/dev/null))
+  printf '%s\n' "$ids" >"$IDLE_SEEN"
+  [[ -n $new ]] || return 0
+  mb=$(jq 'map(.total_mb) | add' "$IDLE")
+  names=$(jq -r 'map("\(.name // .id) \(if .idle_s >= 86400 then "\(.idle_s / 86400 | floor)d" else "\(.idle_s / 3600 | floor)h" end)")
+    | if length > 8 then .[:8] + ["and \(length - 8) more"] else . end | join(", ")' "$IDLE")
+  log "idle: $(jq length "$IDLE") Claude sessions idle over ${idle_hours}h hold ${mb}M: $names"
+  omarchy-notification-send --glyph "$MEMORY_GLYPH" \
+    "$(jq length "$IDLE") Claude sessions idle over ${idle_hours}h" \
+    "They hold ${mb}M until closed: $names. List them: omarchy memory agents --idle $((idle_hours * 60))" >/dev/null 2>&1
 }
 
 start_time() {
@@ -320,6 +355,8 @@ retry_at=0
 quit=0
 last_snapshot=0
 warm=0
+last_idle=0
+idle_pid=
 log "watching: warn at (swap>=${warn_swap_pct}% and ram>=${warn_swap_mem_pct}%) or (ram>=${warn_mem_pct}% and pressure>=${warn_psi}), brake at (swap>=${brake_swap_pct}% and ram>=${brake_swap_mem_pct}%) or (ram>=${brake_mem_pct}% and pressure>=${brake_psi})"
 
 while true; do
@@ -333,6 +370,12 @@ while true; do
     elif ((EPOCHSECONDS - $(stat -c %Y "$STANDDOWN" 2>/dev/null || echo 0) >= standdown_min * 60)); then
       lift_standdown "${standdown_min} minutes passed"
     fi
+  fi
+
+  if ((idle_hours > 0 && EPOCHSECONDS - last_idle >= idle_check)) && ! kill -0 "$idle_pid" 2>/dev/null; then
+    check_idle &
+    idle_pid=$!
+    last_idle=$EPOCHSECONDS
   fi
 
   # One sample is enough here: oomd waits 20s on pressure, this must not.

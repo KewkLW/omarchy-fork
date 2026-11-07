@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # omarchy:summary=Show which AI agents are using the memory, charged per agent
-# omarchy:args=[--json]
-# omarchy:examples=omarchy memory agents | omarchy memory agents --json
+# omarchy:args=[--json] [--idle <minutes>]
+# omarchy:examples=omarchy memory agents | omarchy memory agents --json | omarchy memory agents --idle 720
 
 # Every process is charged to the nearest AI agent in its ancestry, itself
 # included, so an agent's own memory and the builds or headless editors it
@@ -11,6 +11,10 @@
 # Each agent carries a messaging route for the memory responder:
 #   claude-peer  a Claude Code session; reachable with its SendMessage tool by "name"
 #   none         no channel; read its transcript or cmdline to learn what it's doing
+#
+# A Claude Code session also carries idle_s: how long since it last did
+# anything, or null when that can't be told. --idle <minutes> lists only the
+# sessions idle at least that long.
 
 import glob
 import importlib.machinery
@@ -60,6 +64,29 @@ def claude_session(pid):
 def transcript(session_id):
     hits = glob.glob(os.path.join(CLAUDE_HOME, "projects", "*", f"{session_id}.jsonl"))
     return hits[0] if hits else None
+
+
+def idle_seconds(session, path, active_subagents):
+    # Idle only by its own say-so: a session mid-turn, or running a command,
+    # is working however long ago its transcript was written. A session
+    # waiting on background subagents says it is idle, but isn't. The latest
+    # of its status change and its transcript's last write is when it was last
+    # seen working; without either, nobody can tell.
+    if session.get("status") != "idle" or active_subagents:
+        return 0 if session else None
+    seen = [session["statusUpdatedAt"] / 1000] if isinstance(session.get("statusUpdatedAt"), (int, float)) else []
+    try:
+        seen.append(os.path.getmtime(path))
+    except (OSError, TypeError):
+        pass
+    return max(0, int(time.time() - max(seen))) if seen else None
+
+
+def ago(seconds):
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
 
 
 def subagents(session_id):
@@ -123,6 +150,7 @@ def main():
             if own not in agents:
                 s = claude_session(own) if kinds[own] == "claude" else {}
                 path = transcript(s["sessionId"]) if s.get("sessionId") else None
+                subs = subagents(s.get("sessionId"))
                 try:
                     cwd = os.readlink(f"/proc/{own}/cwd")
                 except OSError:
@@ -131,7 +159,8 @@ def main():
                     "id": f"{kinds[own]}-{own}", "kind": kinds[own], "pid": own, "cwd": cwd,
                     "name": s.get("name"), "status": s.get("status"),
                     "route": "claude-peer" if s.get("name") else "none",
-                    "transcript": path, "subagents": subagents(s.get("sessionId")),
+                    "transcript": path, "subagents": subs,
+                    "idle_s": idle_seconds(s, path, subs) if kinds[own] == "claude" else None,
                     "total_mb": 0, "groups": [],
                 }
             a = agents[own]
@@ -145,6 +174,12 @@ def main():
     for a in agents.values():
         a["total_mb"] = a.pop("kb") // 1024
     out = sorted(agents.values(), key=lambda a: -a["total_mb"])
+    if "--idle" in sys.argv:
+        try:
+            idle_min = float(sys.argv[sys.argv.index("--idle") + 1])
+        except (IndexError, ValueError):
+            sys.exit("omarchy-memory-agents: --idle needs the minutes, e.g. --idle 720")
+        out = [a for a in out if a["idle_s"] is not None and a["idle_s"] >= idle_min * 60]
     for a in out:
         a["groups"] = sorted(a["groups"], key=lambda g: -g["total_mb"])[:10]
 
@@ -153,7 +188,8 @@ def main():
         return
     for a in out:
         print(f"{a['total_mb']:>7}M  {a['id']:<18} {a['name'] or '-':<18} "
-              f"route={a['route']:<11} {a['status'] or ''}  cwd={a['cwd']}")
+              f"route={a['route']:<11} {a['status'] or ''}"
+              f"{' ' + ago(a['idle_s']) if a['idle_s'] else ''}  cwd={a['cwd']}")
         for s in a["subagents"]:
             print(f"{'':>10}subagent: {s['description']}")
         for g in a["groups"][:5]:

@@ -130,7 +130,7 @@ watch() {
   # Nothing the watcher could act on outside this test is ever picked.
   run env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" OMARCHY_MEMORY_PRESSURE="$fake/pressure" \
     OMARCHY_MEMORY_APP_PRESSURE="$fake/app-pressure" OMARCHY_MEMORY_INTERVAL=0.2 \
-    OMARCHY_MEMORY_ONLY='^omarchy-memtest-nothing$' "$@" \
+    OMARCHY_MEMORY_ONLY='^omarchy-memtest-nothing$' OMARCHY_MEMORY_IDLE_HOURS=0 "$@" \
     timeout 3 "$ROOT/bin/omarchy-memory-watch" 2>/dev/null || true
   sleep 0.3
 }
@@ -752,6 +752,67 @@ jq -e --argjson agent "$self_agent" --argjson child "$self_child" --argjson scan
    and ([.[].groups[].pids[]] | index($scan) | not)' "$selfscan.json" >/dev/null ||
   fail "memory agents run by an agent charges that agent for its group, less the scan" "$(cat "$selfscan.json")"
 pass "memory agents run inside an agent's group still charges that agent"
+
+# A Claude session idle for two days is listed by --idle and called out by the
+# watcher once; one at work, or waiting on a subagent, is not.
+setsid bash -c "exec -a claude bash -c '$TMPDIR/bin/omarchy-memtest-fat & wait'" &
+idle_agent=$!
+dummy_pids+=("$idle_agent")
+idle_child=
+for _ in {1..50}; do
+  idle_child=$(pgrep -P "$idle_agent" -x python3 || true)
+  [[ -n $idle_child ]] &&
+    (($(awk '/^VmRSS:/ { print $2 }' "/proc/$idle_child/status" 2>/dev/null || echo 0) >= 49152)) && break
+  sleep 0.1
+done
+[[ -n $idle_child ]] || fail "the idle agent dummy starts its child"
+dummy_pids+=("$idle_child")
+idle_session() {
+  mkdir -p "$test_home/.claude/sessions" "$test_home/.claude/projects/memtest"
+  printf '{"pid":%s,"sessionId":"memtest-idle","name":"memtest-idle","status":"%s","statusUpdatedAt":%s}\n' \
+    "$idle_agent" "$1" "$((($(date +%s) - 2 * 86400) * 1000))" >"$test_home/.claude/sessions/$idle_agent.json"
+  touch -d '2 days ago' "$test_home/.claude/projects/memtest/memtest-idle.jsonl"
+}
+idle_session idle
+run "$ROOT/bin/omarchy-memory-agents" --json --idle 720 |
+  jq -e --argjson agent "$idle_agent" 'any(.[]; .pid == $agent and .idle_s >= 2 * 86400 - 60)' >/dev/null ||
+  fail "memory agents --idle lists a session idle two days" "$(run "$ROOT/bin/omarchy-memory-agents" --json --idle 720)"
+run "$ROOT/bin/omarchy-memory-agents" --json --idle 4000 |
+  jq -e --argjson agent "$idle_agent" 'any(.[]; .pid == $agent) | not' >/dev/null ||
+  fail "memory agents --idle leaves out a session idle less than asked"
+pass "memory agents lists sessions idle at least --idle minutes"
+
+idle_session busy
+run "$ROOT/bin/omarchy-memory-agents" --json --idle 720 |
+  jq -e --argjson agent "$idle_agent" 'any(.[]; .pid == $agent) | not' >/dev/null ||
+  fail "a busy session is never idle, however old its transcript"
+idle_session idle
+mkdir -p "$test_home/.claude/projects/memtest/memtest-idle/subagents"
+touch "$test_home/.claude/projects/memtest/memtest-idle/subagents/agent-a1.jsonl"
+run "$ROOT/bin/omarchy-memory-agents" --json --idle 720 |
+  jq -e --argjson agent "$idle_agent" 'any(.[]; .pid == $agent) | not' >/dev/null ||
+  fail "a session waiting on an active subagent is not idle"
+rm -r "$test_home/.claude/projects/memtest/memtest-idle"
+pass "memory agents counts busy sessions and running subagents as working"
+
+printf 'MemTotal: 1000000 kB\nMemAvailable: 900000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n' >"$fake/meminfo"
+idle_toast() {
+  for _ in {1..50}; do
+    grep -Fq 'Claude sessions idle over 12h' "$NOTIFY_LOG" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+rm -f "$state/idle-seen" "$state/idle-agents.json"
+watch OMARCHY_MEMORY_IDLE_HOURS=12
+idle_toast || fail "the watcher calls out a session idle over 12h with memory to spare" "$(cat "$NOTIFY_LOG")"
+grep -Fq 'memtest-idle 2d' "$NOTIFY_LOG" || fail "the idle callout names the session and how long" "$(cat "$NOTIFY_LOG")"
+watch OMARCHY_MEMORY_IDLE_HOURS=12
+! idle_toast || fail "the idle callout does not repeat for sessions it already named" "$(cat "$NOTIFY_LOG")"
+pass "memory watchdog calls out idle Claude sessions once"
+
+kill "$idle_child" "$idle_agent" 2>/dev/null || true
+rm -rf "$test_home/.claude" "$state/idle-seen" "$state/idle-agents.json"
 
 # A game's own binary often has a bland name (under gamescope, or a Proton
 # helper), so the brake protects everything under a game, as memory kill does:
