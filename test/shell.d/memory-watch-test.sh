@@ -78,6 +78,7 @@ SH
 # tested on its own below.
 cat >"$TMPDIR/bin/omarchy-memory-idle" <<'SH'
 #!/bin/bash
+[[ $1 == "--check" ]] && exit 0
 echo "sweep" >>"$NOTIFY_LOG.sweeps"
 SH
 
@@ -839,7 +840,7 @@ echo sent
 SH
 chmod +x "$TMPDIR/relay/omarchy-memory-message"
 sweep_run() {
-  run env PATH="$TMPDIR/relay:$ROOT/bin:$PATH" RELAY_LOG="$TMPDIR/relay-log" OMARCHY_MEMORY_IDLE_POLL=0.2 "$@" \
+  run env PATH="$TMPDIR/relay:$TMPDIR/bin:$ROOT/bin:$PATH" RELAY_LOG="$TMPDIR/relay-log" OMARCHY_MEMORY_IDLE_POLL=0.2 "$@" \
     "$ROOT/bin/omarchy-memory-idle" --idle 60 --min-mb 0 --timeout 10 >/dev/null 2>&1
 }
 

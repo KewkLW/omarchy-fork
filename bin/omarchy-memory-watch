@@ -43,16 +43,18 @@
 #          does not drain just because RAM is free again. A toast says when
 #          it lifts.
 #   kills  after oomd kills, a toast naming what it took (omarchy-memory-oomd-kills).
-#   idle   every half hour, whatever memory looks like: a toast naming the
+#   idle   every ten minutes, whatever memory looks like: a toast naming the
 #          Claude Code sessions idle 12 hours or more, which hold their memory
 #          until closed (omarchy-memory-agents --idle). Only when a session
 #          joins that list, so it does not nag; the warning names them again
 #          when memory runs short.
-#   sweep  then omarchy-memory-idle asks every idle Claude session whether it
-#          is done and its work is in the vault, closes the ones that are,
-#          and leaves a report; the warning starts one too. One at a time, at
-#          most once per OMARCHY_MEMORY_IDLE_SWEEP_COOLDOWN seconds;
-#          OMARCHY_MEMORY_IDLE_SWEEP=0 leaves only the callout.
+#   sweep  on the same check, whenever omarchy-memory-idle --check finds a
+#          Claude session to ask (idle 30 minutes at 100M, or 5 minutes at
+#          200M), it asks each one whether it is done and its work is in the
+#          vault, closes the ones that are, and leaves a report; the warning
+#          starts one too. One at a time, at most once per
+#          OMARCHY_MEMORY_IDLE_SWEEP_COOLDOWN seconds; OMARCHY_MEMORY_IDLE_SWEEP=0
+#          leaves only the callout.
 #
 # Thresholds are environment variables; change them with a drop-in from
 # `systemctl --user edit omarchy-memory-watch`.
@@ -113,9 +115,9 @@ cooldown=${OMARCHY_MEMORY_COOLDOWN:-900}
 retry=${OMARCHY_MEMORY_RETRY:-30} # after a responder that could not start
 standdown_min=${OMARCHY_MEMORY_STANDDOWN_MIN:-30}
 idle_hours=${OMARCHY_MEMORY_IDLE_HOURS:-12} # 0 turns the idle callout off
-idle_check=${OMARCHY_MEMORY_IDLE_CHECK:-1800}
+idle_check=${OMARCHY_MEMORY_IDLE_CHECK:-600}
 idle_sweep=${OMARCHY_MEMORY_IDLE_SWEEP:-1}
-sweep_cooldown=${OMARCHY_MEMORY_IDLE_SWEEP_COOLDOWN:-3600}
+sweep_cooldown=${OMARCHY_MEMORY_IDLE_SWEEP_COOLDOWN:-1800}
 
 mkdir -p "$STATE/reports"
 
@@ -191,12 +193,13 @@ sweep() {
 
 check_idle() {
   local found ids new names mb
+  ((idle_sweep)) && omarchy-memory-idle --check && sweep "idle Claude sessions to ask"
+  ((idle_hours > 0)) || return 0
   found=$(omarchy-memory-agents --json --idle $((idle_hours * 60)) 2>/dev/null) || return
   jq -c '[.[] | {id, name, total_mb, idle_s}]' <<<"$found" >"$IDLE.tmp" 2>/dev/null && mv "$IDLE.tmp" "$IDLE" || return
   ids=$(jq -r '.[].id' "$IDLE" | sort)
   new=$(comm -23 <(printf '%s\n' "$ids") <(sort "$IDLE_SEEN" 2>/dev/null))
   printf '%s\n' "$ids" >"$IDLE_SEEN"
-  [[ -n $ids ]] && sweep "Claude sessions idle over ${idle_hours}h"
   [[ -n $new ]] || return 0
   mb=$(jq 'map(.total_mb) | add' "$IDLE")
   names=$(jq -r 'map("\(.name // .id) \(if .idle_s >= 86400 then "\(.idle_s / 86400 | floor)d" else "\(.idle_s / 3600 | floor)h" end)")
@@ -397,7 +400,7 @@ while true; do
     fi
   fi
 
-  if ((idle_hours > 0 && EPOCHSECONDS - last_idle >= idle_check)) && ! kill -0 "$idle_pid" 2>/dev/null; then
+  if ((EPOCHSECONDS - last_idle >= idle_check)) && ! kill -0 "$idle_pid" 2>/dev/null; then
     check_idle &
     idle_pid=$!
     last_idle=$EPOCHSECONDS
