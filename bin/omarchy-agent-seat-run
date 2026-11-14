@@ -340,13 +340,48 @@ fi
 # the agent starts signed in wherever the user signed in on the seat. The copy
 # is made beside the home and renamed into place, so a launch cut short never
 # leaves half a home; after that the two homes go their own ways.
+#
+# Left out: ~/.cache, the caches apps keep elsewhere (Unreal's Zen derived data
+# cache, NuGet's packages), which grow to gigabytes and rebuild on their own,
+# and a browser's Singleton* locks, which name the default lane's sandbox. Each
+# lane copied the default home's 4.3 GB Zen cache before (2026-11). The rest is
+# copied with --reflink=auto: on btrfs or XFS the lane shares the default
+# home's blocks until either side writes, so a new lane costs next to nothing.
+seed_skip=(.cache .config/Epic/UnrealEngine/Common/Zen .nuget/packages .local/share/NuGet/http-cache)
+
+# copy_seed <from> <to> [relative path]: copy a directory's entries, going into
+# only the directories that hold something to leave out. A subshell, for its
+# own nullglob and dotglob.
+copy_seed() (
+  shopt -s nullglob dotglob
+  local from=$1 to=$2 rel=${3:-} entry name path skip descend
+
+  for entry in "$from"/*; do
+    name=${entry##*/}
+    path=${rel:+$rel/}$name
+    [[ $rel == .config/* && $rel != .config/*/* && $name == Singleton* ]] && continue
+    # Into ~/.config and each app's directory there, for the Singleton* locks.
+    descend=0
+    [[ $path == .config || $rel == .config ]] && descend=1
+    for skip in "${seed_skip[@]}"; do
+      [[ $path == "$skip" ]] && continue 2
+      [[ $skip == "$path"/* ]] && descend=1
+    done
+    if ((descend)) && [[ -d $entry && ! -L $entry ]]; then
+      mkdir -m "$(stat -c %a -- "$entry")" -- "$to/$name" && copy_seed "$entry" "$to/$name" "$path" || return 1
+    else
+      cp -a --reflink=auto -- "$entry" "$to/" || return 1
+    fi
+  done
+)
+
 if [[ $agent_home != "$default_home" && ! -e $agent_home && -d $default_home && ! -L $default_home ]]; then
   if ! error=$(mkdir -p -- "${agent_home%/*}" 2>&1); then
     echo "Could not create ${agent_home%/*} for the agent seat's home: ${error#*: }" >&2
     exit 1
   fi
   seed=$(mktemp -d "${agent_home%/*}/home.XXXXXX")
-  if tar -C "$default_home" --exclude=./.cache --exclude='./.config/*/Singleton*' -cf - . 2>/dev/null | tar -C "$seed" -xf - 2>/dev/null; then
+  if copy_seed "$default_home" "$seed" 2>/dev/null; then
     mv -T -- "$seed" "$agent_home" 2>/dev/null || rm -rf -- "$seed"
   else
     echo "Could not copy the default seat home into this lane's; starting it empty" >&2
