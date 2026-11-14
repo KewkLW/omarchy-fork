@@ -30,7 +30,7 @@ if omarchy-toggle-enabled disk-watch-on; then
 else
   systemctl --user disable --now "$unit_name"
   # A responder or brake already running would carry on with nothing to watch it.
-  systemctl --user stop omarchy-disk-agent.service omarchy-disk-brake.service 2>/dev/null
+  systemctl --user stop omarchy-disk-agent.service omarchy-disk-brake.service omarchy-disk-report.service 2>/dev/null
   rm -rf "$HOME/.local/state/omarchy/disk-watch/mounts"
   rm -f "$unit"
   systemctl --user daemon-reload

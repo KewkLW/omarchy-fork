@@ -34,7 +34,10 @@ then tell them plainly what is left and what is theirs to decide.
   globs with their ages, large dirs to ask about, protected paths.
 - Read-only looks: `df -h`, `du -xsh <dir>/* | sort -rh`, `findmnt`, `ls`, `stat`,
   `journalctl --disk-usage`. The scan already holds each worktree's git state.
-- `omarchy-notification-send "<headline>" "<body>"` for the closing toast.
+- `omarchy-disk-report --notes <notes.json> [--out <page.html>]`: renders the
+  report notes (below) and the scan into a standalone HTML page.
+- `omarchy-notification-send "<headline>" "<body>"` for a toast (the launcher
+  sends the report's own).
 
 Never use `rm`, `mv`, `git worktree remove`, `git clean`, `docker ... prune`,
 `uv cache clean`, `cargo clean` or `sudo` yourself. If reclaim refuses
@@ -70,16 +73,53 @@ something, that is the answer: report it, don't work around it.
 3. **Look past the scan** if that was not enough. `du -xsh ~/* ~/.[!.]* | sort -rh`
    and down into the largest. Anything you find goes in the report as an ask
    item with its size and what it seems to be; you cannot delete it.
-4. **Report** to the report path: the drive before and after (df), what you freed
-   (from reclaim's output), each ask item with size and reason, each root item
-   with its command, and anything odd (a cache growing fast, a log filling the
-   disk). Then one toast: what you freed and the biggest thing waiting on the user.
+4. **Report**: write the notes (below) to the notes path you were given; the
+   launcher renders them into an HTML page and toasts a link. By hand, render
+   them yourself with `omarchy-disk-report --notes <file>` and give the user the
+   page's path. Never publish the report anywhere: it stays a local file.
+
+In **report mode** (`omarchy-agent-disk --report`, started when a drive passes
+the warning line) you free nothing: skip step 2, and put the safe tier under
+"delete" as what could go.
 
 When the user is in the conversation (the toast's click, or asked by hand), show
 them the ask list and free what they agree to with `--approved`. For a big
 directory they want to keep but not here, suggest moving it to another drive
 (a Linux filesystem for Wine prefixes, Steam libraries and build trees; NTFS and
 FAT drives only for cold archives) and leave the move to them.
+
+## Report
+
+A full report like a person would write after triaging the drive: why it is
+full, what to delete, move, ask about and keep, and what to do first. JSON,
+every list optional, sizes in bytes (apparent, from the scan or du):
+
+```json
+{
+  "headline": "Drive / is 87% full: three agent worktrees hold 140G of Rust builds",
+  "summary": "2-4 plain sentences: why it is full, what is safe, the one decision waiting on the user.",
+  "where":  [{"label": "~/Work/app-wt (39 worktrees)", "bytes": 203000000000, "note": "95% target/ dirs"}],
+  "delete": [{"what": "Merged worktrees", "path": "~/Work/app-wt/*", "why": "merged into main, clean, idle 20 days", "bytes": 0}],
+  "move":   [{"what": "Steam library", "path": "~/.local/share/Steam/steamapps", "how": "Steam: add a library on /mnt/ssd, Move install folder", "bytes": 0}],
+  "ask":    [{"what": "Old game", "path": "...", "why": "untouched since 2026-09-21; reinstallable", "bytes": 0}],
+  "keep":   [{"what": "Live worktrees", "path": "...", "why": "agents working in them now", "bytes": 0}],
+  "order":  "Free the delete tier first (about 140G), then decide on the old game.",
+  "trend":  "+25G/day"
+}
+```
+
+- **where**: the 8 to 16 biggest consumers, biggest first, from `du` on the drive,
+  each with a short note on what it is. This is the "why is it full" chart.
+- **delete**: the scan's safe items grouped sensibly (one row for 39 merged
+  worktrees, not 39 rows). In responder mode, what you freed, with df's figure.
+- **move**: only to a drive that suits it: a Linux filesystem (ext4, btrfs, xfs)
+  for Wine prefixes, Steam libraries and build trees; NTFS or FAT only for cold
+  archives (FAT cannot hold files over 4 GB). Check with `findmnt` and `df`.
+- **ask**: everything in the scan's ask tier worth a line, plus big things you
+  found that the scanner does not know (old projects, VM images, model files).
+- **keep**: the big things that must stay and why, so nobody wonders.
+- Root items from the scan are added to the page on their own.
+- Write for the user, plainly: what a thing is, not just its path.
 
 ## Traps
 

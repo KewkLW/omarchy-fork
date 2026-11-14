@@ -9,10 +9,14 @@
 # Disk fills over hours, not seconds, so this samples once a minute:
 #
 #   warn   a drive OMARCHY_DISK_WARN_PCT (85) full: a critical toast with what
-#          is left; a click opens an AI agent in a terminal with the
-#          disk-triage skill, where the user can approve what only they may.
+#          is left (a click opens an AI agent in a terminal with the
+#          disk-triage skill, where the user can approve what only they may),
+#          and, as a crash starts a diagnosis, an AI agent starts on its own
+#          to look and write a full report: read only, it frees nothing. A
+#          second toast opens the report (an HTML page) when it is done.
 #          Again only once it has filled OMARCHY_DISK_WARN_STEP (3) points more,
-#          or after OMARCHY_DISK_WARN_GAP (12h).
+#          or after OMARCHY_DISK_WARN_GAP (12h). OMARCHY_DISK_REPORT=0 leaves
+#          only the toast.
 #   agent  OMARCHY_DISK_AGENT_PCT (92) full, or under OMARCHY_DISK_AGENT_FREE_GB
 #          (25) free: run the default agent headless (omarchy-agent-disk) to
 #          free what is safe and report the rest. A full drive stays full when
@@ -36,6 +40,7 @@ readonly LOG=$STATE/watch.log
 readonly CONFIG=${OMARCHY_DISK_CONFIG:-$HOME/.config/omarchy/disk-watch.conf}
 readonly UNIT=omarchy-disk-agent
 readonly BRAKE_UNIT=omarchy-disk-brake
+readonly REPORT_UNIT=omarchy-disk-report
 # nf-md-harddisk, escaped so this file reads without a Nerd Font.
 readonly DISK_GLYPH=$'\U000f02ca'
 
@@ -50,6 +55,7 @@ rearm_gap=${OMARCHY_DISK_REARM_GAP:-86400}
 brake_pct=${OMARCHY_DISK_BRAKE_PCT:-97}
 brake_free_gb=${OMARCHY_DISK_BRAKE_FREE_GB:-8}
 brake_gap=${OMARCHY_DISK_BRAKE_GAP:-1800}
+report=${OMARCHY_DISK_REPORT:-1}
 once=${OMARCHY_DISK_ONCE:-0} # tests: one pass, then exit
 
 mkdir -p "$STATE/reports" "$STATE/mounts"
@@ -97,8 +103,18 @@ warn() {
   # hint. It consumes the rest of the line, so it comes last.
   omarchy-notification-send --urgency critical --glyph "$DISK_GLYPH" \
     "Drive $mount is ${pct}% full" \
-    "$(gb "$free")G left. Click to see what can go, with AI" \
+    "$(gb "$free")G left.$( ((report)) && echo " An AI report is on its way.") Click to go through it with AI" \
     --exec omarchy-agent-disk --interactive "$mount" >/dev/null 2>&1 &
+  ((report)) || return 0
+  # Not while the responder or another report is at it: it writes its own.
+  if unit_active "$UNIT" || unit_active "$REPORT_UNIT"; then
+    return 0
+  fi
+  systemd-run --user --unit="$REPORT_UNIT" --slice=session.slice --collect --quiet \
+    -p RuntimeMaxSec=1800 -p WorkingDirectory="$STATE" \
+    --setenv=PATH="$PATH" --setenv=OMARCHY_PATH="$OMARCHY_PATH" \
+    omarchy-agent-disk --report "$mount" "${pct}% full, $(gb "$free")G free" ||
+    log "report: could not start $REPORT_UNIT"
 }
 
 spawn_agent() {

@@ -1,32 +1,40 @@
 #!/bin/bash
 
-# omarchy:summary=Have the default agent free space on a nearly full drive
-# omarchy:args=[--interactive] [mount] [reason]
-# omarchy:examples=omarchy agent disk | omarchy agent disk --interactive /home
+# omarchy:summary=Have the default agent report on, or free space on, a filling drive
+# omarchy:args=[--report | --interactive] [mount] [reason]
+# omarchy:examples=omarchy agent disk --report | omarchy agent disk --interactive /home
 
-# Started headless by omarchy-disk-watch when a drive is nearly full, or with
-# --interactive from its warning toast (or by hand) in a terminal, where the
-# user is there to approve what only they may. The method lives in the
-# disk-triage skill; this saves a fresh scan and points the agent at both.
+# Three ways in, one method: the disk-triage skill.
+#   --report       headless and read only: look at what fills the drive and
+#                  write a full report, rendered as a standalone HTML page
+#                  (omarchy-disk-report). omarchy-disk-watch starts this when a
+#                  drive passes its warning line, as a crash starts a diagnosis.
+#                  A toast opens the page.
+#   (no flag)      headless responder near full: free the safe tier through
+#                  omarchy-disk-reclaim, then the same report.
+#   --interactive  in a terminal, from the warning toast or by hand, where the
+#                  user is there to approve what only they may.
 
 set -uo pipefail
 
-interactive=0
-if [[ ${1:-} == "--interactive" ]]; then
-  interactive=1
-  shift
-fi
+mode=respond
+case ${1:-} in
+--interactive) mode=interactive; shift ;;
+--report) mode=report; shift ;;
+esac
 mount=${1:-/}
 reason=${2:-run by hand}
 state=$HOME/.local/state/omarchy/disk-watch
 stamp=$(date '+%Y%m%d-%H%M%S')
 skill="$OMARCHY_PATH/default/agents/skills/disk-triage/SKILL.md"
+notes="$state/reports/$stamp.json"
+page="$state/reports/$stamp.html"
 readonly DISK_GLYPH=$'\U000f02ca'
 
 mkdir -p "$state/reports"
 usage=$(df -h --output=target,size,used,avail,pcent -- "$mount" 2>/dev/null | tail -1)
 
-if ((interactive)); then
+if [[ $mode == "interactive" ]]; then
   prompt=$(
     cat <<PROMPT
 A drive on this Omarchy machine is filling up and I want to know what can go.
@@ -36,6 +44,8 @@ A drive on this Omarchy machine is filling up and I want to know what can go.
   trigger: $reason
 
 Use the disk-triage skill. I'm here, so ask me before anything in its "ask" tier.
+When we are done, write the report notes to $notes and render them with
+omarchy-disk-report --notes $notes, so I get the HTML page.
 If your harness has no skill mechanism, read the skill file and follow it:
 
   $skill
@@ -48,20 +58,30 @@ fi
 # with it instead of spending its time budget waiting.
 omarchy-disk-top --mount "$mount" --save >/dev/null 2>&1
 
+if [[ $mode == "report" ]]; then
+  job="Look only: free nothing (omarchy-disk-reclaim is not yours to run here). Find out
+what fills the drive and what could go, then write the report notes."
+else
+  job="Free what is safe through omarchy-disk-reclaim, then write the report notes,
+covering what you freed and what is left."
+fi
+
 prompt=$(
   cat <<PROMPT
-You are the disk space responder on this Omarchy machine, started headless by
-omarchy-disk-watch. Nobody may be watching, so act on your own judgement within
-the skill's rules.
+You are the disk space ${mode/respond/responder} on this Omarchy machine, started
+headless by omarchy-disk-watch. Nobody may be watching, so act on your own
+judgement within the skill's rules.
+
+$job
 
   drive:    $mount
   usage:    $usage
   trigger:  $reason
   scan:     $state/scan.json (omarchy-disk-top, just now)
-  run id:   $stamp
-  report:   $state/reports/$stamp.md
+  notes:    $notes (JSON, the schema in the skill's Report section)
 
-Read the disk-triage skill and follow it:
+The page is rendered from your notes after you finish. Read the disk-triage
+skill and follow it:
 
   $skill
 PROMPT
@@ -79,7 +99,7 @@ case "$agent" in
 claude)
   claude_home=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
   skill_dir=${skill%/*}
-  settings=$(jq -cn --arg state "$state" '{permissions: {
+  settings=$(jq -cn --arg state "$state" --arg mode "$mode" '{permissions: {
     allow: [
       "Bash(omarchy-disk-*)", "Bash(omarchy disk *)", "Bash(omarchy-notification-send *)",
       "Bash(df *)", "Bash(du *)", "Bash(ls *)", "Bash(stat *)", "Bash(findmnt *)",
@@ -94,7 +114,7 @@ claude)
       "Bash(find * -delete*)", "Bash(find * -exec*)", "Bash(find * -execdir*)", "Bash(find * -ok*)",
       "Bash(xargs:*)", "Bash(systemd-run:*)", "Bash(setsid:*)", "Bash(nohup:*)", "Bash(env:*)",
       "Bash(python:*)", "Bash(python3:*)", "Bash(perl:*)", "Bash(node:*)", "Bash(bash:*)", "Bash(sh:*)"
-    ]
+    ] + (if $mode == "report" then ["Bash(omarchy-disk-reclaim:*)", "Bash(omarchy disk reclaim:*)"] else [] end)
   }}')
   command=(claude -p --permission-mode auto --restricted
     --tools Bash,Read,Write,ToolSearch,SendMessage,ListAgents --settings "$settings"
@@ -103,10 +123,16 @@ claude)
   command+=(--strict-mcp-config -- "$prompt")
   ;;
 codex)
-  # Codex's sandbox hides other processes, which the in-use checks need, so no
-  # sandbox; it relies on the skill and omarchy-disk-reclaim's refusals.
-  command=(codex exec --sandbox danger-full-access -c 'approval_policy="on-request"'
-    -c 'approvals_reviewer="auto_review"' --ignore-user-config --skip-git-repo-check -- "$prompt")
+  if [[ $mode == "report" ]]; then
+    # Read only but for the notes: its sandbox writes only in the working
+    # directory, which is the state directory.
+    command=(codex exec --sandbox workspace-write --ignore-user-config --skip-git-repo-check -- "$prompt")
+  else
+    # Codex's sandbox hides other processes, which the in-use checks need, so
+    # no sandbox; it relies on the skill and omarchy-disk-reclaim's refusals.
+    command=(codex exec --sandbox danger-full-access -c 'approval_policy="on-request"'
+      -c 'approvals_reviewer="auto_review"' --ignore-user-config --skip-git-repo-check -- "$prompt")
+  fi
   ;;
 *)
   omarchy-notification-send --urgency critical --glyph "$DISK_GLYPH" \
@@ -118,3 +144,13 @@ esac
 
 cd "$state" || exit 1
 "${command[@]}" >"$state/reports/$stamp.agent.log" 2>&1 </dev/null
+
+# The page, from the agent's notes; with no notes, from the scan alone, so a
+# failed agent still leaves something to read.
+[[ -s $notes ]] || jq -n --arg m "$mount" '{headline: "Drive \($m): scan only", summary: "The AI agent did not finish its notes; this is the scanner'"'"'s view. Its log is beside this page."}' >"$notes"
+if omarchy-disk-report --notes "$notes" --out "$page" >/dev/null; then
+  headline=$(jq -r '.headline // empty' "$notes" 2>/dev/null)
+  omarchy-notification-send --urgency normal --glyph "$DISK_GLYPH" \
+    "Disk report: $mount" "${headline:-$usage}. Click to open it" \
+    --exec omarchy-launch-browser "file://$page" >/dev/null 2>&1
+fi

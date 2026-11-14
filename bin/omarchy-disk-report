@@ -1,0 +1,173 @@
+#!/usr/bin/python3
+# omarchy:summary=Render a disk triage report as a standalone HTML page from a scan and an agent's notes
+# omarchy:args=--notes <notes.json> [--scan <scan.json>] [--out <report.html>]
+# omarchy:hidden=true
+
+# The disk-triage skill's report mode has the agent write its findings as
+# notes (JSON, schema below); this turns them and omarchy-disk-top's scan into
+# one self-contained page: no fonts, scripts or images from anywhere else, so
+# it opens from disk, offline, in any browser, and looks the same every time.
+#
+# notes.json:
+#   {"headline": "...", "summary": "2-4 sentences",
+#    "where":  [{"label": "...", "bytes": N, "note": "..."}],   biggest first
+#    "delete": [{"what": "...", "path": "...", "why": "...", "bytes": N}],
+#    "move":   [... "how" instead of "why" ...],
+#    "ask":    [...], "keep": [...],
+#    "order":  "what to do first, in a sentence or two",
+#    "trend":  "optional: how fast it is filling, if known"}
+# Every list is optional. bytes may be omitted.
+
+import html
+import json
+import os
+import sys
+import time
+
+STATE = os.path.expanduser("~/.local/state/omarchy/disk-watch")
+
+
+def arg(name, default=None):
+    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
+
+
+def gib(b):
+    if b is None:
+        return ""
+    b = float(b)
+    return f"{b / (1 << 40):.2f}T" if b >= 1 << 40 else f"{b / (1 << 30):.1f}G" if b >= 1 << 30 else f"{b / (1 << 20):.0f}M"
+
+
+def e(s):
+    return html.escape(str(s if s is not None else ""))
+
+
+CSS = """
+:root{--bg:#f4f6f5;--panel:#fff;--fg:#1b2221;--muted:#5b6664;--line:#dce2df;--accent:#1f7a6d;
+--del:#b8432f;--move:#2f62b8;--ask:#a6721a;--keep:#6b7471;--bar:#cfe3de;
+--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,"JetBrains Mono","SFMono-Regular",Menlo,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#141817;--panel:#1b201f;--fg:#e4e9e7;--muted:#97a3a0;--line:#2c3331;
+--accent:#4fbfae;--del:#ef7d66;--move:#7ea6f2;--ask:#e0ac52;--keep:#8c9693;--bar:#24413b;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 var(--sans)}
+.wrap{max-width:920px;margin:0 auto;padding:32px 16px 64px;display:flex;flex-direction:column;gap:30px}
+h1{font-size:1.7rem;margin:0;text-wrap:balance}h2{font-size:1.12rem;margin:0;display:flex;gap:10px;align-items:center}
+p{margin:0;max-width:70ch}.muted{color:var(--muted)}code{font-family:var(--mono);font-size:.86em}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px 14px;display:flex;flex-direction:column;gap:2px}
+.stat b{font-family:var(--mono);font-size:1.35rem;font-weight:500;font-variant-numeric:tabular-nums}.stat span{color:var(--muted);font-size:.85rem}
+.stat.hot b{color:var(--del)}
+section{display:flex;flex-direction:column;gap:12px}
+.bars{display:flex;flex-direction:column;gap:6px}
+.bar{display:grid;grid-template-columns:minmax(0,16rem) 1fr 4.6rem;gap:10px;align-items:center;font-size:.9rem}
+.bar .lab{min-width:0;overflow-wrap:anywhere}.bar .lab small{display:block;color:var(--muted)}
+.bar .track{height:14px}.bar .fill{display:block;height:100%;background:var(--bar);border-left:3px solid var(--accent);border-radius:2px}
+.bar .v{font-family:var(--mono);text-align:right;font-variant-numeric:tabular-nums}
+.pill{font-size:.72rem;letter-spacing:.06em;text-transform:uppercase;font-weight:600;padding:2px 8px;border-radius:3px;border:1px solid currentColor}
+.del{color:var(--del)}.move{color:var(--move)}.ask{color:var(--ask)}.keep{color:var(--keep)}.root{color:var(--muted)}
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:6px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:.9rem}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}tr:last-child td{border-bottom:0}
+th{font-size:.74rem;letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+td.sz{font-family:var(--mono);white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums}
+td .p{display:block;font-family:var(--mono);font-size:.8rem;color:var(--muted);overflow-wrap:anywhere}
+tfoot td{font-weight:600}
+.callout{border-left:3px solid var(--accent);padding:10px 14px;background:var(--panel);border-radius:0 6px 6px 0}
+footer{color:var(--muted);font-size:.82rem}
+@media (max-width:560px){.bar{grid-template-columns:minmax(0,1fr) 4rem}.bar .track{grid-column:1/-1;order:3}}
+"""
+
+TIERS = [
+    ("delete", "del", "Delete", "Safe: rebuilt or re-downloaded on demand, nothing lost.", "why"),
+    ("move", "move", "Move", "Worth keeping, but not on this drive.", "how"),
+    ("ask", "ask", "Your call", "Data you might want. Nothing here is removed without you.", "why"),
+    ("keep", "keep", "Keep", "Big, but leave it.", "why"),
+]
+
+
+def table(rows, col):
+    total = sum(r.get("bytes") or 0 for r in rows)
+    out = ['<div class="tbl"><table><thead><tr><th>What</th><th>%s</th><th style="text-align:right">Size</th></tr></thead><tbody>'
+           % ("How" if col == "how" else "Why")]
+    for r in rows:
+        out.append(f'<tr><td>{e(r.get("what"))}<span class="p">{e(r.get("path"))}</span></td>'
+                   f'<td>{e(r.get(col) or r.get("why") or r.get("how"))}</td><td class="sz">{gib(r.get("bytes"))}</td></tr>')
+    out.append("</tbody>")
+    if total and len(rows) > 1:
+        out.append(f'<tfoot><tr><td colspan="2">Total (apparent)</td><td class="sz">{gib(total)}</td></tr></tfoot>')
+    out.append("</table></div>")
+    return "".join(out)
+
+
+def render(notes, scan):
+    usage = (scan or {}).get("usage") or []
+    cands = (scan or {}).get("candidates") or []
+    u = usage[0] if usage else None
+    when = time.strftime("%Y-%m-%d %-I:%M %p", time.localtime((scan or {}).get("at") or time.time()))
+    host = os.uname().nodename
+    parts = [f"<!doctype html><html lang=en><head><meta charset=utf-8>"
+             f'<meta name=viewport content="width=device-width,initial-scale=1">'
+             f"<title>Disk report {e(u['mount'] if u else '')} {e(when)}</title><style>{CSS}</style></head><body><div class=wrap>"]
+    parts.append(f'<header style="display:flex;flex-direction:column;gap:8px"><h1>{e(notes.get("headline") or "Disk report")}</h1>'
+                 f'<p class=muted>{e(host)}, {e(when)}. Sizes are apparent (du); compressed or hard-linked data frees less, df is the truth.</p>'
+                 f'<p>{e(notes.get("summary"))}</p></header>')
+    if u:
+        safe = sum(c["frees"] for c in cands if c["tier"] == "safe")
+        hot = " hot" if u["pct"] >= 85 else ""
+        parts.append('<div class=stats>'
+                     f'<div class="stat{hot}"><b>{u["pct"]:.0f}%</b><span>{e(u["mount"])} full: {gib(u["size"] - u["free"])} of {gib(u["size"])}</span></div>'
+                     f'<div class="stat{hot}"><b>{gib(u["free"])}</b><span>free</span></div>'
+                     f'<div class=stat><b>{gib(safe)}</b><span>safe to free now (scanner estimate)</span></div>'
+                     + (f'<div class=stat><b>{e(notes["trend"])}</b><span>trend</span></div>' if notes.get("trend") else "")
+                     + '</div>')
+    where = notes.get("where") or []
+    if where:
+        top = max((w.get("bytes") or 0) for w in where) or 1
+        rows = "".join(
+            f'<div class=bar><span class=lab>{e(w.get("label"))}<small>{e(w.get("note"))}</small></span>'
+            f'<span class=track><span class=fill style="width:{100 * (w.get("bytes") or 0) / top:.1f}%"></span></span>'
+            f'<span class=v>{gib(w.get("bytes"))}</span></div>' for w in where)
+        parts.append(f'<section><h2>Where it goes</h2><div class=bars>{rows}</div></section>')
+    for key, cls, title, blurb, col in TIERS:
+        rows = notes.get(key) or []
+        if rows:
+            parts.append(f'<section><h2><span class="pill {cls}">{title}</span>{e(blurb)}</h2>{table(rows, col)}</section>')
+    root = [c for c in cands if c["tier"] == "root"]
+    if root:
+        rows = [{"what": c["kind"], "path": c["path"], "how": c["reason"], "bytes": c["bytes"]} for c in root]
+        parts.append(f'<section><h2><span class="pill root">Root</span>Needs sudo: run the command</h2>{table(rows, "how")}</section>')
+    if notes.get("order"):
+        parts.append(f'<div class=callout><p><b>Suggested order:</b> {e(notes["order"])}</p></div>')
+    parts.append('<footer>Free the safe items: <code>omarchy disk reclaim --safe --mount '
+                 f'{e(u["mount"] if u else "/")}</code>. Talk it through with an agent: <code>omarchy agent disk --interactive</code>. '
+                 'Made by the disk watchdog (omarchy-disk-watch) with the disk-triage skill.</footer>')
+    parts.append("</div></body></html>")
+    return "\n".join(parts)
+
+
+def main():
+    notes_path = arg("--notes")
+    if not notes_path:
+        print("usage: omarchy-disk-report --notes <notes.json> [--scan <scan.json>] [--out <report.html>]", file=sys.stderr)
+        return 2
+    try:
+        notes = json.load(open(notes_path))
+    except (OSError, ValueError) as error:
+        print(f"Cannot read the notes {notes_path}: {error}", file=sys.stderr)
+        return 1
+    scan_path = arg("--scan", os.path.join(STATE, "scan.json"))
+    try:
+        scan = json.load(open(scan_path))
+    except (OSError, ValueError):
+        scan = None
+    out = arg("--out", os.path.splitext(notes_path)[0] + ".html")
+    tmp = f"{out}.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(render(notes, scan))
+    os.replace(tmp, out)
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

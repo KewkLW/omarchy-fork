@@ -140,18 +140,20 @@ step 87 130
 (($(count "% full" "$NOTIFY_LOG") == 1)) || fail "one more point does not warn again" "$(cat "$NOTIFY_LOG")"
 step 89 110
 (($(count "is 89% full" "$NOTIFY_LOG") == 1)) || fail "three points more warns again" "$(cat "$NOTIFY_LOG")"
-pass "the watcher warns at 85% and again every 3 points"
+(($(count "omarchy-disk-report" "$SYSTEMD_RUN_LOG") == 2)) || fail "each warning starts a read-only AI report" "$(cat "$SYSTEMD_RUN_LOG")"
+[[ $(grep -m1 omarchy-disk-report "$SYSTEMD_RUN_LOG") == *"omarchy-agent-disk --report $TMPDIR"* ]] || fail "the report runs the agent in report mode" "$(cat "$SYSTEMD_RUN_LOG")"
+pass "the watcher warns at 85% and again every 3 points, each time with an AI report"
 
 step 93 70
-(($(count "omarchy-agent-disk $TMPDIR" "$SYSTEMD_RUN_LOG") == 1)) || fail "93% full starts the responder" "$(cat "$SYSTEMD_RUN_LOG")"
+(($(count "unit=omarchy-disk-agent" "$SYSTEMD_RUN_LOG") == 1)) || fail "93% full starts the responder" "$(cat "$SYSTEMD_RUN_LOG")"
 step 93 70
-(($(count "omarchy-agent-disk" "$SYSTEMD_RUN_LOG") == 1)) || fail "a running responder is not started twice" "$(cat "$SYSTEMD_RUN_LOG")"
+(($(count "unit=omarchy-disk-agent" "$SYSTEMD_RUN_LOG") == 1)) || fail "a running responder is not started twice" "$(cat "$SYSTEMD_RUN_LOG")"
 rm -f "$ACTIVE"
 step 93 70
 step 94 60
-(($(count "omarchy-agent-disk" "$SYSTEMD_RUN_LOG") == 1)) || fail "a drive the responder left full does not restart it" "$(cat "$SYSTEMD_RUN_LOG")"
+(($(count "unit=omarchy-disk-agent" "$SYSTEMD_RUN_LOG") == 1)) || fail "a drive the responder left full does not restart it" "$(cat "$SYSTEMD_RUN_LOG")"
 step 95 50
-(($(count "omarchy-agent-disk" "$SYSTEMD_RUN_LOG") == 2)) || fail "two points past where it left off starts it again" "$(cat "$SYSTEMD_RUN_LOG")"
+(($(count "unit=omarchy-disk-agent" "$SYSTEMD_RUN_LOG") == 2)) || fail "two points past where it left off starts it again" "$(cat "$SYSTEMD_RUN_LOG")"
 pass "the watcher hands a nearly full drive to the responder, and re-arms only as it fills"
 
 step 98 20
@@ -160,3 +162,19 @@ step 98 20
 step 98 20
 (($(count "omarchy-disk-brake" "$SYSTEMD_RUN_LOG") == 1)) || fail "the brake waits its gap" "$(cat "$SYSTEMD_RUN_LOG")"
 pass "the watcher frees the safe tier itself at 97%"
+
+# The report page: a standalone file from the notes and the scan, escaped.
+notes="$TMPDIR/notes.json"
+cat >"$notes" <<'JSON'
+{"headline": "Drive is 87% full: worktrees hold 140G", "summary": "Mostly Rust <script>alert(1)</script> builds.",
+ "where": [{"label": "~/Work/app-wt", "bytes": 150000000000, "note": "target dirs"}, {"label": "Steam", "bytes": 90000000000}],
+ "delete": [{"what": "Merged worktrees", "path": "~/Work/app-wt/*", "why": "merged, clean", "bytes": 140000000000}],
+ "ask": [{"what": "Old game", "path": "~/Games/old", "why": "idle 60 days", "bytes": 30000000000}],
+ "order": "Delete tier first."}
+JSON
+page=$(omarchy-disk-report --notes "$notes" --scan /dev/null --out "$TMPDIR/report.html") || fail "the report renders" "$page"
+grep -q "Drive is 87% full: worktrees hold 140G" "$TMPDIR/report.html" || fail "the report has the headline" "$(head -c 600 "$TMPDIR/report.html")"
+grep -q "Merged worktrees" "$TMPDIR/report.html" && grep -q "Old game" "$TMPDIR/report.html" || fail "the report has its tiers" ""
+! grep -q "<script>alert" "$TMPDIR/report.html" || fail "notes are escaped, never markup" ""
+! grep -qE "https?://" "$TMPDIR/report.html" || fail "the report loads nothing from anywhere" "$(grep -oE 'https?://[^\"]*' "$TMPDIR/report.html")"
+pass "omarchy disk report renders a standalone, escaped HTML page from the notes"
