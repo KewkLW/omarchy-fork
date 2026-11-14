@@ -235,6 +235,23 @@ def main_branch(repo):
     return None
 
 
+# Ignored files a worktree may hold and still go: build output and generated
+# files, by any path component. Anything else ignored (.env, a local database,
+# fuzz findings, extracted assets) makes it the user's call.
+BUILD_OUTPUT = {
+    "target", "node_modules", "dist", "build", "out", "_build", ".next", ".nuxt", ".turbo", ".svelte-kit",
+    ".parcel-cache", ".vite", ".vite-hooks", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".tox", ".venv", "venv", ".gradle", ".dart_tool", ".build", "DerivedData", "Intermediate", "Binaries",
+    "DerivedDataCache", "coverage", ".nyc_output", ".cache", ".generated", "zig-cache", ".zig-cache",
+    "zig-out", "cmake-build-debug", "cmake-build-release", "obj", "bin-debug", "bin-release", ".tanstack",
+}
+
+
+def build_output(rel):
+    parts = rel.rstrip("/").split("/")
+    return any(p in BUILD_OUTPUT or p.startswith("dist-") or p.endswith(".egg-info") for p in parts) or rel.endswith((".pyc", ".tsbuildinfo"))
+
+
 def worktree_check(path, cfg, busy):
     """(tier, reason, extra) for a linked worktree: safe to remove, or why not."""
     if not os.path.isfile(os.path.join(path, ".git")):
@@ -250,10 +267,12 @@ def worktree_check(path, cfg, busy):
         return "keep", "its repo has no main branch", extra
     if os.path.realpath(path) == os.path.realpath(repo):
         return "keep", "it is the main working tree", extra
-    rc, status = git(path, "status", "--porcelain", "--untracked-files=all")
+    rc, status = git(path, "status", "--porcelain", "--untracked-files=all", "--ignored=matching")
     if rc != 0:
         return "keep", "git status failed", extra
-    dirty = len(status.splitlines()) if status else 0
+    lines = status.splitlines() if status else []
+    dirty = sum(1 for l in lines if not l.startswith("!! "))
+    kept_ignored = [l[3:] for l in lines if l.startswith("!! ") and not build_output(l[3:])]
     rc, cherry = git(path, "cherry", main, "HEAD")
     unmerged = sum(1 for l in cherry.splitlines() if l.startswith("+"))
     # Idle since the later of its last commit and its index (a checkout or add).
@@ -275,6 +294,15 @@ def worktree_check(path, cfg, busy):
         return "keep", what, extra
     if idle_days < float(cfg["min_age_days"]):
         return "keep", f"merged and clean, but touched {idle_days:.1f} days ago", extra
+    # A branch nobody has committed on yet sits on main too, so it looks merged:
+    # an open task whose worker has not started. Its reflog shows only its creation.
+    rc, reflog = git(path, "reflog", "show", "--format=%H", f"refs/heads/{branch}", "--")
+    if rc == 0 and len(reflog.splitlines()) <= 1:
+        return "keep", "no commits of its own yet (not started, not merged)", extra
+    if kept_ignored:
+        shown = ", ".join(kept_ignored[:4]) + (" ..." if len(kept_ignored) > 4 else "")
+        extra["ignored"] = kept_ignored[:20]
+        return "ask", f"merged and clean, but holds ignored files that are not build output: {shown}", extra
     return "safe", f"merged into {main}, nothing uncommitted, idle {idle_days:.0f} days", extra
 
 
@@ -317,7 +345,16 @@ def uv_unreferenced():
                 keep.add(m.group(1))
         except OSError:
             pass
-    return cache, [os.path.join(archive, e) for e in os.listdir(archive) if e not in keep]
+    # Newer than a day: maybe an install in progress, whose environment links it soon.
+    out = []
+    for e in os.listdir(archive):
+        p = os.path.join(archive, e)
+        try:
+            if e not in keep and time.time() - os.lstat(p).st_mtime > DAY:
+                out.append(p)
+        except OSError:
+            pass
+    return cache, out
 
 
 def docker_df():
@@ -356,7 +393,7 @@ def scan(cfg, mounts):
     for root in cfg["worktree_root"]:
         for wt in find_worktrees(root):
             real = os.path.realpath(wt)
-            if real in seen or not on_disk(wt):
+            if real in seen or not on_disk(wt) or protected(wt, cfg):
                 continue
             seen.add(real)
             tier, reason, extra = worktree_check(wt, cfg, busy)

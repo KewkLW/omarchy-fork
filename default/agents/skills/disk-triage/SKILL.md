@@ -32,8 +32,8 @@ then tell them plainly what is left and what is theirs to decide.
   free space before and after (df).
 - `~/.config/omarchy/disk-watch.conf`: watched drives, worktree roots, cache
   globs with their ages, large dirs to ask about, protected paths.
-- Read-only looks: `df -h`, `du -xsh <dir>/* | sort -rh`, `findmnt`, `git -C <wt>
-  status`/`log`, `docker system df`, `journalctl --disk-usage`.
+- Read-only looks: `df -h`, `du -xsh <dir>/* | sort -rh`, `findmnt`, `ls`, `stat`,
+  `journalctl --disk-usage`. The scan already holds each worktree's git state.
 - `omarchy-notification-send "<headline>" "<body>"` for the closing toast.
 
 Never use `rm`, `mv`, `git worktree remove`, `git clean`, `docker ... prune`,
@@ -44,7 +44,8 @@ something, that is the answer: report it, don't work around it.
 
 - **safe**: rebuilt or re-downloaded on demand, nothing lost.
   - Linked git worktrees that are merged into their repo's main branch, with
-    nothing uncommitted or untracked, no process inside, idle a day. Their build
+    nothing uncommitted or untracked, no ignored files but build output, at
+    least one commit of their own, no process inside, idle a day. Their build
     output (Rust `target/`, `node_modules`, Unreal `Intermediate/`) is where most
     of a developer's disk goes: one board of 39 finished Rust worktrees held 189 GB.
   - Configured cache globs untouched for their days (per-task scratch dirs,
@@ -62,9 +63,10 @@ something, that is the answer: report it, don't work around it.
 
 1. **Measure.** `df -h` on the drive, and read the scan. Note free bytes now; the
    report gives the df difference at the end, not du's sum.
-2. **Free the safe tier**, biggest first, through `omarchy-disk-reclaim`. Stop
-   once the drive is under the watchdog's agent line (92%) with some room; there
-   is no prize for emptying every cache.
+2. **Free the safe tier** through `omarchy-disk-reclaim`, the biggest items in one
+   call (`omarchy-disk-reclaim <id> <id> ...`): each call rescans the drive, which
+   takes a minute or two. Stop once the drive is under the watchdog's agent line
+   (92%) with some room; there is no prize for emptying every cache.
 3. **Look past the scan** if that was not enough. `du -xsh ~/* ~/.[!.]* | sort -rh`
    and down into the largest. Anything you find goes in the report as an ask
    item with its size and what it seems to be; you cannot delete it.

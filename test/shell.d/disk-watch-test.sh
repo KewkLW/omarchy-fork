@@ -35,18 +35,35 @@ g -C "$repo" add a
 GIT_COMMITTER_DATE="$old" g -C "$repo" commit -qm init --date "$old"
 # Build output, ignored like target/ in a Rust repo (info/exclude is shared by its worktrees).
 echo "target/" >>"$repo/.git/info/exclude"
-for name in merged dirty unmerged fresh; do
-  g -C "$repo" worktree add -q "$HOME/Work/app-wt/$name" -b "$name" main
+echo ".env" >>"$repo/.git/info/exclude"
+for name in merged dirty unmerged fresh unstarted secrets busy keepme; do
+  wt="$HOME/Work/app-wt/$name"
+  [[ $name == "keepme" ]] && wt="$HOME/Work/keepme-wt/integration"
+  g -C "$repo" worktree add -q "$wt" -b "$name" main
+  [[ $name == "keepme" ]] && { touch -d "$old" "$repo/.git/worktrees/integration/index"; continue; }
   mkdir -p "$HOME/Work/app-wt/$name/target"
   head -c 200000 /dev/urandom >"$HOME/Work/app-wt/$name/target/big.o"
+  # Work on the branch, merged into main, except for the one never started.
+  if [[ $name != "unstarted" ]]; then
+    echo "$name" >"$HOME/Work/app-wt/$name/$name.txt"
+    g -C "$HOME/Work/app-wt/$name" add "$name.txt"
+    GIT_COMMITTER_DATE="$old" g -C "$HOME/Work/app-wt/$name" commit -qm "$name" --date "$old"
+    GIT_COMMITTER_DATE="$old" g -C "$repo" merge -q --no-ff "$name" -m "merge $name"
+  fi
 done
 echo "wip" >"$HOME/Work/app-wt/dirty/notes.txt"
 echo two >>"$HOME/Work/app-wt/unmerged/a"
 GIT_COMMITTER_DATE="$old" g -C "$HOME/Work/app-wt/unmerged" commit -qam "not on main" --date "$old"
+echo "TOKEN=hunter2" >"$HOME/Work/app-wt/secrets/.env"
 # Old checkouts, except fresh.
-for name in merged dirty unmerged; do
+for name in merged dirty unmerged unstarted secrets busy; do
   touch -d "$old" "$repo/.git/worktrees/$name/index"
 done
+# Someone working in one: a real process with its cwd inside.
+(cd "$HOME/Work/app-wt/busy/target" && exec sleep 60) &
+busy_pid=$!
+trap 'kill "$busy_pid" 2>/dev/null; rm -rf "$TMPDIR"' EXIT
+sleep 0.2
 
 mkdir -p "$HOME/.cache/b12-scratch" "$HOME/.cache/b13-live"
 head -c 100000 /dev/urandom >"$HOME/.cache/b12-scratch/blob"
@@ -60,16 +77,22 @@ tier() { jq -r --arg p "$1" '.candidates[] | select(.path == $p) | .tier' <<<"$s
 [[ $(tier "$HOME/Work/app-wt/dirty") != "safe" ]] || fail "a worktree with an untracked file is not safe" "$scan"
 [[ $(tier "$HOME/Work/app-wt/unmerged") != "safe" ]] || fail "a worktree with a commit not on main is not safe" "$scan"
 [[ $(tier "$HOME/Work/app-wt/fresh") != "safe" ]] || fail "a worktree checked out just now is not safe" "$scan"
+[[ $(tier "$HOME/Work/app-wt/unstarted") != "safe" ]] || fail "a branch with no commits of its own is not safe" "$scan"
+[[ $(tier "$HOME/Work/app-wt/secrets") == "ask" ]] || fail "a worktree holding an ignored file that is not build output is the user's call" "$scan"
+[[ $(tier "$HOME/Work/app-wt/busy") == "keep" ]] || fail "a worktree a process is working in is kept" "$scan"
 [[ $(tier "$HOME/.cache/b12-scratch") == "safe" ]] || fail "an idle cache glob is safe" "$scan"
 [[ $(tier "$HOME/.cache/b13-live") == "keep" ]] || fail "a cache touched today is kept" "$scan"
 [[ -z $(tier "$repo") ]] || fail "the main repo is never a candidate" "$scan"
+[[ -z $(tier "$HOME/Work/keepme-wt/integration") ]] || fail "a protected worktree is never a candidate" "$scan"
 pass "omarchy disk top sorts worktrees and caches into safe and not"
 
 out=$(omarchy-disk-reclaim "$HOME/Work/app-wt/dirty" "$HOME/Work/app-wt/unmerged" 2>&1) && fail "reclaim refuses unsafe items with a failing status" "$out"
 [[ -d $HOME/Work/app-wt/dirty && -f $HOME/Work/app-wt/dirty/notes.txt && -d $HOME/Work/app-wt/unmerged ]] ||
   fail "refused worktrees stay" "$out"
 [[ $out == *"refused"* ]] || fail "reclaim says what it refused" "$out"
-pass "omarchy disk reclaim refuses dirty and unmerged worktrees"
+out=$(omarchy-disk-reclaim "$HOME/Work/app-wt/secrets" "$HOME/Work/app-wt/busy" 2>&1) && fail "reclaim refuses ask and busy worktrees" "$out"
+[[ -f $HOME/Work/app-wt/secrets/.env && -d $HOME/Work/app-wt/busy ]] || fail "the .env and the busy worktree stay" "$out"
+pass "omarchy disk reclaim refuses dirty, unmerged, busy and secret-holding worktrees"
 
 out=$(omarchy-disk-reclaim "worktree:$HOME/Work/app-wt/merged" "$HOME/.cache/b12-scratch" 2>&1) || fail "reclaim frees safe items" "$out"
 [[ ! -e $HOME/Work/app-wt/merged && ! -e $HOME/.cache/b12-scratch ]] || fail "safe items are gone" "$out"

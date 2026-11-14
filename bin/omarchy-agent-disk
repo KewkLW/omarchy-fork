@@ -72,7 +72,9 @@ agent=$(omarchy-default-agent)
 # Only agents with an unattended one-shot mode, without the user's settings or
 # MCP servers. Space is freed through omarchy-disk-reclaim, which checks every
 # item again and refuses what is the user's to decide when run from this unit;
-# the limits below keep the agent from going around it where the harness can.
+# the limits below keep the agent from going around it where the harness can:
+# no other delete, and nothing that starts a command outside this unit's
+# cgroup, which is how the helper knows the responder (systemd-run, setsid).
 case "$agent" in
 claude)
   claude_home=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
@@ -80,16 +82,18 @@ claude)
   settings=$(jq -cn --arg state "$state" '{permissions: {
     allow: [
       "Bash(omarchy-disk-*)", "Bash(omarchy disk *)", "Bash(omarchy-notification-send *)",
-      "Bash(df *)", "Bash(du *)", "Bash(ls *)", "Bash(find *)", "Bash(stat *)", "Bash(findmnt *)",
-      "Bash(git -C * status*)", "Bash(git -C * log*)", "Bash(git -C * worktree list*)",
-      "Bash(docker system df*)", "Bash(journalctl --disk-usage*)", "Bash(omarchy-agent-list*)",
-      "Edit(/\($state)/**)", "Write(/\($state)/**)", "Read", "ToolSearch", "SendMessage", "ListAgents"
+      "Bash(df *)", "Bash(du *)", "Bash(ls *)", "Bash(stat *)", "Bash(findmnt *)",
+      "Bash(journalctl --disk-usage*)", "Bash(omarchy-agent-list*)",
+      "Edit(/\($state)/**)", "Read", "ToolSearch", "SendMessage", "ListAgents"
     ],
     deny: [
       "Bash(rm:*)", "Bash(rmdir:*)", "Bash(mv:*)", "Bash(shred:*)", "Bash(truncate:*)", "Bash(sudo:*)",
       "Bash(pkexec:*)", "Bash(systemctl:*)", "Bash(kill:*)", "Bash(pkill:*)", "Bash(git -C * worktree remove*)",
       "Bash(git -C * clean*)", "Bash(git -C * reset*)", "Bash(docker:*)", "Bash(uv:*)", "Bash(cargo:*)",
-      "Bash(omarchy agent:*)", "Bash(omarchy-agent:*)", "Bash(omarchy-agent-disk:*)"
+      "Bash(omarchy agent:*)", "Bash(omarchy-agent:*)", "Bash(omarchy-agent-disk:*)",
+      "Bash(find * -delete*)", "Bash(find * -exec*)", "Bash(find * -execdir*)", "Bash(find * -ok*)",
+      "Bash(xargs:*)", "Bash(systemd-run:*)", "Bash(setsid:*)", "Bash(nohup:*)", "Bash(env:*)",
+      "Bash(python:*)", "Bash(python3:*)", "Bash(perl:*)", "Bash(node:*)", "Bash(bash:*)", "Bash(sh:*)"
     ]
   }}')
   command=(claude -p --permission-mode auto --restricted
