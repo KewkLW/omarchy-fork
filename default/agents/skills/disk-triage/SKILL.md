@@ -120,6 +120,14 @@ every list optional, sizes in bytes (apparent, from the scan or du):
 - **keep**: the big things that must stay and why, so nobody wonders.
 - Root items from the scan are added to the page on their own.
 - Write for the user, plainly: what a thing is, not just its path.
+- **Short.** summary: at most three short sentences, no caveats (the page already
+  says sizes are apparent). order: one or two sentences. why/how: one line.
+  No raw byte counts in prose; say "about 140G".
+- **Grouped.** At most about 12 rows per list: one row per project or kind
+  ("31 merged aion2-lens worktrees", "9 idle omarchy PR worktrees"), never a row
+  per worktree. The renderer folds anything past 15 rows away.
+- Say what changed if you can tell (a dir that grew a lot since the last report
+  in `~/.local/state/omarchy/disk-watch/reports/`): that is often the real cause.
 
 ## Traps
 

@@ -72,6 +72,7 @@ th{font-size:.74rem;letter-spacing:.05em;text-transform:uppercase;color:var(--mu
 td.sz{font-family:var(--mono);white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums}
 td .p{display:block;font-family:var(--mono);font-size:.8rem;color:var(--muted);overflow-wrap:anywhere}
 tfoot td{font-weight:600}
+details summary{cursor:pointer;color:var(--muted)}details table{margin-top:8px}
 .callout{border-left:3px solid var(--accent);padding:10px 14px;background:var(--panel);border-radius:0 6px 6px 0}
 footer{color:var(--muted);font-size:.82rem}
 @media (max-width:560px){.bar{grid-template-columns:minmax(0,1fr) 4rem}.bar .track{grid-column:1/-1;order:3}}
@@ -89,10 +90,17 @@ def table(rows, col):
     total = sum(r.get("bytes") or 0 for r in rows)
     out = ['<div class="tbl"><table><thead><tr><th>What</th><th>%s</th><th style="text-align:right">Size</th></tr></thead><tbody>'
            % ("How" if col == "how" else "Why")]
-    for r in rows:
-        out.append(f'<tr><td>{e(r.get("what"))}<span class="p">{e(r.get("path"))}</span></td>'
-                   f'<td>{e(r.get(col) or r.get("why") or r.get("how"))}</td><td class="sz">{gib(r.get("bytes"))}</td></tr>')
+    def row(r):
+        return (f'<tr><td>{e(r.get("what"))}<span class="p">{e(r.get("path"))}</span></td>'
+                f'<td>{e(r.get(col) or r.get("why") or r.get("how"))}</td><td class="sz">{gib(r.get("bytes"))}</td></tr>')
+    for r in rows[:15]:
+        out.append(row(r))
     out.append("</tbody>")
+    if len(rows) > 15:
+        rest = rows[15:]
+        out.append(f'<tbody><tr><td colspan="3"><details><summary>{len(rest)} more, about '
+                   f'{gib(sum(r.get("bytes") or 0 for r in rest))}</summary><table>'
+                   + "".join(row(r) for r in rest) + '</table></details></td></tr></tbody>')
     if total and len(rows) > 1:
         out.append(f'<tfoot><tr><td colspan="2">Total (apparent)</td><td class="sz">{gib(total)}</td></tr></tfoot>')
     out.append("</table></div>")
