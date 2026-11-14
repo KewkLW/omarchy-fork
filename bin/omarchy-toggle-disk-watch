@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# omarchy:summary=Toggle the disk watchdog that warns as a drive fills and frees safe space before it runs out
+# omarchy:args=[toggle|on|off]
+# omarchy:examples=omarchy toggle disk-watch | omarchy toggle disk-watch off
+
+# Off by default: near full it removes build output and caches on its own and
+# runs the default agent unattended, approving its own actions, so that is the
+# user's call to make.
+
+# nf-md-harddisk, escaped so this file reads without a Nerd Font.
+readonly DISK_GLYPH=$'\U000f02ca'
+
+unit_name=omarchy-disk-watch.service
+unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit_name"
+unit_source="$OMARCHY_PATH/default/systemd/user/$unit_name"
+config="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/disk-watch.conf"
+
+omarchy-toggle disk-watch-on "${1:-toggle}" || exit 1
+
+# Not shipped in /usr/lib/systemd/user, so the unit is only on machines that
+# asked for it. The unit also checks the flag with ConditionPathExists, so a
+# stale enable without the flag stays inert.
+if omarchy-toggle-enabled disk-watch-on; then
+  [[ -e $config ]] || install -Dm644 "$OMARCHY_PATH/default/omarchy/disk-watch.conf" "$config"
+  install -Dm644 "$unit_source" "$unit"
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$unit_name"
+  omarchy-notification-send -g "$DISK_GLYPH" "Disk watchdog enabled" "Settings: ~/.config/omarchy/disk-watch.conf"
+else
+  systemctl --user disable --now "$unit_name"
+  # A responder or brake already running would carry on with nothing to watch it.
+  systemctl --user stop omarchy-disk-agent.service omarchy-disk-brake.service 2>/dev/null
+  rm -rf "$HOME/.local/state/omarchy/disk-watch/mounts"
+  rm -f "$unit"
+  systemctl --user daemon-reload
+  omarchy-notification-send -g "$DISK_GLYPH" "Disk watchdog disabled"
+fi

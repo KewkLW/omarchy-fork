@@ -1,0 +1,495 @@
+#!/usr/bin/python3
+# omarchy:summary=List what fills a drive and what can go: safe build output and caches, things to ask about, root-owned space
+# omarchy:args=[--json] [--mount <path>] [--save]
+# omarchy:examples=omarchy disk top | omarchy disk top --mount / --json
+
+# Read only. Every candidate gets a tier:
+#
+#   safe   gone without losing anything: rebuilt or re-downloaded on demand.
+#          omarchy-disk-reclaim removes these, checking each again first.
+#     worktree  a linked git worktree with nothing to lose: git status shows
+#               nothing (untracked files included), its HEAD is on its repo's
+#               main branch, no process is inside it, untouched for
+#               min_age_days. Its build output (target/, node_modules) goes
+#               with it; the branch stays.
+#     cache     a configured cache glob untouched for its days, with no
+#               process inside: per-task scratch, worker browser profiles.
+#     tool      package and app caches: Trash, thumbnails, pip, Go, npm.
+#     uv        uv's unpacked archives that no cached environment links to.
+#               `uv cache clean` is never used: every MCP server run by uvx
+#               holds uv's lock, so it waits five minutes and fails.
+#     docker    Docker build cache and dangling images.
+#   ask    the user's to decide: idle large dirs (games, prefixes), images no
+#          container uses, worktrees with unmerged or uncommitted work but
+#          idle a long time. Reported with their size, never removed by the
+#          responder.
+#   root   root-owned space (journal, core dumps, the package cache). Reported
+#          with the command that frees it.
+#
+# "frees" counts only files whose last link this is (st_nlink == 1), since
+# deleting a hard-linked copy frees nothing. It cannot see reflinks shared
+# with other files, so the real gain can still be lower: measure with df.
+#
+# Settings: ~/.config/omarchy/disk-watch.conf, one "key = value" per line
+# (see default/omarchy/disk-watch.conf). Candidates are only those on the
+# filesystem of --mount (default: every watched mount).
+
+import fnmatch
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("OMARCHY_DISK_CONFIG", os.path.join(HOME, ".config/omarchy/disk-watch.conf"))
+STATE = os.path.join(HOME, ".local/state/omarchy/disk-watch")
+PROC = os.environ.get("OMARCHY_DISK_PROC", "/proc")
+DAY = 86400
+# Smaller candidates are left out: not worth a line in a report.
+MIN_BYTES = int(os.environ.get("OMARCHY_DISK_MIN_BYTES", 10 << 20))
+# Large dirs are worth asking about from this size.
+LARGE_BYTES = int(os.environ.get("OMARCHY_DISK_LARGE_BYTES", 5 << 30))
+
+# Never removed, whatever a glob or a scan says. Anything holding a main git
+# repository (a .git directory) is refused too, see protected().
+BUILTIN_PROTECT = [
+    "~", "~/.ssh", "~/.gnupg", "~/.password-store", "~/.local/share/keyrings",
+    "~/.config", "~/.local/share", "~/.local/state", "~/Documents", "~/Pictures",
+    "~/Videos", "~/Music", "~/Desktop", "~/Downloads",
+]
+
+# Package and app caches, and how to empty each: "dir" removes the directory's
+# entries, keeping the directory.
+TOOL_CACHES = [
+    ("Trash", "~/.local/share/Trash/files", "dir"),
+    ("Trash info", "~/.local/share/Trash/info", "dir"),
+    ("thumbnails", "~/.cache/thumbnails", "dir"),
+    ("pip", "~/.cache/pip", "dir"),
+    ("Go build cache", "~/.cache/go-build", "dir"),
+    ("npm cache", "~/.npm/_cacache", "dir"),
+    ("Chromium cache", "~/.cache/chromium", "dir"),
+    ("headless Chromium cache", "~/.cache/chromium-headless", "dir"),
+    ("node-gyp", "~/.cache/node-gyp", "dir"),
+]
+
+
+def expand(p):
+    return os.path.normpath(os.path.expanduser(p))
+
+
+def config():
+    cfg = {"watch": [], "worktree_root": [], "cache": [], "large": [], "protect": [],
+           "min_age_days": "1", "ask_idle_days": "14"}
+    try:
+        lines = open(CONFIG).read().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if "=" not in line:
+            continue
+        key, value = (s.strip() for s in line.split("=", 1))
+        if isinstance(cfg.get(key), list):
+            cfg[key].append(value)
+        elif key in cfg:
+            cfg[key] = value
+    cfg["watch"] = cfg["watch"] or ["/"]
+    cfg["worktree_root"] = cfg["worktree_root"] or ["~/Work", "~/build", "~/src", "~/code"]
+    return cfg
+
+
+def glob_days(entry, default):
+    """'<glob> [days]' -> (glob, days)."""
+    parts = entry.rsplit(None, 1)
+    if len(parts) == 2 and re.fullmatch(r"\d+(\.\d+)?", parts[1]):
+        return expand(parts[0]), float(parts[1])
+    return expand(entry), default
+
+
+_MOUNTS = None
+
+
+def dev(path):
+    """The filesystem a path lives on, as its mount's source device. Not st_dev:
+    btrfs gives every subvolume (/, /home) its own, though they share the space."""
+    global _MOUNTS
+    if _MOUNTS is None:
+        _MOUNTS = []
+        try:
+            for line in open(os.environ.get("OMARCHY_DISK_MOUNTINFO", "/proc/self/mountinfo")):
+                left, right = line.split(" - ", 1)
+                point = left.split()[4].replace("\\040", " ")
+                fstype, source = right.split()[:2]
+                _MOUNTS.append((point, f"{fstype}:{source}"))
+        except OSError:
+            pass
+        _MOUNTS.sort(key=lambda m: len(m[0]), reverse=True)
+    try:
+        real = os.path.realpath(path)
+        os.stat(real)
+    except OSError:
+        return None
+    for point, source in _MOUNTS:
+        if real == point or real.startswith(point.rstrip("/") + "/"):
+            return source
+    return None
+
+
+def size_of(path, limit_s=60):
+    """(apparent bytes, bytes freed if deleted, newest mtime) of a tree, without following links."""
+    total = frees = 0
+    newest = 0.0
+    deadline = time.monotonic() + limit_s
+    stack = [path]
+    while stack:
+        p = stack.pop()
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        newest = max(newest, st.st_mtime)
+        blocks = st.st_blocks * 512
+        total += blocks
+        if st.st_nlink == 1 or os.path.isdir(p):
+            frees += blocks
+        if os.path.isdir(p) and not os.path.islink(p):
+            try:
+                with os.scandir(p) as it:
+                    stack.extend(e.path for e in it)
+            except OSError:
+                pass
+        if time.monotonic() > deadline:
+            break
+    return total, frees, newest
+
+
+def busy_paths():
+    """Every cwd, root and open file of every process this user can see."""
+    out = []
+    try:
+        pids = [n for n in os.listdir(PROC) if n.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        base = os.path.join(PROC, pid)
+        for link in ("cwd", "root", "exe"):
+            try:
+                out.append(os.readlink(os.path.join(base, link)))
+            except OSError:
+                pass
+        try:
+            for fd in os.listdir(os.path.join(base, "fd")):
+                try:
+                    out.append(os.readlink(os.path.join(base, "fd", fd)))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return out
+
+
+def in_use(path, busy):
+    if busy is None:
+        return True  # unknown counts as in use
+    real = os.path.realpath(path)
+    prefix = real.rstrip("/") + "/"
+    return any(b == real or b.startswith(prefix) for b in busy)
+
+
+def protected(path, cfg):
+    real = os.path.realpath(path)
+    for p in BUILTIN_PROTECT:
+        if real == os.path.realpath(expand(p)):
+            return f"{p} itself is never removed"
+    for g in cfg["protect"]:
+        g = expand(g)
+        if fnmatch.fnmatch(real, g) or real == g or real.startswith(g.rstrip("/") + "/"):
+            return f"protected by disk-watch.conf ({g})"
+    if not real.startswith(HOME + "/"):
+        return "outside the home directory"
+    if os.path.isdir(os.path.join(real, ".git")):
+        return "it holds a git repository"
+    return None
+
+
+def git(cwd, *args):
+    # --no-optional-locks: a read-only look. Plain `git status` rewrites the
+    # index, which would make every scanned worktree look touched just now.
+    r = subprocess.run(["git", "--no-optional-locks", "-C", cwd, *args], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def main_branch(repo):
+    rc, out = git(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    if rc == 0 and out:
+        name = out.split("/", 1)[-1]
+        if git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}")[0] == 0:
+            return name
+    for name in ("main", "master", "trunk", "develop"):
+        if git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}")[0] == 0:
+            return name
+    return None
+
+
+def worktree_check(path, cfg, busy):
+    """(tier, reason, extra) for a linked worktree: safe to remove, or why not."""
+    if not os.path.isfile(os.path.join(path, ".git")):
+        return "keep", "not a linked worktree", {}
+    rc, common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if rc != 0:
+        return "keep", "git cannot read it", {}
+    repo = os.path.dirname(common) if common.endswith("/.git") else common
+    main = main_branch(repo)
+    rc, branch = git(path, "rev-parse", "--abbrev-ref", "HEAD")
+    extra = {"repo": repo, "branch": branch, "main": main}
+    if not main:
+        return "keep", "its repo has no main branch", extra
+    if os.path.realpath(path) == os.path.realpath(repo):
+        return "keep", "it is the main working tree", extra
+    rc, status = git(path, "status", "--porcelain", "--untracked-files=all")
+    if rc != 0:
+        return "keep", "git status failed", extra
+    dirty = len(status.splitlines()) if status else 0
+    rc, cherry = git(path, "cherry", main, "HEAD")
+    unmerged = sum(1 for l in cherry.splitlines() if l.startswith("+"))
+    # Idle since the later of its last commit and its index (a checkout or add).
+    rc, last = git(path, "log", "-1", "--format=%ct")
+    rc, gitdir = git(path, "rev-parse", "--path-format=absolute", "--git-dir")
+    try:
+        touched = max(int(last or 0), os.stat(os.path.join(gitdir, "index")).st_mtime)
+    except (OSError, ValueError):
+        touched = time.time()
+    idle_days = (time.time() - touched) / DAY
+    extra.update(dirty=dirty, unmerged=unmerged, idle_days=round(idle_days, 1))
+    if in_use(path, busy):
+        return "keep", "a process is using it", extra
+    if dirty or unmerged:
+        what = ", ".join(x for x in (f"{dirty} uncommitted or untracked file(s)" if dirty else "",
+                                       f"{unmerged} commit(s) not on {main}" if unmerged else "") if x)
+        if idle_days >= float(cfg["ask_idle_days"]):
+            return "ask", f"{what}; idle {idle_days:.0f} days", extra
+        return "keep", what, extra
+    if idle_days < float(cfg["min_age_days"]):
+        return "keep", f"merged and clean, but touched {idle_days:.1f} days ago", extra
+    return "safe", f"merged into {main}, nothing uncommitted, idle {idle_days:.0f} days", extra
+
+
+def find_worktrees(root, depth=3):
+    root = expand(root)
+    out = []
+    if not os.path.isdir(root):
+        return out
+    base = root.rstrip("/").count("/")
+    for dirpath, dirnames, filenames in os.walk(root):
+        if ".git" in filenames:
+            out.append(dirpath)
+            dirnames[:] = []
+            continue
+        if ".git" in dirnames:  # a main repo: its own worktrees live elsewhere
+            dirnames[:] = []
+            continue
+        if dirpath.count("/") - base >= depth:
+            dirnames[:] = []
+        dirnames[:] = [d for d in dirnames if d not in ("node_modules", "target", ".cache")]
+    return out
+
+
+def uv_unreferenced():
+    cache = expand(os.environ.get("UV_CACHE_DIR", "~/.cache/uv"))
+    archive = os.path.join(cache, "archive-v0")
+    if not os.path.isdir(archive):
+        return cache, []
+    keep = set()
+    for dirpath, dirnames, filenames in os.walk(os.path.join(cache, "environments-v2")):
+        for name in dirnames + filenames:
+            p = os.path.join(dirpath, name)
+            if os.path.islink(p):
+                m = re.search(r"archive-v0/([^/]+)", os.readlink(p))
+                if m:
+                    keep.add(m.group(1))
+    for maps in glob.glob(os.path.join(PROC, "[0-9]*", "maps")):
+        try:
+            for m in re.finditer(r"archive-v0/([A-Za-z0-9_-]+)", open(maps).read()):
+                keep.add(m.group(1))
+        except OSError:
+            pass
+    return cache, [os.path.join(archive, e) for e in os.listdir(archive) if e not in keep]
+
+
+def docker_df():
+    if not shutil.which("docker"):
+        return []
+    r = subprocess.run(["docker", "system", "df", "--format", "{{json .}}"], capture_output=True, text=True, timeout=60)
+    rows = []
+    for line in r.stdout.splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+    return rows
+
+
+def human_bytes(s):
+    m = re.match(r"([\d.]+)\s*([kMGT]?B)", s or "")
+    if not m:
+        return 0
+    return int(float(m.group(1)) * {"B": 1, "kB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}[m.group(2)])
+
+
+def scan(cfg, mounts):
+    devs = {dev(m) for m in mounts} - {None}
+    busy = busy_paths()
+    out = []
+
+    def add(tier, kind, path, reason, size=None, frees=None, **extra):
+        out.append({"id": f"{kind}:{path}", "tier": tier, "kind": kind, "path": path, "reason": reason,
+                    "bytes": size or 0, "frees": frees if frees is not None else (size or 0), **extra})
+
+    def on_disk(p):
+        return dev(p) in devs
+
+    seen = set()
+    for root in cfg["worktree_root"]:
+        for wt in find_worktrees(root):
+            real = os.path.realpath(wt)
+            if real in seen or not on_disk(wt):
+                continue
+            seen.add(real)
+            tier, reason, extra = worktree_check(wt, cfg, busy)
+            if tier == "keep" and "touched" not in reason and "process" not in reason:
+                continue
+            size, frees, _ = size_of(wt)
+            if size < MIN_BYTES:
+                continue
+            add(tier, "worktree", wt, reason, size, frees, **extra)
+
+    for entry in cfg["cache"]:
+        g, days = glob_days(entry, 2)
+        for p in sorted(glob.glob(g)):
+            real = os.path.realpath(p)
+            if real in seen or not on_disk(p) or protected(p, cfg):
+                continue
+            seen.add(real)
+            size, frees, newest = size_of(p)
+            if size < MIN_BYTES:
+                continue
+            idle = (time.time() - newest) / DAY
+            if in_use(p, busy):
+                add("keep", "cache", p, "a process is using it", size, frees)
+            elif idle < days:
+                add("keep", "cache", p, f"touched {idle:.1f} days ago (kept for {days:g})", size, frees)
+            else:
+                add("safe", "cache", p, f"cache untouched {idle:.0f} days", size, frees)
+
+    for label, p, how in TOOL_CACHES:
+        p = expand(p)
+        if os.path.isdir(p) and on_disk(p):
+            size, frees, _ = size_of(p)
+            if size > 100 << 20:
+                add("safe" if not in_use(p, busy) else "keep", "tool", p, label, size, frees)
+
+    cache, unref = uv_unreferenced()
+    if unref and on_disk(cache):
+        size = frees = 0
+        for e in unref:
+            s, f, _ = size_of(e)
+            size += s
+            frees += f
+        add("safe", "uv", cache, f"{len(unref)} unpacked archives no environment links to", size, frees, entries=len(unref))
+
+    if os.path.realpath("/var/lib/docker") and any(on_disk(m) for m in ("/var/lib/docker", "/var/lib/containerd") if os.path.exists(m)):
+        for row in docker_df():
+            kind = row.get("Type")
+            reclaim = human_bytes(row.get("Reclaimable"))
+            if kind == "Build Cache" and reclaim > 100 << 20:
+                add("safe", "docker", "build-cache", "Docker build cache", reclaim)
+            elif kind == "Images" and reclaim > 100 << 20:
+                add("ask", "docker", "images", "images no container uses (dangling ones are safe and go with the build cache)", reclaim)
+
+    for entry in cfg["large"]:
+        g, days = glob_days(entry, 30)
+        for p in sorted(glob.glob(g)):
+            if not os.path.isdir(p) or not on_disk(p):
+                continue
+            size, frees, newest = size_of(p, limit_s=120)
+            idle = (time.time() - newest) / DAY
+            if size >= LARGE_BYTES and idle >= days:
+                add("ask", "large", p, f"untouched {idle:.0f} days", size, frees)
+
+    if on_disk("/"):
+        r = subprocess.run(["journalctl", "--disk-usage"], capture_output=True, text=True)
+        m = re.search(r"take up ([\d.]+)([KMGT])", r.stdout)
+        if m:
+            b = int(float(m.group(1)) * {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}[m.group(2)])
+            if b > 1 << 30:
+                add("root", "journal", "/var/log/journal", "sudo journalctl --vacuum-size=500M", b)
+        for p, cmd in (("/var/lib/systemd/coredump", "sudo rm /var/lib/systemd/coredump/core.*"),
+                       ("/var/cache/pacman/pkg", "sudo paccache -rk1 && sudo paccache -ruk0")):
+            try:
+                b = sum(e.stat().st_blocks * 512 for e in os.scandir(p) if e.is_file())
+            except OSError:
+                continue
+            if b > 1 << 30:
+                add("root", "root", p, cmd, b)
+
+    order = {"safe": 0, "ask": 1, "root": 2, "keep": 3}
+    out.sort(key=lambda c: (order[c["tier"]], -c["frees"]))
+    return out
+
+
+def usage(mounts):
+    rows = []
+    for m in mounts:
+        try:
+            st = os.statvfs(m)
+        except OSError:
+            continue
+        size = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        rows.append({"mount": m, "size": size, "free": free,
+                     "pct": round(100 * (size - free) / size, 1) if size else 0})
+    return rows
+
+
+def gib(b):
+    return f"{b / (1 << 30):.1f}G"
+
+
+def main(argv):
+    as_json = "--json" in argv
+    save = "--save" in argv
+    cfg = config()
+    mounts = cfg["watch"]
+    if "--mount" in argv:
+        mounts = [argv[argv.index("--mount") + 1]]
+    found = scan(cfg, mounts)
+    result = {"at": int(time.time()), "usage": usage(mounts), "candidates": found}
+    if save:
+        os.makedirs(STATE, exist_ok=True)
+        tmp = os.path.join(STATE, f".scan.{os.getpid()}")
+        with open(tmp, "w") as f:
+            json.dump(result, f, indent=1)
+        os.replace(tmp, os.path.join(STATE, "scan.json"))
+    if as_json:
+        json.dump(result, sys.stdout, indent=1)
+        print()
+        return 0
+    for u in result["usage"]:
+        print(f"{u['mount']}: {u['pct']}% used, {gib(u['free'])} free of {gib(u['size'])}")
+    for tier in ("safe", "ask", "root", "keep"):
+        rows = [c for c in found if c["tier"] == tier]
+        if not rows:
+            continue
+        total = sum(c["frees"] for c in rows)
+        print(f"\n{tier.upper()}  (~{gib(total)} freed)")
+        for c in rows:
+            print(f"  {gib(c['frees']):>8}  {c['kind']:<8} {c['path']}  ({c['reason']})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

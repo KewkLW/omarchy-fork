@@ -1,0 +1,21 @@
+[Unit]
+Description=Warn as a drive fills, free safe build output and caches near full, and hand the rest to an AI agent
+# Needs the session bus to notify, and OMARCHY_PATH, which UWSM imports, for
+# the commands it runs.
+After=graphical-session.target wayland-session-waitenv.service
+PartOf=graphical-session.target
+ConditionEnvironment=OMARCHY_PATH
+ConditionEnvironment=WAYLAND_DISPLAY
+# Opt-in, set by omarchy-toggle-disk-watch.
+ConditionPathExists=%h/.local/state/omarchy/toggles/disk-watch-on
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/omarchy-disk-watch
+Restart=always
+RestartSec=10
+Slice=session.slice
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

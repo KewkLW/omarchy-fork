@@ -1,0 +1,116 @@
+#!/bin/bash
+
+# omarchy:summary=Have the default agent free space on a nearly full drive
+# omarchy:args=[--interactive] [mount] [reason]
+# omarchy:examples=omarchy agent disk | omarchy agent disk --interactive /home
+
+# Started headless by omarchy-disk-watch when a drive is nearly full, or with
+# --interactive from its warning toast (or by hand) in a terminal, where the
+# user is there to approve what only they may. The method lives in the
+# disk-triage skill; this saves a fresh scan and points the agent at both.
+
+set -uo pipefail
+
+interactive=0
+if [[ ${1:-} == "--interactive" ]]; then
+  interactive=1
+  shift
+fi
+mount=${1:-/}
+reason=${2:-run by hand}
+state=$HOME/.local/state/omarchy/disk-watch
+stamp=$(date '+%Y%m%d-%H%M%S')
+skill="$OMARCHY_PATH/default/agents/skills/disk-triage/SKILL.md"
+readonly DISK_GLYPH=$'\U000f02ca'
+
+mkdir -p "$state/reports"
+usage=$(df -h --output=target,size,used,avail,pcent -- "$mount" 2>/dev/null | tail -1)
+
+if ((interactive)); then
+  prompt=$(
+    cat <<PROMPT
+A drive on this Omarchy machine is filling up and I want to know what can go.
+
+  drive:   $mount
+  usage:   $usage
+  trigger: $reason
+
+Use the disk-triage skill. I'm here, so ask me before anything in its "ask" tier.
+If your harness has no skill mechanism, read the skill file and follow it:
+
+  $skill
+PROMPT
+  )
+  exec omarchy-agent --prompt "$prompt"
+fi
+
+# The scan takes a minute or two on a big home; done here so the agent starts
+# with it instead of spending its time budget waiting.
+omarchy-disk-top --mount "$mount" --save >/dev/null 2>&1
+
+prompt=$(
+  cat <<PROMPT
+You are the disk space responder on this Omarchy machine, started headless by
+omarchy-disk-watch. Nobody may be watching, so act on your own judgement within
+the skill's rules.
+
+  drive:    $mount
+  usage:    $usage
+  trigger:  $reason
+  scan:     $state/scan.json (omarchy-disk-top, just now)
+  run id:   $stamp
+  report:   $state/reports/$stamp.md
+
+Read the disk-triage skill and follow it:
+
+  $skill
+PROMPT
+)
+
+agent=$(omarchy-default-agent)
+
+# Only agents with an unattended one-shot mode, without the user's settings or
+# MCP servers. Space is freed through omarchy-disk-reclaim, which checks every
+# item again and refuses what is the user's to decide when run from this unit;
+# the limits below keep the agent from going around it where the harness can.
+case "$agent" in
+claude)
+  claude_home=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+  skill_dir=${skill%/*}
+  settings=$(jq -cn --arg state "$state" '{permissions: {
+    allow: [
+      "Bash(omarchy-disk-*)", "Bash(omarchy disk *)", "Bash(omarchy-notification-send *)",
+      "Bash(df *)", "Bash(du *)", "Bash(ls *)", "Bash(find *)", "Bash(stat *)", "Bash(findmnt *)",
+      "Bash(git -C * status*)", "Bash(git -C * log*)", "Bash(git -C * worktree list*)",
+      "Bash(docker system df*)", "Bash(journalctl --disk-usage*)", "Bash(omarchy-agent-list*)",
+      "Edit(/\($state)/**)", "Write(/\($state)/**)", "Read", "ToolSearch", "SendMessage", "ListAgents"
+    ],
+    deny: [
+      "Bash(rm:*)", "Bash(rmdir:*)", "Bash(mv:*)", "Bash(shred:*)", "Bash(truncate:*)", "Bash(sudo:*)",
+      "Bash(pkexec:*)", "Bash(systemctl:*)", "Bash(kill:*)", "Bash(pkill:*)", "Bash(git -C * worktree remove*)",
+      "Bash(git -C * clean*)", "Bash(git -C * reset*)", "Bash(docker:*)", "Bash(uv:*)", "Bash(cargo:*)",
+      "Bash(omarchy agent:*)", "Bash(omarchy-agent:*)", "Bash(omarchy-agent-disk:*)"
+    ]
+  }}')
+  command=(claude -p --permission-mode auto --restricted
+    --tools Bash,Read,Write,ToolSearch,SendMessage,ListAgents --settings "$settings"
+    --add-dir "$skill_dir")
+  [[ -d $claude_home/projects ]] && command+=(--add-dir "$claude_home/projects")
+  command+=(--strict-mcp-config -- "$prompt")
+  ;;
+codex)
+  # Codex's sandbox hides other processes, which the in-use checks need, so no
+  # sandbox; it relies on the skill and omarchy-disk-reclaim's refusals.
+  command=(codex exec --sandbox danger-full-access -c 'approval_policy="on-request"'
+    -c 'approvals_reviewer="auto_review"' --ignore-user-config --skip-git-repo-check -- "$prompt")
+  ;;
+*)
+  omarchy-notification-send --urgency critical --glyph "$DISK_GLYPH" \
+    "Drive $mount is nearly full" "$usage. See what can go: omarchy disk top" >/dev/null 2>&1
+  echo "No headless disk responder for default agent '${agent:-none}'" >&2
+  exit 1
+  ;;
+esac
+
+cd "$state" || exit 1
+"${command[@]}" >"$state/reports/$stamp.agent.log" 2>&1 </dev/null

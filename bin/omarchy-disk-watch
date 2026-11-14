@@ -1,0 +1,182 @@
+#!/bin/bash
+
+# omarchy:summary=Watch drive space; warn as a drive fills, hand it to an AI agent near full, and free safe build output and caches at the edge
+# omarchy:hidden=true
+
+# A full drive fails slowly and then all at once: builds die with ENOSPC,
+# databases and browser profiles get corrupted half-written, and on btrfs a
+# volume with no unallocated space left can stop taking even metadata writes.
+# Disk fills over hours, not seconds, so this samples once a minute:
+#
+#   warn   a drive OMARCHY_DISK_WARN_PCT (85) full: a critical toast with what
+#          is left; a click opens an AI agent in a terminal with the
+#          disk-triage skill, where the user can approve what only they may.
+#          Again only once it has filled OMARCHY_DISK_WARN_STEP (3) points more,
+#          or after OMARCHY_DISK_WARN_GAP (12h).
+#   agent  OMARCHY_DISK_AGENT_PCT (92) full, or under OMARCHY_DISK_AGENT_FREE_GB
+#          (25) free: run the default agent headless (omarchy-agent-disk) to
+#          free what is safe and report the rest. A full drive stays full when
+#          what is left is the user's to decide, so a plain cooldown would start
+#          it again and again for nothing: after a run it waits until the drive
+#          has filled OMARCHY_DISK_REARM_STEP (2) points past where that run left
+#          it, or OMARCHY_DISK_REARM_GAP (24h) has passed.
+#   brake  OMARCHY_DISK_BRAKE_PCT (97) full, or under OMARCHY_DISK_BRAKE_FREE_GB
+#          (8) free: free every safe item right away (omarchy-disk-reclaim
+#          --safe), without waiting for an agent that may take minutes to start
+#          or may not start at all. At most once per OMARCHY_DISK_BRAKE_GAP (30m).
+#
+# Which drives: the watch lines of ~/.config/omarchy/disk-watch.conf, default /.
+# Thresholds are environment variables; change them with a drop-in from
+# `systemctl --user edit omarchy-disk-watch`.
+
+set -uo pipefail
+
+readonly STATE=$HOME/.local/state/omarchy/disk-watch
+readonly LOG=$STATE/watch.log
+readonly CONFIG=${OMARCHY_DISK_CONFIG:-$HOME/.config/omarchy/disk-watch.conf}
+readonly UNIT=omarchy-disk-agent
+readonly BRAKE_UNIT=omarchy-disk-brake
+# nf-md-harddisk, escaped so this file reads without a Nerd Font.
+readonly DISK_GLYPH=$'\U000f02ca'
+
+interval=${OMARCHY_DISK_INTERVAL:-60}
+warn_pct=${OMARCHY_DISK_WARN_PCT:-85}
+warn_step=${OMARCHY_DISK_WARN_STEP:-3}
+warn_gap=${OMARCHY_DISK_WARN_GAP:-43200}
+agent_pct=${OMARCHY_DISK_AGENT_PCT:-92}
+agent_free_gb=${OMARCHY_DISK_AGENT_FREE_GB:-25}
+rearm_step=${OMARCHY_DISK_REARM_STEP:-2}
+rearm_gap=${OMARCHY_DISK_REARM_GAP:-86400}
+brake_pct=${OMARCHY_DISK_BRAKE_PCT:-97}
+brake_free_gb=${OMARCHY_DISK_BRAKE_FREE_GB:-8}
+brake_gap=${OMARCHY_DISK_BRAKE_GAP:-1800}
+once=${OMARCHY_DISK_ONCE:-0} # tests: one pass, then exit
+
+mkdir -p "$STATE/reports" "$STATE/mounts"
+
+log() {
+  printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2
+}
+
+mounts() {
+  local found
+  found=$(sed -n 's/#.*//; s/^[[:space:]]*watch[[:space:]]*=[[:space:]]*//p' "$CONFIG" 2>/dev/null | sed 's/[[:space:]]*$//' | grep -v '^$')
+  printf '%s\n' "${found:-/}"
+}
+
+# "<pct> <free bytes>" of a mount. OMARCHY_DISK_DF names a file of
+# "<mount> <pct> <free bytes>" lines, so the tests can feed the watcher numbers.
+usage() {
+  local mount=$1 m pct free
+  if [[ -n ${OMARCHY_DISK_DF:-} ]]; then
+    while read -r m pct free; do
+      [[ $m == "$mount" ]] && { echo "$pct $free"; return 0; }
+    done <"$OMARCHY_DISK_DF"
+    return 1
+  fi
+  df --output=pcent,avail -B1 -- "$mount" 2>/dev/null | awk 'NR == 2 { sub("%", "", $1); print $1, $2 }'
+}
+
+# State per mount, in files named after it, so a restart keeps the windows.
+key() { local k=${1//\//_}; echo "${k:-_}"; }
+get() {
+  local f
+  f="$STATE/mounts/$(key "$1").$2"
+  if [[ -r $f ]]; then cat "$f"; else echo "${3:-0}"; fi
+}
+put() { echo "$3" >"$STATE/mounts/$(key "$1").$2"; }
+
+gb() { echo $(($1 / 1024 / 1024 / 1024)); }
+
+unit_active() { systemctl --user is-active --quiet "$1.service"; }
+
+warn() {
+  local mount=$1 pct=$2 free=$3
+  log "warn: $mount ${pct}% full, $(gb "$free")G free"
+  # --exec rather than a libnotify action: the shell runs clicks from its own
+  # hint. It consumes the rest of the line, so it comes last.
+  omarchy-notification-send --urgency critical --glyph "$DISK_GLYPH" \
+    "Drive $mount is ${pct}% full" \
+    "$(gb "$free")G left. Click to see what can go, with AI" \
+    --exec omarchy-agent-disk --interactive "$mount" >/dev/null 2>&1 &
+}
+
+spawn_agent() {
+  local mount=$1 pct=$2 free=$3 setenv=(--setenv=PATH="$PATH" --setenv=OMARCHY_PATH="$OMARCHY_PATH") name
+  for name in "${!OMARCHY_DISK_@}"; do
+    setenv+=(--setenv="$name=${!name}")
+  done
+  log "agent: $mount ${pct}% full, $(gb "$free")G free"
+  # A transient unit, so it survives this watcher restarting; its name is how
+  # omarchy-disk-reclaim knows the responder from the user.
+  if ! systemd-run --user --unit="$UNIT" --slice=session.slice --collect --quiet \
+    -p RuntimeMaxSec=2400 -p WorkingDirectory="$STATE" "${setenv[@]}" \
+    omarchy-agent-disk "$mount" "${pct}% full, $(gb "$free")G free"; then
+    log "agent: could not start $UNIT"
+    return 1
+  fi
+  put "$mount" spawned "$EPOCHSECONDS"
+  put "$mount" running 1
+}
+
+brake() {
+  local mount=$1 pct=$2 free=$3
+  log "brake: $mount ${pct}% full, $(gb "$free")G free; freeing every safe item"
+  put "$mount" braked "$EPOCHSECONDS"
+  systemd-run --user --unit="$BRAKE_UNIT" --slice=session.slice --collect --quiet \
+    -p RuntimeMaxSec=3600 --setenv=PATH="$PATH" --setenv=OMARCHY_PATH="$OMARCHY_PATH" \
+    bash -c 'out=$(omarchy-disk-reclaim --safe --mount "$1" 2>&1); printf "%s\n" "$out" >>"$2"
+      freed=$(grep -c "^freed" <<<"$out")
+      omarchy-notification-send --urgency critical --glyph "$3" "Disk brake on $1" \
+        "Freed $freed safe item(s) (build output, caches). Now: $(df -h --output=avail "$1" | tail -1 | tr -d " ") free"' \
+    _ "$mount" "$LOG" "$DISK_GLYPH" || log "brake: could not start $BRAKE_UNIT"
+}
+
+check() {
+  local mount=$1 pct free now=$EPOCHSECONDS last settled
+  read -r pct free < <(usage "$mount") || return 0
+  [[ $pct =~ ^[0-9]+$ && $free =~ ^[0-9]+$ ]] || return 0
+
+  # A responder that has finished leaves the drive where it could get it.
+  if (($(get "$mount" running) == 1)) && ! unit_active "$UNIT"; then
+    put "$mount" running 0
+    put "$mount" settled "$pct"
+    log "agent: done; $mount left at ${pct}%"
+  fi
+
+  if ((pct >= brake_pct || free < brake_free_gb * 1024 * 1024 * 1024)); then
+    if ((now - $(get "$mount" braked) >= brake_gap)) && ! unit_active "$BRAKE_UNIT"; then
+      brake "$mount" "$pct" "$free"
+    fi
+  fi
+
+  if ((pct >= agent_pct || free < agent_free_gb * 1024 * 1024 * 1024)); then
+    last=$(get "$mount" spawned)
+    settled=$(get "$mount" settled -1)
+    if ! unit_active "$UNIT" && { ((last == 0)) || ((settled >= 0 && pct >= settled + rearm_step)) || ((now - last >= rearm_gap)); }; then
+      spawn_agent "$mount" "$pct" "$free" && return 0
+    fi
+  fi
+
+  if ((pct >= warn_pct)); then
+    last=$(get "$mount" warned)
+    if ((last == 0 || pct >= $(get "$mount" warned_pct) + warn_step || now - last >= warn_gap)); then
+      put "$mount" warned "$now"
+      put "$mount" warned_pct "$pct"
+      warn "$mount" "$pct" "$free"
+    fi
+  elif ((pct < warn_pct - warn_step)); then
+    # Back under with some room: the next fill warns from scratch.
+    put "$mount" warned 0
+    put "$mount" warned_pct 0
+  fi
+}
+
+log "start: watching $(mounts | paste -sd' ')"
+while :; do
+  while IFS= read -r mount; do
+    check "$mount"
+  done < <(mounts)
+  ((once)) && break
+  sleep "$interval"
+done

@@ -1,0 +1,165 @@
+#!/usr/bin/python3
+# omarchy:summary=Free one item omarchy disk top lists as safe, checking it again first
+# omarchy:args=<id|path>... | --safe [--mount <path>] [--dry-run] [--approved]
+# omarchy:examples=omarchy disk reclaim worktree:/home/me/Work/app-wt/b12 | omarchy disk reclaim --safe --mount /
+# omarchy:hidden=true
+
+# The disk-triage skill frees space only through here, so its rules hold in
+# code and not only in a prompt. Each item is scanned again at the moment it is
+# removed (omarchy-disk-top's checks: merged and clean, idle, no process
+# inside, not protected), so a scan saved an hour ago cannot remove a worktree
+# someone has since started working in.
+#
+# safe items are removed. ask items (idle games, unmerged work, images no
+# container uses) only with --approved, which the user gives by hand, and never
+# from the disk responder's unit, whatever its arguments say. root items are
+# never removed here: they need sudo, so they are reported with their command.
+#
+# --safe frees every safe item on the mount, as the watcher's brake does when a
+# drive is nearly full. Every removal is logged to reclaim.log with the free
+# space before and after, measured with statvfs, since du overstates what a
+# compressed or deduplicated filesystem gets back.
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+loader = importlib.machinery.SourceFileLoader("top", shutil.which("omarchy-disk-top"))
+top = importlib.util.module_from_spec(importlib.util.spec_from_loader("top", loader))
+loader.exec_module(top)
+
+LOG = os.path.join(top.STATE, "reclaim.log")
+RESPONDER_UNIT = "omarchy-disk-agent.service"
+
+
+def log(line):
+    os.makedirs(top.STATE, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{time.strftime('%F %T')} {line}\n")
+
+
+def from_responder():
+    try:
+        return RESPONDER_UNIT in open(f"/proc/{os.getpid()}/cgroup").read()
+    except OSError:
+        return False
+
+
+def free_bytes(path):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+def remove_tree(path):
+    shutil.rmtree(path)
+
+
+def empty_dir(path):
+    for e in os.scandir(path):
+        if e.is_dir(follow_symlinks=False):
+            shutil.rmtree(e.path)
+        else:
+            os.unlink(e.path)
+
+
+def act(c):
+    """Free one candidate; raises on failure."""
+    kind, path = c["kind"], c["path"]
+    if kind == "worktree":
+        r = subprocess.run(["git", "-C", c["repo"], "worktree", "remove", os.path.realpath(path)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip() or "git worktree remove failed")
+        if os.path.islink(path):
+            os.unlink(path)
+    elif kind == "cache" or kind == "large":
+        remove_tree(path)
+    elif kind == "tool":
+        empty_dir(path)
+    elif kind == "uv":
+        _, unref = top.uv_unreferenced()
+        for e in unref:
+            shutil.rmtree(e, ignore_errors=True)
+    elif kind == "docker":
+        cmds = {"build-cache": [["docker", "builder", "prune", "-af"], ["docker", "image", "prune", "-f"]],
+                "images": [["docker", "image", "prune", "-af"]]}[path]
+        for cmd in cmds:
+            subprocess.run(cmd, capture_output=True, check=True, timeout=1800)
+    else:
+        raise RuntimeError(f"{kind} items are not removed here")
+
+
+def main(argv):
+    dry = "--dry-run" in argv
+    approved = "--approved" in argv and not from_responder()
+    cfg = top.config()
+    mounts = cfg["watch"]
+    if "--mount" in argv:
+        mounts = [argv[argv.index("--mount") + 1]]
+    wanted = [a for i, a in enumerate(argv) if not a.startswith("--") and (i == 0 or argv[i - 1] != "--mount")]
+    if not wanted and "--safe" not in argv:
+        print("usage: omarchy-disk-reclaim <id|path>... | --safe [--mount <path>] [--dry-run]", file=sys.stderr)
+        return 2
+
+    # A fresh scan is the check: whatever it does not list as safe now stays.
+    found = top.scan(cfg, mounts)
+    by_key = {}
+    for c in found:
+        by_key[c["id"]] = c
+        by_key.setdefault(c["path"], c)
+        by_key.setdefault(os.path.realpath(c["path"]) if c["path"].startswith("/") else c["path"], c)
+
+    status = 0
+    if "--safe" in argv:
+        targets = [c for c in found if c["tier"] == "safe"]
+    else:
+        targets = []
+        for w in wanted:
+            c = by_key.get(w) or by_key.get(os.path.realpath(w))
+            if not c:
+                print(f"refused {w}: not in a fresh scan of {' '.join(mounts)} (gone, not a candidate, or on another drive)")
+                status = 1
+                continue
+            targets.append(c)
+
+    for c in targets:
+        why = None
+        if c["tier"] == "keep":
+            why = c["reason"]
+        elif c["tier"] == "root":
+            why = f"needs root: {c['reason']}"
+        elif c["tier"] == "ask" and not approved:
+            why = "the user's to decide" + (" (the responder cannot approve)" if from_responder() else "; rerun with --approved once they agree")
+        elif c["path"].startswith("/") and c["kind"] not in ("uv", "tool"):
+            why = top.protected(c["path"], cfg)
+        if why:
+            print(f"refused {c['id']}: {why}")
+            log(f"refused {c['id']}: {why}")
+            status = 1
+            continue
+        if dry:
+            print(f"would free ~{top.gib(c['frees'])}: {c['id']} ({c['reason']})")
+            continue
+        anchor = mounts[0]
+        before = free_bytes(anchor)
+        try:
+            act(c)
+        except Exception as e:  # report and carry on with the rest
+            print(f"failed {c['id']}: {e}")
+            log(f"failed {c['id']}: {e}")
+            status = 1
+            continue
+        os.sync()
+        gained = free_bytes(anchor) - before
+        print(f"freed {top.gib(max(gained, 0))} (df) of ~{top.gib(c['frees'])} estimated: {c['id']}")
+        log(f"freed {gained} bytes (df) est {c['frees']}: {c['id']} [{c['reason']}]")
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
