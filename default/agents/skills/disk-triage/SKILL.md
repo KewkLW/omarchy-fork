@@ -51,6 +51,11 @@ something, that is the answer: report it, don't work around it.
     least one commit of their own, no process inside, idle a day. Their build
     output (Rust `target/`, `node_modules`, Unreal `Intermediate/`) is where most
     of a developer's disk goes: one board of 39 finished Rust worktrees held 189 GB.
+  - Build output alone (`target/`, `node_modules/`, ...) inside a worktree that
+    has to stay (unmerged, uncommitted, still at work): listed as a `build` item,
+    safe once nothing runs in the worktree and nothing wrote to it for
+    `build_idle_hours` (6). The work stays; only the next build is slower. Live
+    task boards leave dozens of these: one held 56 at 10 GB each.
   - Configured cache globs untouched for their days (per-task scratch dirs,
     worker browser profiles), Trash, thumbnails, pip, Go, npm, Chromium caches.
   - uv's unpacked archives that no cached environment links to.

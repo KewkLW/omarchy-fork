@@ -83,7 +83,7 @@ def expand(p):
 
 def config():
     cfg = {"watch": [], "worktree_root": [], "cache": [], "large": [], "protect": [],
-           "min_age_days": "1", "ask_idle_days": "14"}
+           "min_age_days": "1", "ask_idle_days": "14", "build_idle_hours": "6"}
     try:
         lines = open(CONFIG).read().splitlines()
     except OSError:
@@ -273,6 +273,10 @@ def worktree_check(path, cfg, busy):
     lines = status.splitlines() if status else []
     dirty = sum(1 for l in lines if not l.startswith("!! "))
     kept_ignored = [l[3:] for l in lines if l.startswith("!! ") and not build_output(l[3:])]
+    # Ignored directories named as build output (target/, fuzz/target/, node_modules/):
+    # they can go on their own even when the worktree around them has to stay.
+    extra_build = [l[3:].rstrip("/") for l in lines
+                   if l.startswith("!! ") and l.endswith("/") and l[3:].rstrip("/").split("/")[-1] in BUILD_OUTPUT]
     rc, cherry = git(path, "cherry", main, "HEAD")
     unmerged = sum(1 for l in cherry.splitlines() if l.startswith("+"))
     # Idle since the later of its last commit and its index (a checkout or add).
@@ -283,7 +287,7 @@ def worktree_check(path, cfg, busy):
     except (OSError, ValueError):
         touched = time.time()
     idle_days = (time.time() - touched) / DAY
-    extra.update(dirty=dirty, unmerged=unmerged, idle_days=round(idle_days, 1))
+    extra.update(dirty=dirty, unmerged=unmerged, idle_days=round(idle_days, 1), build_dirs=extra_build)
     if in_use(path, busy):
         return "keep", "a process is using it", extra
     if dirty or unmerged:
@@ -397,12 +401,36 @@ def scan(cfg, mounts):
                 continue
             seen.add(real)
             tier, reason, extra = worktree_check(wt, cfg, busy)
-            if tier == "keep" and "touched" not in reason and "process" not in reason:
+            build_dirs = extra.pop("build_dirs", [])
+            if reason in ("not a linked worktree", "it is the main working tree"):
                 continue
+            # Every worktree is listed, kept ones too: hiding the ones still at work
+            # hid what fills the drive (dozens of live branches with a Rust build each).
             size, frees, _ = size_of(wt)
             if size < MIN_BYTES:
                 continue
             add(tier, "worktree", wt, reason, size, frees, **extra)
+            if tier == "safe":
+                continue  # the whole worktree goes, build output with it
+            # Its build output alone: rebuilt on demand, so it may go once nothing
+            # runs inside the worktree and nothing has written to it for a while.
+            busy_wt = in_use(wt, busy)
+            for rel in build_dirs:
+                p = os.path.join(wt, rel)
+                if os.path.islink(p) or not os.path.isdir(p):
+                    continue
+                bsize, bfrees, newest = size_of(p)
+                if bsize < MIN_BYTES:
+                    continue
+                idle_h = (time.time() - newest) / 3600
+                bextra = {"repo": extra.get("repo"), "worktree": wt}
+                if busy_wt:
+                    add("keep", "build", p, "build output of a worktree a process is using", bsize, bfrees, **bextra)
+                elif idle_h < float(cfg["build_idle_hours"]):
+                    add("keep", "build", p, f"build output written {idle_h:.1f} hours ago", bsize, bfrees, **bextra)
+                else:
+                    add("safe", "build", p, f"build output only, untouched {idle_h:.0f} hours, nothing running in the worktree ({reason})",
+                        bsize, bfrees, **bextra)
 
     for entry in cfg["cache"]:
         g, days = glob_days(entry, 2)

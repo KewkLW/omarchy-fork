@@ -77,7 +77,7 @@ def act(c):
             raise RuntimeError(r.stderr.strip() or "git worktree remove failed")
         if os.path.islink(path):
             os.unlink(path)
-    elif kind == "cache" or kind == "large":
+    elif kind == "cache" or kind == "large" or kind == "build":
         remove_tree(path)
     elif kind == "tool":
         empty_dir(path)

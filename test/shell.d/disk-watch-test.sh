@@ -70,6 +70,9 @@ head -c 100000 /dev/urandom >"$HOME/.cache/b12-scratch/blob"
 head -c 100000 /dev/urandom >"$HOME/.cache/b13-live/blob"
 touch -d "$old" "$HOME/.cache/b12-scratch/blob" "$HOME/.cache/b12-scratch"
 
+# A build dir in the unmerged worktree, untouched for days; dirty's is fresh.
+touch -d "$old" "$HOME/Work/app-wt/unmerged/target" "$HOME/Work/app-wt/unmerged/target/big.o"
+
 scan=$(omarchy-disk-top --json)
 tier() { jq -r --arg p "$1" '.candidates[] | select(.path == $p) | .tier' <<<"$scan"; }
 
@@ -85,6 +88,19 @@ tier() { jq -r --arg p "$1" '.candidates[] | select(.path == $p) | .tier' <<<"$s
 [[ -z $(tier "$repo") ]] || fail "the main repo is never a candidate" "$scan"
 [[ -z $(tier "$HOME/Work/keepme-wt/integration") ]] || fail "a protected worktree is never a candidate" "$scan"
 pass "omarchy disk top sorts worktrees and caches into safe and not"
+
+[[ $(tier "$HOME/Work/app-wt/unmerged") == "keep" ]] || fail "a worktree with unmerged work, not yet idle, is still listed" "$scan"
+[[ $(tier "$HOME/Work/app-wt/unmerged/target") == "safe" ]] || fail "idle build output of a kept worktree is safe" "$scan"
+[[ $(tier "$HOME/Work/app-wt/dirty/target") == "keep" ]] || fail "build output written just now is kept" "$scan"
+[[ $(tier "$HOME/Work/app-wt/busy/target") == "keep" ]] || fail "build output of a worktree a process is using is kept" "$scan"
+[[ -z $(tier "$HOME/Work/app-wt/merged/target") ]] || fail "a safe worktree is not split into its build output" "$scan"
+[[ -z $(tier "$HOME/Work/keepme-wt/integration/target") ]] || fail "a protected worktree's build output is never a candidate" "$scan"
+out=$(omarchy-disk-reclaim "$HOME/Work/app-wt/busy/target" 2>&1) && fail "reclaim refuses build output of a busy worktree" "$out"
+out=$(omarchy-disk-reclaim "build:$HOME/Work/app-wt/unmerged/target" 2>&1) || fail "reclaim frees idle build output" "$out"
+[[ ! -e $HOME/Work/app-wt/unmerged/target && -f $HOME/Work/app-wt/unmerged/unmerged.txt && -d $HOME/Work/app-wt/busy/target ]] ||
+  fail "only the idle build output went; the worktree and its work stay" "$out"
+[[ $(g -C "$HOME/Work/app-wt/unmerged" log -1 --format=%s) == "not on main" ]] || fail "the unmerged commit stays" "$out"
+pass "omarchy disk top lists every worktree and frees idle build output of kept ones"
 
 out=$(omarchy-disk-reclaim "$HOME/Work/app-wt/dirty" "$HOME/Work/app-wt/unmerged" 2>&1) && fail "reclaim refuses unsafe items with a failing status" "$out"
 [[ -d $HOME/Work/app-wt/dirty && -f $HOME/Work/app-wt/dirty/notes.txt && -d $HOME/Work/app-wt/unmerged ]] ||
