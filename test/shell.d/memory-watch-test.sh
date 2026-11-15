@@ -860,7 +860,20 @@ rm -f "$state/idle/answers.json"
 idle_session idle
 IDLE_ANSWER=done IDLE_VAULT="not saved" sweep_run
 kill -0 "$idle_agent" 2>/dev/null || fail "the sweep keeps a done session whose work is not in the vault"
-rm -f "$state/idle/answers.json"
+# --report asks and closes nobody.
+rm -f "$state/idle/answers.json" "$state/reports/"idle-*
+idle_session idle
+: >"$TMPDIR/relay-log"
+report_run() {
+  run env PATH="$TMPDIR/relay:$TMPDIR/bin:$ROOT/bin:$PATH" RELAY_LOG="$TMPDIR/relay-log" \
+    "$ROOT/bin/omarchy-memory-idle" --report --idle 60 --min-mb 0 >/dev/null 2>&1
+}
+report_run
+[[ ! -s $TMPDIR/relay-log ]] || fail "a report-only run asks no session"
+kill -0 "$idle_agent" 2>/dev/null || fail "a report-only run closes no session"
+grep -Fq 'due to be asked' "$state/reports/"idle-*.md || fail "a report-only run lists the sessions a sweep would ask" "$(cat "$state/reports/"idle-*.md)"
+pass "memory idle report-only run asks and closes no session"
+
 idle_session idle
 IDLE_ANSWER=done sweep_run
 for _ in {1..30}; do kill -0 "$idle_agent" 2>/dev/null || break; sleep 0.1; done
@@ -868,6 +881,17 @@ for _ in {1..30}; do kill -0 "$idle_agent" 2>/dev/null || break; sleep 0.1; done
 grep -Fq 'claude --resume memtest-idle' "$state/reports/"idle-*.md ||
   fail "the report says how to resume a closed session" "$(cat "$state/reports/"idle-*.md)"
 pass "memory idle sweep closes done sessions and reports how to resume them"
+
+# The report is by project, and a later run still says what a closed session
+# finished.
+grep -Fq -- '- **No project**' "$state/reports/"idle-*.md || fail "the report groups agents by project" "$(cat "$state/reports/"idle-*.md)"
+rm -f "$state/reports/"idle-*
+: >"$TMPDIR/relay-log"
+report_run
+grep -Fq 'Closed or exited in the last' "$state/reports/"idle-*.md && grep -Fq 'claude --resume memtest-idle' "$state/reports/"idle-*.md ||
+  fail "a later report still lists the session closed earlier" "$(cat "$state/reports/"idle-*.md)"
+cmp -s "$state/reports/idle-latest.html" "$(ls "$state/reports/"idle-2*.html | tail -1)" || fail "the newest report is also idle-latest.html"
+pass "memory idle report is by project and keeps the sessions closed earlier"
 
 kill "$idle_child" "$idle_agent" 2>/dev/null || true
 rm -rf "$test_home/.claude" "$state/idle-seen" "$state/idle-agents.json" "$state/idle" "$state/reports/"idle-*

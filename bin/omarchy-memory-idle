@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # omarchy:summary=Ask idle Claude Code sessions if they are done, close the done ones, and report
-# omarchy:args=[--dry-run] [--check] [--only <session>] [--idle <minutes>] [--min-mb <MB>] [--timeout <seconds>]
-# omarchy:examples=omarchy memory idle | omarchy memory idle --dry-run | omarchy memory idle --idle 60
+# omarchy:args=[--dry-run] [--check] [--report] [--only <session>] [--idle <minutes>] [--min-mb <MB>] [--timeout <seconds>]
+# omarchy:examples=omarchy memory idle | omarchy memory idle --dry-run | omarchy memory idle --idle 60 | omarchy memory idle --report
 
 # The watcher runs this when a session qualifies, or memory runs short. Every
 # local Claude session at least --idle minutes idle and --min-mb big, or
@@ -21,7 +21,16 @@
 # time, are not asked, nor is the one in the window in focus; the report lists
 # them with what they last did, and the other agents too. --check asks
 # nothing: it exits 0 when some session would be asked, 1 when none would.
+#
+# Every run writes a report, by project: each project with its agents under
+# it (orchestrator first), what each is for, what it has left, who it waits
+# on and what it last said, then the sessions closed in this run and the ones
+# that closed or exited in the last OMARCHY_MEMORY_IDLE_REPORT_HOURS (24),
+# with their last words and the command to resume them. The newest report is
+# also reports/idle-latest.html. --report asks and closes nothing and only
+# writes the report.
 
+import glob
 import json
 import os
 import re
@@ -36,7 +45,12 @@ from datetime import datetime
 STATE = os.path.expanduser("~/.local/state/omarchy/memory-watch")
 IDLE_DIR = os.path.join(STATE, "idle")
 ANSWERS = os.path.join(IDLE_DIR, "answers.json")
+CLOSED = os.path.join(IDLE_DIR, "closed.jsonl")
+SEEN = os.path.join(IDLE_DIR, "seen.json")
 LOG = os.path.join(STATE, "watch.log")
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+PROJECT_ROOTS = ("Work", "build", "Projects")
+NOISE = ("<", "Stop hook feedback", "[Agent room]", "[Memory watchdog idle sweep", "[Request interrupted", "Caveat:", "# AGENTS.md")
 CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 TERMINALS = {"foot", "alacritty", "ghostty", "kitty", "wezterm-gui", "konsole", "xterm"}
 SHELLS = {"bash", "zsh", "fish", "sh", "dash"}
@@ -55,6 +69,7 @@ def arg(name, default):
 
 DRY = "--dry-run" in sys.argv
 CHECK = "--check" in sys.argv
+REPORT = "--report" in sys.argv
 ONLY = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv[:-1] else None
 IDLE_MIN = arg("--idle", float(os.environ.get("OMARCHY_MEMORY_IDLE_ASK_MIN", 30)))
 MIN_MB = arg("--min-mb", float(os.environ.get("OMARCHY_MEMORY_IDLE_MIN_MB", 100)))
@@ -64,6 +79,7 @@ TIMEOUT = arg("--timeout", float(os.environ.get("OMARCHY_MEMORY_IDLE_TIMEOUT", 6
 REASK = float(os.environ.get("OMARCHY_MEMORY_IDLE_REASK", 6)) * 3600
 CLOSE_SILENT = os.environ.get("OMARCHY_MEMORY_IDLE_CLOSE_SILENT") == "1"
 POLL = float(os.environ.get("OMARCHY_MEMORY_IDLE_POLL", 5))
+REPORT_HOURS = float(os.environ.get("OMARCHY_MEMORY_IDLE_REPORT_HOURS", 24))
 
 
 def log(line):
@@ -174,7 +190,13 @@ def entries(path, offset=0):
     return out
 
 
-def texts(entry, role):
+def texts(entry, role, tools=True):
+    if entry.get("type") == "response_item":
+        # A Codex rollout.
+        item = entry.get("payload") or {}
+        if item.get("type") != "message" or item.get("role") != role:
+            return []
+        return [c.get("text") or "" for c in item.get("content") or [] if isinstance(c, dict)]
     if entry.get("type") != role:
         return []
     content = (entry.get("message") or {}).get("content")
@@ -184,7 +206,7 @@ def texts(entry, role):
     for block in content or []:
         if block.get("type") == "text":
             out.append(block.get("text") or "")
-        elif role == "assistant" and block.get("type") == "tool_use":
+        elif tools and role == "assistant" and block.get("type") == "tool_use":
             # A session may answer the sender with SendMessage instead.
             out += [v for v in (block.get("input") or {}).values() if isinstance(v, str)]
     return out
@@ -205,18 +227,175 @@ def parse_reply(text):
     return reply
 
 
-def last_said(path):
-    # What a session was last asked and last said, for the ones not asked now.
-    asked = said = ""
-    for e in entries(path, max(0, (os.path.getsize(path) if path and os.path.exists(path) else 0) - 400_000)):
-        for t in texts(e, "user"):
-            if t.strip() and not t.lstrip().startswith("<"):
-                asked = t
-        for t in texts(e, "assistant"):
-            if t.strip():
+def clip(text, size):
+    text = " ".join((text or "").split())
+    return text if len(text) <= size else text[:size - 1].rstrip() + "\u2026"
+
+
+def summary(path):
+    # What a session was started for (its first real prompt) and the last thing
+    # it said that was not an answer to the sweep: its closing words.
+    if not path or not os.path.exists(path):
+        return "", ""
+    purpose = said = ""
+    for e in entries(path)[:400] if os.path.getsize(path) < 300_000 else head_entries(path):
+        purpose = next((t for t in texts(e, "user") if t.strip() and not t.lstrip().startswith(NOISE)), "")
+        if purpose:
+            break
+    for e in entries(path, max(0, os.path.getsize(path) - 400_000)):
+        for t in texts(e, "assistant", tools=False):
+            if t.strip() and "IDLE-REPLY:" not in t:
                 said = t
-    clip = lambda s: " ".join(s.split())[:240]
-    return clip(asked), clip(said)
+    # A board worker's prompt opens with boilerplate; its bounty title says more.
+    bounty = re.search(r"bounty #(\d+).*?Title: (.+?)\s+- Type ", " ".join(purpose.split()))
+    if bounty:
+        purpose = f"Bounty #{bounty.group(1)}: {bounty.group(2)}"
+    # The last words keep their line breaks: they are often a whole result.
+    said = re.sub(r"\n{3,}", "\n\n", said.strip())
+    return clip(purpose, 300), said if len(said) <= 6000 else said[:6000].rstrip() + "\u2026"
+
+
+def head_entries(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read(300_000)
+    except OSError:
+        return []
+    out = []
+    for line in data.split(b"\n")[:-1]:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def proc_env(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            pairs = (v.split("=", 1) for v in f.read().decode(errors="replace").split("\0") if v.startswith("OMARCHY_"))
+            return {k: v for k, v in pairs}
+    except (OSError, ValueError):
+        return {}
+
+
+def project_of(cwd, env):
+    # The project an agent was spawned for, else the one its directory belongs
+    # to: ~/Work/<project>-wt/<task>, ~/Work/<project>-board, ~/build/<project>.
+    if env.get("OMARCHY_PROJECT"):
+        return env["OMARCHY_PROJECT"]
+    home = os.path.expanduser("~")
+    parts = cwd[len(home) + 1:].split("/") if (cwd or "").startswith(home + "/") else []
+    if len(parts) > 1 and parts[0] in PROJECT_ROOTS:
+        return re.sub(r"-(wt|board)$", "", parts[1])
+    return ""
+
+
+def started_at(start):
+    # A /proc start time in clock ticks, as seconds since the epoch.
+    try:
+        with open("/proc/stat") as f:
+            boot = next(int(line.split()[1]) for line in f if line.startswith("btime"))
+        return boot + int(start) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, StopIteration):
+        return 0
+
+
+def find_transcript(agent, started):
+    # For agents with no session file (headless workers, Codex): the transcript
+    # in their directory that began nearest to when the process started.
+    if agent["kind"] == "claude":
+        files = glob.glob(os.path.join(CLAUDE_HOME, "projects", re.sub(r"[^A-Za-z0-9]", "-", agent["cwd"] or ""), "*.jsonl"))
+    elif agent["kind"] == "codex":
+        files = glob.glob(os.path.join(CODEX_HOME, "sessions", "*", "*", "*", "rollout-*.jsonl"))
+    else:
+        return None
+    best = None
+    for path in files:
+        try:
+            if os.path.getmtime(path) < started - 5:
+                continue
+            with open(path, "rb") as f:
+                top = f.read(65536).decode(errors="replace")
+        except OSError:
+            continue
+        if agent["kind"] == "codex" and f'"cwd":"{agent["cwd"]}"' not in top:
+            continue
+        stamp = re.search(r'"timestamp":"([^"]+)"', top)
+        try:
+            began = datetime.fromisoformat(stamp.group(1).replace("Z", "+00:00")).timestamp()
+        except (AttributeError, ValueError):
+            began = os.path.getmtime(path)
+        if best is None or abs(began - started) < best[0]:
+            best = (abs(began - started), path)
+    return best[1] if best else None
+
+
+def clock(at):
+    then = datetime.fromtimestamp(at)
+    text = then.strftime("%I:%M %p").lstrip("0").lower()
+    return text if then.date() == datetime.now().date() else f"{then:%b} {then.day}, {text}"
+
+
+def load_closed():
+    out = []
+    try:
+        with open(CLOSED) as f:
+            for line in f:
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def load_seen():
+    try:
+        with open(SEEN) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def card(a):
+    # One agent as the report shows it.
+    r = a.get("reply") or a.get("prior") or {}
+    old = f" (said {ago(time.time() - r['at'])} ago)" if r.get("at") else ""
+    if a["group"] == "closed":
+        state, kind = f"closed {clock(time.time())}", "closed"
+    elif a.get("asked_at"):
+        state, kind = (r.get("verdict") or a.get("outcome") or "kept"), "kept"
+    else:
+        state = a.get("outcome") or "running"
+        kind = "working" if state in ("working", "running") or state.startswith("running") else "idle"
+    return {
+        "key": a["key"], "label": a["label"], "name": a.get("name") or a["id"], "role": a.get("role") or "",
+        "kind": a["kind"], "project": a["project"], "cwd": a["cwd"], "mb": a["total_mb"],
+        "idle": ago(a["idle_s"]) if a.get("idle_s") else "", "state": state, "class": kind,
+        "doing": r.get("doing") or a.get("purpose") or "", "left": (r.get("left") or "") + (old if r.get("left") else ""),
+        "waiting": r.get("waiting-on") or "", "vault": r.get("vault") or "", "final": a.get("last_said") or "",
+        "action": a.get("action") or "", "resume": a.get("resume") or "",
+    }
+
+
+def by_project(cards, past):
+    # Projects with live agents first, the busiest on top; no project last.
+    names = {c["project"] for c in cards} | {c["project"] for c in past}
+    live = lambda n: [c for c in cards if c["project"] == n and c["class"] != "closed"]
+    order = sorted(names, key=lambda n: (n == "", not live(n), -len(live(n)), n))
+    rank = lambda c: (c["role"] != "orchestrator", c["class"] == "closed", c["label"].lower())
+    return [(n, sorted((c for c in cards if c["project"] == n), key=rank),
+             sorted((c for c in past if c["project"] == n), key=lambda c: -c["at"])) for n in order]
+
+
+def card_lines(c):
+    lines = [("For", c["doing"]), ("Left", c["left"]), ("Waiting on", c["waiting"]), ("Vault", c["vault"]),
+             ("Last said", c["final"]), ("Sweep", c["action"]), ("Resume", c["resume"])]
+    # Whether it reached the vault matters once a session was asked or closed.
+    return [(k, v) for k, v in lines if v and v.lower() not in ("none", "nothing", "-")
+            and (k != "Vault" or c["class"] not in ("working", "idle"))]
 
 
 def question(run):
@@ -289,53 +468,84 @@ def close(agent):
     return f"closed, {window}"
 
 
-def html_report(run, rows, others):
+def html_report(run, cards, past):
     esc = lambda s: (str(s or "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    colors = {"closed": "#3fb950", "left running": "#d29922", "not asked": "#8b949e"}
 
-    def table(items):
-        head = "<tr><th>Session</th><th>Memory</th><th>Idle</th><th>Answer</th><th>Vault</th><th>Doing</th><th>Left</th><th>Waiting on</th><th>Action</th></tr>"
+    def block(c):
+        meta = " \u00b7 ".join(x for x in (c["role"], c["name"] if c["name"] != c["label"] else "", c["kind"] if c["kind"] != "claude" else "",
+                                           f"{c['mb']}M" if c.get("mb") else "", f"idle {c['idle']}" if c.get("idle") else "") if x)
         body = ""
-        for a in items:
-            r = a.get("reply") or {}
-            body += (f"<tr><td><b>{esc(a['name'])}</b><br><small>{esc(a['cwd'])}</small></td><td>{a['total_mb']}M</td>"
-                     f"<td>{ago(a.get('idle_s'))}</td><td>{esc(r.get('verdict') or a.get('outcome'))}</td>"
-                     f"<td>{esc(r.get('vault'))}</td><td>{esc(r.get('doing') or a.get('last_asked'))}</td>"
-                     f"<td>{esc(r.get('left'))}</td><td>{esc(r.get('waiting-on'))}</td>"
-                     f"<td>{esc(a.get('action'))}{'<br><code>' + esc(a['resume']) + '</code>' if a.get('resume') else ''}</td></tr>")
-        return f"<table>{head}{body}</table>"
+        for k, v in card_lines(c):
+            if k == "Last said" and (len(v) > 260 or "\n" in v):
+                v = f"<details><summary>{esc(clip(v, 240))}</summary><div class='said'>{esc(v)}</div></details>"
+            elif k == "Resume":
+                v = f"<code>{esc(v)}</code>"
+            else:
+                v = esc(v)
+            body += f"<dt>{k}</dt><dd>{v}</dd>"
+        return (f"<div class='agent {c['class']}'><div class='head'><span class='pill'>{esc(c['state'])}</span>"
+                f"<b>{esc(c['label'])}</b><span class='dim'>{esc(meta)}</span></div>"
+                f"<div class='dim cwd'>{esc(c['cwd'])}</div><dl>{body}</dl></div>")
 
     sections = ""
-    for group in ("closed", "left running", "not asked"):
-        items = [a for a in rows if a["group"] == group]
-        if items:
-            sections += f"<h2 style='color:{colors[group]}'>{group.capitalize()} ({len(items)}, {sum(a['total_mb'] for a in items)}M)</h2>{table(items)}"
-    if others:
-        sections += "<h2>Other agents (not Claude, not asked)</h2><ul>" + "".join(
-            f"<li><b>{esc(o['id'])}</b> {o['total_mb']}M, {esc(o['cwd'])}: {esc(o['what'])}</li>" for o in others) + "</ul>"
+    for name, items, gone in by_project(cards, past):
+        live = [c for c in items if c["class"] != "closed"]
+        closed = [c for c in items if c["class"] == "closed"]
+        counts = ", ".join(x for x in (f"{len(live)} running" if live else "", f"{len(closed)} closed this run" if closed else "",
+                                       f"{len(gone)} closed earlier" if gone else "") if x)
+        sections += (f"<section><h2>{esc(name or 'No project')}<span class='dim'>{counts}"
+                     f"{', ' + str(sum(c['mb'] for c in live)) + 'M' if live else ''}</span></h2>"
+                     + "".join(block(c) for c in live))
+        if closed:
+            sections += "<h3>Closed in this run</h3>" + "".join(block(c) for c in closed)
+        if gone:
+            # Board workers come and go by the dozen: folded once there are many.
+            sections += (f"<details class='gone'{' open' if len(gone) <= 4 else ''}><summary>Closed or exited in the last "
+                         f"{REPORT_HOURS:g} hours ({len(gone)})</summary>" + "".join(block(c) for c in gone) + "</details>")
+        sections += "</section>"
+    closed = [c for c in cards if c["class"] == "closed"]
+    asked = [c for c in cards if c["class"] in ("closed", "kept")]
+    top = (f"Asked {len(asked)}, closed {len(closed)}, freed about {sum(c['mb'] for c in closed)}M. "
+           f"{len(cards) - len(closed)} agents still running in {len({c['project'] for c in cards if c['class'] != 'closed'})} projects.")
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>Idle sweep {run}</title>
-<style>body{{background:#0d1117;color:#e6edf3;font:14px system-ui;margin:24px}}table{{border-collapse:collapse;width:100%;margin-bottom:24px}}
-td,th{{border:1px solid #30363d;padding:6px 8px;vertical-align:top;text-align:left}}th{{background:#161b22}}code{{color:#79c0ff;font-size:12px}}</style></head>
-<body><h1>Idle session sweep {run}</h1><p>Freed about {sum(a['total_mb'] for a in rows if a['group'] == 'closed')}M.</p>{sections}</body></html>"""
+<style>body{{background:#0d1117;color:#e6edf3;font:14px/1.45 system-ui;margin:24px auto;max-width:1100px;padding:0 16px}}
+h1{{margin-bottom:4px}}h2{{margin:0 0 10px;font-size:20px}}h3{{margin:16px 0 8px 22px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#8b949e}}
+section{{border:1px solid #30363d;border-radius:10px;padding:16px;margin:18px 0;background:#11161d}}
+.dim{{color:#8b949e;font-weight:400;font-size:12px;margin-left:10px}}.cwd{{margin:2px 0 0}}
+.agent{{margin:8px 0 8px 22px;padding:10px 12px;border-left:3px solid #8b949e;background:#161b22;border-radius:0 8px 8px 0}}
+.pill{{display:inline-block;padding:1px 9px;border-radius:10px;font-size:12px;margin-right:10px;background:#30363d}}
+.working{{border-color:#58a6ff}}.working .pill{{background:#12305a;color:#79c0ff}}
+.idle{{border-color:#8b949e}}.kept{{border-color:#d29922}}.kept .pill{{background:#4d3800;color:#e3b341}}
+.closed{{border-color:#3fb950}}.closed .pill{{background:#0f3d1c;color:#56d364}}
+.past{{border-color:#3fb950;opacity:.85}}.past .pill{{background:#0f3d1c;color:#56d364}}
+dl{{display:grid;grid-template-columns:90px 1fr;gap:3px 10px;margin:8px 0 0}}dt{{color:#8b949e}}dd{{margin:0;overflow-wrap:anywhere}}
+details summary{{cursor:pointer}}.said{{white-space:pre-wrap;margin-top:6px;padding:8px 10px;background:#0d1117;border-radius:6px}}
+.gone>summary{{margin:16px 0 8px 22px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:#8b949e}}code{{color:#79c0ff;font-size:12px}}</style></head>
+<body><h1>Idle session sweep</h1><p class="dim" style="margin-left:0">{clock(time.time())}, run {run}</p><p>{top}</p>{sections}</body></html>"""
 
 
-def md_report(run, rows, others):
+def md_report(run, cards, past):
     out = [f"# Idle session sweep {run}", ""]
-    for group in ("closed", "left running", "not asked"):
-        items = [a for a in rows if a["group"] == group]
-        if not items:
-            continue
-        out += [f"## {group.capitalize()}", ""]
-        for a in items:
-            r = a.get("reply") or {}
-            out.append(f"- **{a['name']}** {a['total_mb']}M, idle {ago(a.get('idle_s'))}, {a['cwd']}: "
-                       f"{r.get('verdict') or a.get('outcome')}; vault {r.get('vault', '-')}; "
-                       f"doing: {r.get('doing') or a.get('last_asked') or '-'}; left: {r.get('left', '-')}; "
-                       f"waiting on: {r.get('waiting-on', '-')}. {a.get('action', '')}"
-                       f"{' Resume: `' + a['resume'] + '`' if a.get('resume') else ''}")
+
+    def block(c):
+        meta = ", ".join(x for x in (c["role"], c["name"] if c["name"] != c["label"] else "", f"{c['mb']}M" if c.get("mb") else "",
+                                     f"idle {c['idle']}" if c.get("idle") else "", c["cwd"]) if x)
+        lines = [f"  - **{c['label']}** [{c['state']}] {meta}"]
+        for k, v in card_lines(c):
+            lines.append(f"    - {k}: " + (f"`{v}`" if k == "Resume" else clip(v, 600)))
+        return lines
+
+    for name, items, gone in by_project(cards, past):
+        out.append(f"- **{name or 'No project'}**")
+        for c in items:
+            out += block(c)
+        if gone:
+            out.append(f"  - Closed or exited in the last {REPORT_HOURS:g} hours:")
+            for c in gone[:10]:
+                out += ["  " + line for line in block(c)]
+            if len(gone) > 10:
+                out.append(f"    - and {len(gone) - 10} more, in the HTML report")
         out.append("")
-    if others:
-        out += ["## Other agents (not asked)", ""] + [f"- {o['id']} {o['total_mb']}M {o['cwd']}: {o['what']}" for o in others]
     return "\n".join(out) + "\n"
 
 
@@ -347,23 +557,36 @@ def main():
                                       text=True, check=True).stdout)
     mine, frozen, answers, now = ancestors(), frozen_pids(), load_answers(), time.time()
     focused = focused_pid()
-    rows, others, targets = [], [], []
+    rows, targets = [], []
     for a in found:
         if a["pid"] in mine:
             continue
-        if a["kind"] != "claude" or a["route"] != "claude-peer":
-            if a["total_mb"] >= MIN_MB:
-                first = (a.get("groups") or [{}])[0]
-                others.append({**a, "what": first.get("cmd") or first.get("leader") or a["kind"]})
-            continue
-        if a["total_mb"] < MIN_MB or (ONLY and a["name"] != ONLY):
-            continue
         s = stat(a["pid"])
+        env = proc_env(a["pid"])
+        a.update(start=s["start"] if s else "", group="not asked", project=project_of(a["cwd"], env),
+                 role=env.get("OMARCHY_AGENT_ROLE", ""), key=f"{a['pid']}:{s['start'] if s else ''}")
+        a["label"] = env.get("OMARCHY_AGENT_NAME") or a.get("name") or os.path.basename(a["cwd"] or "") or a["id"]
+        rows.append(a)
+        if a["kind"] != "claude" or a["route"] != "claude-peer":
+            # Not reachable with a question: listed with what its transcript says.
+            a["transcript"] = a.get("transcript") or find_transcript(a, started_at(a["start"]))
+            a["purpose"], a["last_said"] = summary(a["transcript"])
+            if a["kind"] == "claude" and a["transcript"]:
+                a["session_id"] = os.path.basename(a["transcript"])[:-6]
+            quiet = now - os.path.getmtime(a["transcript"]) if a["transcript"] else 0
+            a["outcome"] = f"running, quiet {ago(quiet)}" if quiet > 120 else "running"
+            if not a["purpose"]:
+                first = (a.get("groups") or [{}])[0]
+                a["purpose"] = clip(first.get("cmd") or first.get("leader") or a["kind"], 300)
+            continue
         sid = session_file(a["pid"]).get("sessionId")
-        a.update(start=s["start"] if s else "", session_id=sid, group="not asked")
-        a["last_asked"], a["last_said"] = last_said(a["transcript"])
+        a["session_id"] = sid
+        a["purpose"], a["last_said"] = summary(a["transcript"])
         prior = answers.get(sid or "")
-        if a["pid"] in frozen:
+        a["prior"] = prior
+        if a["total_mb"] < MIN_MB or (ONLY and a["name"] != ONLY):
+            a["outcome"] = "working" if a["status"] != "idle" or not a["idle_s"] else f"idle {ago(a['idle_s'])}"
+        elif a["pid"] in frozen:
             a["outcome"] = "paused by the brake"
         elif under(a["pid"], focused):
             # Kewk may be reading it; the question would land in his prompt.
@@ -374,20 +597,24 @@ def main():
             a["outcome"] = f"idle {ago(a['idle_s'])}, under {ago(limit)}"
         elif prior and now - prior["at"] < REASK and prior["verdict"] in ("working", "waiting", "no answer"):
             a["outcome"] = f"answered {prior['verdict']} {ago(now - prior['at'])} ago"
-            a["reply"] = prior
         else:
             targets.append(a)
-        rows.append(a)
 
     if CHECK:
         sys.exit(0 if targets else 1)
-    (print if DRY else log)(f"run {run}: asking {len(targets)} of {len(rows)} Claude sessions"
+    (print if DRY else log)(f"run {run}: {'report only, would ask' if REPORT else 'asking'} {len(targets)} of {len(rows)} Claude sessions"
         f" ({', '.join(a['name'] for a in targets) or 'none'})")
     if DRY:
         for a in rows:
+            if a["route"] != "claude-peer":
+                continue
             print(f"{'ask' if a in targets else 'skip':<5}{a['name']:<20}{a['total_mb']:>6}M  idle {ago(a['idle_s']):<5} {a.get('outcome', '')}")
         return
 
+    if REPORT:
+        for a in targets:
+            a["outcome"] = f"idle {ago(a['idle_s'])}, due to be asked"
+        targets = []
     threads = [threading.Thread(target=ask, args=(a, run)) for a in targets]
     for t in threads:
         t.start()
@@ -396,6 +623,7 @@ def main():
 
     for a in targets:
         r = a.get("reply")
+        a["prior"] = None
         if r:
             answers[a["session_id"] or a["name"]] = {**r, "at": time.time(), "name": a["name"]}
         elif a.get("outcome") == "no answer":
@@ -418,20 +646,55 @@ def main():
             f"{(r or {}).get('verdict') or a.get('outcome')}: {a['action']}")
     save_answers(answers)
 
+    # Sessions closed here, and ones seen by the last run that have since gone
+    # on their own, are kept so later reports still say what they finished.
+    cards = [card(a) for a in rows]
+    ledger = [c for c in load_closed() if now - c.get("at", 0) < 7 * 86400]
+    known = {c["key"] for c in ledger} | {c["key"] for c in cards}
+    for key, c in load_seen().items():
+        pid, _, start = key.partition(":")
+        # Not listed is not gone: the session running this report skips itself.
+        if key not in known and (stat(pid) or {}).get("start") != start:
+            at = os.path.getmtime(c["transcript"]) if c.get("transcript") and os.path.exists(c["transcript"]) else now
+            c["purpose_now"], c["final"] = summary(c.get("transcript"))
+            c.update(at=at, state=f"exited by {clock(at)}", action="exited on its own, not closed by the sweep")
+            c["doing"] = c.get("doing") or c.pop("purpose_now")
+            c.pop("purpose_now", None)
+            if c["kind"] == "claude" and c.get("session_id"):
+                c["resume"] = f"cd {c['cwd']} && claude --resume {c['session_id']}"
+            c["class"] = "past"
+            ledger.append(c)
+    past = [c for c in ledger if now - c["at"] < REPORT_HOURS * 3600]
+    for c in cards:
+        if c["class"] == "closed":
+            ledger.append({**c, "at": time.time(), "class": "past"})
+    tmp = CLOSED + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(json.dumps(c) + "\n" for c in ledger)
+    os.replace(tmp, CLOSED)
+    sessions = {a["key"]: a for a in rows}
+    seen = {c["key"]: {**c, "transcript": sessions[c["key"]].get("transcript"),
+                       "session_id": sessions[c["key"]].get("session_id")} for c in cards if c["class"] != "closed"}
+    tmp = SEEN + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(seen, f)
+    os.replace(tmp, SEEN)
+
     base = os.path.join(STATE, "reports", f"idle-{run}")
     with open(base + ".md", "w") as f:
-        f.write(md_report(run, rows, others))
+        f.write(md_report(run, cards, past))
     with open(base + ".html", "w") as f:
-        f.write(html_report(run, rows, others))
+        f.write(html_report(run, cards, past))
+    shutil.copyfile(base + ".html", os.path.join(STATE, "reports", "idle-latest.html"))
     closed = [a for a in rows if a["group"] == "closed"]
     left = [a for a in rows if a["group"] != "closed"]
-    summary = (f"Closed {len(closed)} ({sum(a['total_mb'] for a in closed)}M): "
+    headline = (f"Closed {len(closed)} ({sum(a['total_mb'] for a in closed)}M): "
                f"{', '.join(a['name'] for a in closed) or 'none'}. {len(left)} left running.")
-    log(f"run {run}: {summary} Report: {base}.html")
+    log(f"run {run}: {headline} Report: {base}.html")
     print(base + ".html")
     if targets and shutil.which("omarchy-notification-send"):
         subprocess.run(["omarchy-notification-send", "--glyph", MEMORY_GLYPH, "Idle Claude sessions swept",
-                        summary + " Click for the report.", "--exec", "xdg-open", base + ".html"],
+                        headline + " Click for the report.", "--exec", "xdg-open", base + ".html"],
                        capture_output=True)
 
 
