@@ -21,10 +21,66 @@ readonly dedupe_seconds=${OMARCHY_CRASH_DEDUPE_SECONDS:-60}
 # Extended regex of process names never worth announcing.
 readonly ignore_pattern=${OMARCHY_CRASH_IGNORE:-}
 
+# A crash an agent caused is that agent's to deal with: it ran the program and
+# saw it die. Those are written here instead of raising a toast, so the toasts
+# left are crashes nobody was already looking at.
+readonly agent_ledger=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agent-crashes.log
+
+# OMARCHY_CRASH_ANNOUNCE_AGENTS=1 toasts agent-caused crashes as well.
+readonly announce_agents=${OMARCHY_CRASH_ANNOUNCE_AGENTS:-}
+
+# Fields are joined on the unit separator, not a tab: tab is IFS whitespace, so
+# `read` would fold empty fields together and shift the rest left.
+readonly SEP=$'\x1f'
+
 declare -A last_notified
 
+# Print the PID of a coding agent still running in the crashed process's
+# cgroup. The agent markers in a crashed process's environment are inherited
+# for good, so they only say an agent started it. An agent that is still in the
+# same cgroup is one that is still there to deal with it.
+live_agent_in() {
+  local cgroup=$1 procs p comm
+
+  [[ $cgroup == /* && $cgroup != *..* ]] || return 1
+  procs=/sys/fs/cgroup$cgroup/cgroup.procs
+  [[ -r $procs ]] || return 1
+
+  while IFS= read -r p; do
+    comm=$(<"/proc/$p/comm") 2>/dev/null || continue
+    if [[ $comm == claude || $comm == codex ]]; then
+      echo "$p"
+      return 0
+    fi
+  done <"$procs"
+
+  return 1
+}
+
+# Record an agent-caused crash, and tell the agent when it can be told.
+hand_to_agent() {
+  local name=$1 pid=$2 exe=$3 signal=$4 owner=$5 session=$6 agent_pid=${7:-}
+
+  mkdir -p "${agent_ledger%/*}"
+  printf '%(%F %T)T\t%s\t%s\t%s\t%s\t%s\t%s\n' -1 \
+    "$name" "$signal" "$pid" "$owner" "$session" "$exe" >>"$agent_ledger"
+
+  # Only agents started through the relay can be sent to; the rest already saw
+  # the crash in their own command output. Backgrounded so a slow room never
+  # holds up the next crash.
+  [[ -n $agent_pid ]] || return 0
+  (
+    id=$(omarchy-agent-list --json 2>/dev/null |
+      jq -r --argjson pid "$agent_pid" \
+        'first(.[] | select(.pid == $pid and .relay == true) | .id) // empty' 2>/dev/null)
+    [[ -n $id ]] || exit 0
+    timeout 20 omarchy-agent-send "$id" \
+      "FYI: $name (PID $pid) that you started crashed with $signal. No action needed if you expected it; otherwise: coredumpctl info $pid" >/dev/null 2>&1
+  ) &
+}
+
 announce() {
-  local comm=$1 pid=$2 exe=$3 signal=$4
+  local comm=$1 pid=$2 exe=$3 signal=$4 body=${5:-Click to diagnose with AI}
 
   # The shell owns org.freedesktop.Notifications, so a shell crash takes the
   # notification server down with it and a toast sent into that gap is lost.
@@ -41,27 +97,38 @@ announce() {
     --urgency critical \
     --glyph "$CRASH_GLYPH" \
     "Process crashed: $comm" \
-    "Click to diagnose with AI" \
+    "$body" \
     --exec omarchy-agent-crash "$pid" "$comm" "$exe" "$signal"
 }
 
 # -n 0 so a restart does not re-announce crashes already dealt with.
-journalctl -f -n 0 -o json "MESSAGE_ID=$COREDUMP_MESSAGE_ID" 2>/dev/null |
+# --all because journalctl prints any field over 4K as null, and the crashed
+# process's environment usually is. --output-fields keeps the memory maps and
+# mount table --all would otherwise drag in out of every entry.
+journalctl -f -n 0 -o json --all \
+  --output-fields=_UID,COREDUMP_COMM,COREDUMP_PID,COREDUMP_EXE,COREDUMP_SIGNAL_NAME,COREDUMP_CGROUP,COREDUMP_ENVIRON \
+  "MESSAGE_ID=$COREDUMP_MESSAGE_ID" 2>/dev/null |
   while IFS= read -r entry; do
-    IFS=$'\t' read -r uid comm pid exe signal < <(
-      jq -r '[(._UID // "-"),
-              (.COREDUMP_COMM // "-"),
-              (.COREDUMP_PID // "-"),
-              (.COREDUMP_EXE // "-"),
-              (.COREDUMP_SIGNAL_NAME // "-")] | @tsv' <<<"$entry" 2>/dev/null
+    # An environment that is not valid text arrives as a byte array; that reads
+    # as no markers. Every field defaults to "-" so none is ever empty.
+    IFS=$SEP read -r uid comm pid exe signal cgroup agent session marked < <(
+      jq -r '
+        ((.COREDUMP_ENVIRON | strings) // "" | split("\n")) as $env
+        | def var($k): first($env[] | select(startswith($k + "=")) | .[($k | length) + 1:]) // "-";
+          [(._UID // "-"),
+           (.COREDUMP_COMM // "-"),
+           (.COREDUMP_PID // "-"),
+           (.COREDUMP_EXE // "-"),
+           (.COREDUMP_SIGNAL_NAME // "-"),
+           (.COREDUMP_CGROUP // "-"),
+           var("OMARCHY_AGENT_NAME"),
+           var("CLAUDE_CODE_SESSION_ID"),
+           (if any($env[]; test("^(CLAUDECODE=1$|OMARCHY_AGENT_NAME=|CODEX_[A-Z_]+=)")) then "yes" else "-" end)]
+        | map(tostring | gsub("[\n\u001f]"; " ") | if . == "" then "-" else . end)
+        | join("\u001f")' <<<"$entry" 2>/dev/null
     )
 
     [[ $pid =~ ^[0-9]+$ ]] || continue
-
-    # The toast only offers a diagnosis, so it has nothing to offer until an
-    # agent is chosen. Checked per crash, not at startup, so picking one takes
-    # effect without restarting this service.
-    [[ -n $(omarchy-default-agent) ]] || continue
 
     # Only this user's crashes; a daemon dumping core is a sysadmin's problem.
     [[ $uid =~ ^[0-9]+$ ]] || continue
@@ -76,11 +143,38 @@ journalctl -f -n 0 -o json "MESSAGE_ID=$COREDUMP_MESSAGE_ID" 2>/dev/null |
     # Never announce our own machinery, or it notifies about itself.
     [[ $name == omarchy-crash-* || $name == omarchy-agent-* ]] && continue
 
+    # Whose crash is it? An agent's, when the process carries an agent's
+    # environment and that agent is still running beside it; a bounty board's,
+    # when it ran inside a board service (boards run their checks with a clean
+    # environment, so the cgroup is the only trace).
+    body=
+    if [[ ${marked:-} == yes ]]; then
+      label=$agent
+      [[ $label == - ]] && label="an agent"
+      if agent_pid=$(live_agent_in "${cgroup:-}"); then
+        if [[ -z $announce_agents ]]; then
+          hand_to_agent "$name" "$pid" "$exe" "$signal" "$label" "${session:--}" "$agent_pid"
+          continue
+        fi
+      else
+        # Started by an agent that has since gone: nobody is watching it.
+        body="Started by $label, which is no longer running. Click to diagnose with AI"
+      fi
+    elif [[ ${cgroup:-} =~ /(bounty-board[^/]*)\.service$ && -z $announce_agents ]]; then
+      hand_to_agent "$name" "$pid" "$exe" "$signal" "${BASH_REMATCH[1]}" - ""
+      continue
+    fi
+
+    # The toast only offers a diagnosis, so it has nothing to offer until an
+    # agent is chosen. Checked per crash, not at startup, so picking one takes
+    # effect without restarting this service.
+    [[ -n $(omarchy-default-agent) ]] || continue
+
     now=$EPOCHSECONDS
     (((now - ${last_notified[$name]:-0}) < dedupe_seconds)) && continue
 
     # Only a delivered toast starts the dedupe window. A failed send that
     # counted would suppress the rest of a crash loop for a minute, and
     # `journalctl -n 0` never replays what was missed.
-    announce "$name" "$pid" "$exe" "$signal" && last_notified[$name]=$now
+    announce "$name" "$pid" "$exe" "$signal" ${body:+"$body"} && last_notified[$name]=$now
   done
