@@ -27,6 +27,9 @@
 #   the user answers in their own menu, once or for the rest of the session,
 #   and an allowed app connects through a socket of its own that also offers
 #   GPU buffers.
+# - Apps get no audio unless the user allows it, the same way. An allowed
+#   launch gets the user's PipeWire and PulseAudio sockets (play, record and
+#   route), which omarchy-agent-seat-run binds into that one sandbox.
 #
 # The agent drives the seat through a control socket that only this user can
 # reach and that is never mounted into the sandbox.
@@ -136,6 +139,7 @@ GPU_GLOBALS = {
   "wp_linux_drm_syncobj_manager_v1": None,
 }
 GPU_CHOICES = {"Allow once": "once", "Allow for this session": "session"}
+AUDIO_CHOICES = GPU_CHOICES
 GPU_GRANT_UNUSED_SECONDS = 300  # an allowed launch that never connects gives its socket back, after a cold start's worth
 GPU_GRANT_IDLE_SECONDS = 10  # and one whose app has gone, after a grace for apps that reconnect
 
@@ -1870,6 +1874,8 @@ class Broker:
     self.grants = []
     self.gpu_session = False  # the user allowed the GPU for the rest of this session
     self.gpu_requests = collections.deque()  # (conn, program) waiting for the user, the first one asked
+    self.audio_session = False  # the user allowed audio for the rest of this session
+    self.audio_requests = collections.deque()  # (conn, program) waiting for the user, the first one asked
     self.shots = []  # screenshots being taken
     self.refusals = [0, 0]  # when to log a refused connection again, and how many were not logged
     self.jobs = []
@@ -1949,7 +1955,7 @@ class Broker:
     from its record, before its app connects.
     """
     now = time.monotonic()
-    if self.clients or self.requests or self.jobs or self.shots or self.grants or self.gpu_requests or glob.glob(os.path.join(RUNTIME_DIR, "sandboxes", "sandbox.*")):
+    if self.clients or self.requests or self.jobs or self.shots or self.grants or self.gpu_requests or self.audio_requests or glob.glob(os.path.join(RUNTIME_DIR, "sandboxes", "sandbox.*")):
       self.busy = now
     return now - self.busy > IDLE_EXIT_SECONDS
 
@@ -2139,7 +2145,7 @@ class Broker:
       self.end_job(job)
       job.process.kill()
       self.reply(job.conn, error="The agent seat stopped")
-    for conn, _ in self.gpu_requests:
+    for conn, _ in [*self.gpu_requests, *self.audio_requests]:
       if conn.fileno() >= 0:
         self.reply(conn, error="The agent seat stopped")
     for client in list(self.clients):
@@ -2231,6 +2237,35 @@ class Broker:
     if not scope:
       raise PermissionError("The user did not allow the GPU")
     return self.grant_gpu(scope)
+
+  # Audio grants work like GPU grants. There is no socket of the broker's own:
+  # an allowed launch gets the user's PipeWire and PulseAudio sockets, bound by
+  # omarchy-agent-seat-run into that one sandbox, so the answer is all it needs.
+
+  def defer_audio(self, conn, caller, app="an app"):
+    if self.audio_session:
+      self.reply(conn, {"scope": "session"})
+      return
+    self.audio_requests.append((conn, self.program(app, caller)))
+    if len(self.audio_requests) == 1:
+      self.ask_audio()
+
+  def ask_audio(self):
+    conn, program = self.audio_requests[0]
+    self.start_job(conn, ["omarchy-menu-select", f"Let the agent's {program} use audio (play, record and route)?", *AUDIO_CHOICES, "Deny"], self.answered_audio)
+
+  def answered_audio(self, output, _):
+    self.audio_requests.popleft()
+    scope = AUDIO_CHOICES.get(output.strip())
+    if scope == "session":
+      self.audio_session = True
+      while self.audio_requests:
+        self.reply(self.audio_requests.popleft()[0], {"scope": "session"})
+    elif self.audio_requests:
+      self.ask_audio()
+    if not scope:
+      raise PermissionError("The user did not allow audio")
+    return {"scope": scope}
 
   def grant_gpu(self, scope):
     grant = Grant(self, scope)
@@ -2379,7 +2414,7 @@ class Broker:
 
   def do_status(self):
     gpu_apps = sum(1 for client in self.clients if client.grant)
-    return {"pid": os.getpid(), "apps": len(self.clients), "windows": len(self.windows), "gpu": "session" if self.gpu_session else "ask", "gpu_apps": gpu_apps}
+    return {"pid": os.getpid(), "apps": len(self.clients), "windows": len(self.windows), "gpu": "session" if self.gpu_session else "ask", "gpu_apps": gpu_apps, "audio": "session" if self.audio_session else "ask"}
 
   def defer_state(self, conn, caller, window=None):
     if window is not None:
@@ -2484,6 +2519,7 @@ class Broker:
     for pointer in client.pointers:
       client.send_event(pointer, "button", self.next_serial(), self.now(), BUTTONS[button], 1)
     self.pointer_frame(client)
+    client.flush()
     # As a compositor's implicit grab does, the surface that took the press
     # keeps the pointer until the release: every motion goes to it in its own
     # coordinates, even past its edges, and no leave ends a selection or a
@@ -2497,6 +2533,12 @@ class Broker:
             client.send_event(pointer, "motion", self.now(), x, y)
             client.pointer_positions[pointer] = (x, y)
         self.pointer_frame(client)
+        # Each step reaches the app on its own, about a frame apart, as a hand
+        # would move: toolkits merge motion that arrives in one burst, so a
+        # drag sent at once is seen as a press, one jump and a release, which
+        # is too little to move an item or open a selection rectangle.
+        client.flush()
+        time.sleep(0.016)
     finally:
       # The button always comes up, never stuck down in the app.
       for pointer in client.pointers:
