@@ -124,7 +124,7 @@ The broker speaks Wayland only, and the sandbox has none of your X11 sockets, so
 
 - **Per launch.** The X server lives in the launch's sandbox and dies with it. Two launches, or two agents' lanes, never share one, and none of them reaches yours.
 - **A path, never an abstract socket.** The sandboxes share your network namespace, and abstract Unix sockets belong to the namespace, so an X server listening on `@/tmp/.X11-unix/X0` would be reachable from your whole session, and libxcb tries that name before the path when `DISPLAY=:0`. The launcher binds `/tmp/.X11-unix/X0` in the sandbox's private `/tmp` and hands it to satellite with `-listenfd`, so nothing abstract is opened, and sets `DISPLAY=unix:/tmp/.X11-unix/X0`, which libxcb connects to by path alone. Another sandbox cannot squat the app's display name.
-- **Lazy.** A small launcher in the sandbox binds the socket and waits; satellite and Xwayland start only when the first X client connects, so an app that never opens the display costs one sleeping Python process. Chromium does open it (its GPU probing picks EGL's X11 platform once `DISPLAY` is set), which starts about 47 MB of Xwayland and satellite in its sandbox; `--no-x11` avoids that.
+- **Lazy.** A small launcher in the sandbox binds the socket and waits; satellite and Xwayland start only when the first X client connects, so an app that never opens the display costs one sleeping Python process. Chromium does open it as it starts, from its browser process and its GPU process attempts (seen with strace; the cause is unconfirmed), which starts about 47 MB of Xwayland and satellite in its sandbox; `--no-x11` avoids that.
 - **The GPU as granted.** With `--gpu`, Xwayland uses the GPU (glamor) through the launch's GPU socket. Without it, Xwayland draws in software and is told to load only Mesa's EGL: NVIDIA's EGL crashes Xwayland when no GPU device exists.
 
 ### The clipboard is yours
@@ -217,6 +217,7 @@ Agent apps share your network namespace, so besides the internet they reach ever
 - **No clipboard protection once you step in.** An app reads your clipboard while your keyboard is in it and you acted last.
 - **No VM.** bubblewrap is namespaces: the apps share your kernel.
 - **No box around the agent.** The agent runs as you, under its harness's permission rules. The seat boxes the apps it drives.
+- **No X11 popup pixels while the seat is hidden.** An X app's menus open and take keys and clicks, but while the seat's workspace is off screen a seat screenshot shows them black: Xwayland copies a window into its Wayland buffer only on a frame callback, and Hyprland holds those for surfaces it does not show (Wayland apps draw straight into the shared memory the broker reads). The main windows update; popups stay at their first, empty commit.
 - **No Wine menu bar from the agent's pointer yet.** In WineMine, clicks reach the game board but the menu bar does not open, and no popup window is created; dialogs and buttons are untested. Ask the user, or use the app's keyboard shortcuts.
 - **One X server per launch.** X apps started from different launches cannot see each other's windows, by design.
 - **No GPU unless the user allows it.** Apps draw in software; one launched with `--gpu` gets the GPU only after the user's yes, and its screenshots come from Hyprland.
