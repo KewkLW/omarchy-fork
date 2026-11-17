@@ -182,13 +182,18 @@ run_headless() {
 # binding its directory would hand all of that to the sandbox.
 cat >"$test_dir/probe" <<'EOF'
 #!/bin/bash
-out=$1 scratch=$2 test_dir=$3 real_home=$4 real_runtime=$5 signature=$6
+out=$1 scratch=$2 test_dir=$3 real_home=$4 real_runtime=$5 signature=$6 host_x11=$7
 {
   [[ -e $HOME/canary || -e $test_dir/home/canary ]] && echo "home visible"
   [[ -e $real_home ]] && echo "user home visible"
   [[ -e /run/user ]] && echo "/run/user visible"
   [[ -e $real_runtime ]] && echo "real runtime visible"
-  [[ -e /tmp/.X11-unix ]] && echo "X11 visible"
+  # The sandbox's X socket is its own, never the user's.
+  [[ -n $host_x11 && $(stat -c %d:%i /tmp/.X11-unix/X0 2>/dev/null) == "$host_x11" ]] && echo "X11 visible"
+  echo "x11: $(ls -A /tmp/.X11-unix 2>/dev/null | tr '\n' ' ')"
+  echo "display: ${DISPLAY:-}"
+  # Started only once an X client connects; this probe is not one.
+  pgrep -x xwayland-satell >/dev/null && echo "X server running before any X client"
   [[ -e $XDG_RUNTIME_DIR/hypr || -e $real_runtime/hypr ]] && echo "hypr visible"
   [[ -e $XDG_RUNTIME_DIR/bus || -e $real_runtime/bus ]] && echo "D-Bus visible"
   [[ -e $XDG_RUNTIME_DIR/keyring || -e $real_runtime/keyring/control ]] && echo "keyring visible"
@@ -205,19 +210,42 @@ out=$1 scratch=$2 test_dir=$3 real_home=$4 real_runtime=$5 signature=$6
 EOF
 chmod +x "$test_dir/probe"
 
+# The user's own X socket, to tell it from the sandbox's.
+host_x11=$(stat -c %d:%i /tmp/.X11-unix/X0 2>/dev/null)
 run_headless --share "$test_dir/out" --share-ro "$test_dir/scratch" "$test_dir/probe" \
-  "$test_dir/out" "$test_dir/scratch" "$test_dir" "$real_home" "$real_runtime" "${HYPRLAND_INSTANCE_SIGNATURE:-}" ||
+  "$test_dir/out" "$test_dir/scratch" "$test_dir" "$real_home" "$real_runtime" "${HYPRLAND_INSTANCE_SIGNATURE:-}" "$host_x11" ||
   fail "a headless probe runs in the sandbox" "$(cat "$seat/apps.log" 2>/dev/null)"
 result=$(cat "$test_dir/out/result" 2>/dev/null)
 [[ $result == *"done"* ]] || fail "the probe reports back through a shared directory" "$result $(cat "$seat/apps.log" 2>/dev/null)"
 pass "a shared directory is writable from the sandbox"
 
 for leak in "home visible" "user home visible" "/run/user visible" "real runtime visible" "X11 visible" \
-  "hypr visible" "D-Bus visible" "keyring visible" "Hyprland signature set" "hyprctl reaches Hyprland"; do
+  "hypr visible" "D-Bus visible" "keyring visible" "Hyprland signature set" "hyprctl reaches Hyprland" \
+  "X server running before any X client"; do
   [[ $result != *"$leak"* ]] || fail "the sandbox hides the user's session: $leak" "$result"
 done
 grep -qx "runtime: agent-bus wayland-0 " <<<"$result" || fail "the sandbox's runtime directory holds only the broker socket and its private bus" "$result"
 pass "the sandbox sees no home, X11, Hyprland, D-Bus or keyring, and only the broker socket and its private bus"
+
+if [[ -x /usr/bin/xwayland-satellite && -x /usr/bin/Xwayland ]]; then
+  # By path, so libxcb never tries an abstract socket, which the shared
+  # network namespace would let any other sandbox bind first.
+  grep -qx "display: unix:/tmp/.X11-unix/X0" <<<"$result" || fail "X11 apps get the sandbox's own X socket, named by its path" "$result"
+  grep -qx "x11: X0 " <<<"$result" || fail "the sandbox's X socket directory holds only its own socket" "$result"
+  pass "X11 apps get an X server of the sandbox's own, by path, started only when a client connects"
+
+  mv "$test_dir/out/result" "$test_dir/out/result.first"
+  run_headless --no-x11 --share "$test_dir/out" "$test_dir/probe" \
+    "$test_dir/out" "$test_dir/scratch" "$test_dir" "$real_home" "$real_runtime" "" "$host_x11" ||
+    fail "a --no-x11 probe runs in the sandbox" "$(cat "$seat/apps.log" 2>/dev/null)"
+  no_x11=$(cat "$test_dir/out/result" 2>/dev/null)
+  grep -qx "display: " <<<"$no_x11" && grep -qx "x11: " <<<"$no_x11" || fail "--no-x11 leaves the X server out" "$no_x11"
+  mv "$test_dir/out/result.first" "$test_dir/out/result"
+  pass "--no-x11 leaves the X server out"
+else
+  grep -qx "display: " <<<"$result" || fail "without xwayland-satellite the sandbox has no DISPLAY" "$result"
+  skip "xwayland-satellite is not installed; skipping the sandbox's own X server"
+fi
 
 [[ $result != *"probe directory visible"* ]] || fail "a program outside /usr gets only its own file" "$result"
 pass "a program outside /usr gets only its own file, not its directory"

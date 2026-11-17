@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # omarchy:summary=Launch a sandboxed app on the agent seat and print its agent window number
-# omarchy:args=[--no-wait] [--gpu] [--audio] [--cdp] [--share <path>] [--share-ro <path>] <command> [args...]
-# omarchy:examples=omarchy agent seat run chromium https://omarchy.org | omarchy agent seat run foot | omarchy agent seat run --gpu vkcube | omarchy agent seat run --share ~/Projects/site chromium ~/Projects/site/index.html
+# omarchy:args=[--no-wait] [--gpu] [--audio] [--cdp] [--no-x11] [--share <path>] [--share-ro <path>] <command> [args...]
+# omarchy:examples=omarchy agent seat run chromium https://omarchy.org | omarchy agent seat run foot | omarchy agent seat run winecfg | omarchy agent seat run --gpu vkcube | omarchy agent seat run --share ~/Projects/site chromium ~/Projects/site/index.html
 
 # The app runs in a bubblewrap sandbox whose only way to the desktop is the
 # agent seat broker. It gets no Hyprland IPC, no user Wayland or X11 socket, no
@@ -25,6 +25,19 @@
 # does the app get the user's PipeWire socket and PulseAudio socket, so it can
 # play, record and route audio like any of the user's own apps (patchbays,
 # DAWs, players). Without --audio the sandbox has no audio at all.
+#
+# X11 apps (Java apps such as Bitwig, Wine, older toolkits) get an X server
+# of their own: xwayland-satellite, run inside this one sandbox against the
+# broker's socket, so each X window is an ordinary seat window that the
+# agent's pointer, keyboard and screenshots reach. It listens only on a socket
+# in the sandbox's private /tmp, never on an abstract one, which the shared
+# network namespace would hand to the whole machine; DISPLAY names that socket
+# by its path, so no X client looks for an abstract socket that another
+# sandbox could have bound under the same name. It starts only when an X
+# client first connects, so an app that never opens the display pays for one
+# sleeping process (Chromium opens it as it starts). Each launch has
+# its own: two launches, or two agents' lanes, never share an X server, and
+# the user's own X server stays out of reach. --no-x11 leaves it out.
 #
 # --cdp starts a Chromium or Electron app with its DevTools protocol on a free
 # localhost port, which omarchy agent seat ui reads its page through.
@@ -189,6 +202,7 @@ wait_for_window=true
 gpu=false
 audio=false
 cdp=false
+x11=true
 shares=()
 while [[ $1 == --* ]]; do
   case $1 in
@@ -196,6 +210,7 @@ while [[ $1 == --* ]]; do
     --gpu) gpu=true ;;
     --audio) audio=true ;;
     --cdp) cdp=true ;;
+    --no-x11) x11=false ;;
     --share | --share-ro)
       if ! path=$(realpath -e -- "${2:-}" 2>/dev/null); then
         echo "Nothing to share at ${2:-(no path given)}" >&2
@@ -242,7 +257,7 @@ while [[ $1 == --* ]]; do
 done
 
 if (($# == 0)); then
-  echo "Usage: omarchy agent seat run [--no-wait] [--gpu] [--audio] [--cdp] [--share <path>] [--share-ro <path>] <command> [args...]" >&2
+  echo "Usage: omarchy agent seat run [--no-wait] [--gpu] [--audio] [--cdp] [--no-x11] [--share <path>] [--share-ro <path>] <command> [args...]" >&2
   exit 1
 fi
 
@@ -523,6 +538,52 @@ if [[ $cdp == "true" ]]; then
   echo "$port" >"$session/cdp-port"
   set -- "$@" "--remote-debugging-port=$port"
 fi
+# The X server for X11 apps, from inside the sandbox: the app's command runs
+# behind a small launcher that binds the private socket, hands its waiting to
+# a process of its own, which becomes xwayland-satellite once the first X
+# client knocks, and then becomes the app with DISPLAY set. That process is
+# orphaned to the sandbox's init at once, so the app never finds it among its
+# own children, and it ends with the sandbox like everything else in it.
+# Without the GPU, Xwayland draws in software and loads only Mesa's EGL:
+# NVIDIA's crashes it when no GPU device is there.
+if [[ $x11 == "true" && -x /usr/bin/xwayland-satellite && -x /usr/bin/Xwayland && -x /usr/bin/python3 ]]; then
+  x11_launcher='
+import os, select, socket, sys
+
+gpu, command = sys.argv[1] == "gpu", sys.argv[3:]
+try:
+  os.makedirs("/tmp/.X11-unix", exist_ok=True)
+  os.chmod("/tmp/.X11-unix", 0o1777)
+  server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+  server.bind("/tmp/.X11-unix/X0")
+  server.listen(64)
+except OSError as error:
+  print(f"agent-seat: no X server for this app: {error}", file=sys.stderr, flush=True)
+else:
+  child = os.fork()
+  if child == 0:
+    try:
+      if os.fork() == 0:
+        select.select([server], [], [])
+        os.set_inheritable(server.fileno(), True)
+        environment = dict(os.environ)
+        if not gpu:
+          environment.update(XWAYLAND_NO_GLAMOR="1", __EGL_VENDOR_LIBRARY_FILENAMES="/usr/share/glvnd/egl_vendor.d/50_mesa.json")
+        os.execve("/usr/bin/xwayland-satellite", ["xwayland-satellite", ":0", "-listenfd", str(server.fileno())], environment)
+    finally:
+      os._exit(1)
+  os.waitpid(child, 0)
+  server.close()
+  os.environ["DISPLAY"] = "unix:/tmp/.X11-unix/X0"
+try:
+  os.execvp(command[0], command)
+except OSError as error:
+  print(f"agent-seat: {command[0]}: {error.strerror}", file=sys.stderr, flush=True)
+  sys.exit(127)
+'
+  set -- /usr/bin/python3 -I -c "$x11_launcher" "$([[ $gpu == "true" ]] && echo gpu || echo software)" -- "$@"
+fi
+
 # The supervisor passes the pinned files on to bwrap, which mounts them and
 # closes them before the app starts; this launch needs them no longer.
 setsid "$sandbox_supervisor" "$record" "$marker" "${sandbox[@]}" -- "$@" >>"$runtime/apps.log" 2>&1 8>&- 9>&- &

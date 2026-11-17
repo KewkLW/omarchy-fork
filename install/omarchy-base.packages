@@ -145,6 +145,7 @@ xdg-desktop-portal-gtk
 xdg-desktop-portal-hyprland
 xdg-terminal-exec
 xournalpp
+xwayland-satellite
 yaru-icon-theme
 yay
 yt-dlp

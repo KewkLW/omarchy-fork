@@ -43,6 +43,10 @@ Apps get no GPU by default. For one that needs it (a game engine, a 3D tool, a V
 
 Screenshots of a GPU app come from Hyprland rather than the app's own buffers, so menus that open outside its window may be missing from them. GPU-drawn apps rarely have an accessibility tree; expect to work from screenshots.
 
+## X11 apps
+
+X11-only apps (Bitwig and other Java apps, Wine and Proton, older toolkits) work like any seat app: each launch gets an X server of its own inside its sandbox, started when the app first opens the display, and its windows take your pointer, keyboard and screenshots. Nothing to pass: `omarchy agent seat run winecfg`, `omarchy agent seat run --audio --gpu --share ~/.BitwigStudio bitwig-studio`. Give a Windows app a prefix of its own with `env`, since the sandbox starts from an empty environment: `omarchy agent seat run env WINEPREFIX=$HOME/.wine-myapp winecfg` (the prefix lives in your lane's home). Its X server ends when the app's sandbox does, and X apps from different launches cannot see each other. `--no-x11` leaves the X server out. Wine's menu bar does not open from your pointer yet; use the app's keyboard shortcuts or ask the user.
+
 ## Your files
 
 The sandbox sees none of the user's files unless you share them: `--share <path>` read-write, `--share-ro <path>` read-only, repeatable, each at the same path inside. `omarchy agent seat run --gpu --share ~/Projects/game ~/Projects/game/Editor`. The seat asks nothing about this itself; sharing is part of your command, so your own permission rules decide it, the same as for files you touch directly. Share only what the app needs. The seat refuses shares that would undo the sandbox: `/`, the user's home or `/tmp` as a whole, `$XDG_RUNTIME_DIR` and `/run/user`, `/proc`, `/dev`, any directory holding one of those, and anything inside `~/.config`, `~/.ssh`, `~/.gnupg` or `~/.local/share/keyrings`, including where those link to.
