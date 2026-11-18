@@ -116,6 +116,9 @@ crush)
   fi
   ;;
 claude)
+  # Pre-answer Claude Code's folder-trust dialog for the folder it starts in (repo root or worktree), on both
+  # accounts, so spawned agents never stall on "do you trust this folder" (claude-trust, ~/.local/bin).
+  command -v claude-trust >/dev/null && claude-trust --quiet "$PWD" >/dev/null 2>&1
   command=(claude --dangerously-skip-permissions)
   [[ -n ${prompt:-} ]] && command+=(-- "$prompt")
   ;;
