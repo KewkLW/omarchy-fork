@@ -111,6 +111,7 @@ Resizing uses the two keys right of 0, whatever your keyboard prints on them: `-
 | `Super + Ctrl + D`           | Display panel    |
 | `Super + Ctrl + P`           | Power panel    |
 | `Super + Ctrl + X`           | Agents panel    |
+| `Super + Ctrl + Alt + X`           | Jump to the agent seat    |
 | `Super + Ctrl + Alt + D`           | Calendar panel    |
 | `Super + Ctrl + Alt + E`           | World clock panel    |
 | `Super + Ctrl + 1-9`           | Toggle bar panel by position    |
@@ -123,7 +124,6 @@ Resizing uses the two keys right of 0, whatever your keyboard prints on them: `-
 | `Super + Shift + Ctrl + A` | Start your default agent |
 | `Power` key | System menu |
 | `Super + Shift + Copilot` key | Omarchy menu |
-| `Super + Ctrl + Alt + A` | Jump to the agent seat |
 
 ## Adjustments
 
