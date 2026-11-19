@@ -1,0 +1,148 @@
+#!/bin/bash
+
+# TEMP herald (scratch branch only, never upstream): screenshots of this
+# checkout's visible changes in the CI VM, run by test/ci-vm in place of the
+# tests. Every shot writes a PNG or a reason, and the script always exits 0.
+
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/shell.d/base-test.sh"
+set +e +u
+set +o pipefail
+
+OUT="$HOME/shell-logs/herald"
+mkdir -p "$OUT"
+log() { printf 'herald: %s\n' "$*" | tee -a "$OUT/log.txt"; }
+reason() { printf '%s\n' "$2" >"$OUT/$1.reason.txt"; log "no $1: $2"; }
+shot() {
+  local name="$1"
+  if grim "$OUT/$name.png" 2>>"$OUT/log.txt"; then
+    log "shot $name.png"
+  else
+    reason "$name" "grim failed"
+  fi
+}
+
+session_path=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OMARCHY_PATH=//p' | tail -n 1)
+log "root $ROOT, session OMARCHY_PATH ${session_path:-unset}, $(hyprctl version | head -n 1)"
+log "monitors $(hyprctl monitors -j | jq -c '[.[] | {name, width, height, scale, ws: .activeWorkspace.id}]')"
+
+# One shell on screen, this checkout's: the session's own shell (the
+# release's) is stopped with its launcher, and a scratch shell of this
+# checkout takes over the bar, the menu and the notifications.
+pkill -f omarchy-launch-shell
+[[ -n $session_path ]] && timeout 30 quickshell kill -p "$session_path/shell" --any-display >/dev/null 2>&1
+sleep 1
+log "quickshell after stopping the session's: $(quickshell list -a -j 2>&1 | jq -c '[.[].config_path]' 2>&1)"
+
+setup_scratch_shell
+# The VM user's theme and shell settings, so the scratch shell looks as the
+# session's does.
+mkdir -p "$SCRATCH_HOME/.local/state/omarchy" "$SCRATCH_HOME/.config"
+cp -a "$HOME/.local/state/omarchy/current" "$SCRATCH_HOME/.local/state/omarchy/" 2>>"$OUT/log.txt"
+cp -a "$HOME/.config/omarchy" "$SCRATCH_HOME/.config/" 2>>"$OUT/log.txt"
+log "seeded theme: $(readlink "$SCRATCH_HOME/.local/state/omarchy/current/theme" 2>&1)"
+start_scratch_shell
+shell_up=""
+for _ in {1..150}; do
+  [[ $(scratch_ipc shell ping 2>/dev/null || true) == "ok" ]] && { shell_up=1; break; }
+  kill -0 "$SCRATCH_PID" 2>/dev/null || break
+  sleep 0.2
+done
+log "scratch shell answers: ${shell_up:-no}"
+sleep 3
+log "org.freedesktop.Notifications owner pid: $(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetConnectionUnixProcessID s org.freedesktop.Notifications 2>&1), scratch shell pid $SCRATCH_PID"
+
+# Opens the scratch shell's menu at <route> and waits for it to map.
+summon_menu() {
+  local route="$1"
+  for _ in {1..80}; do
+    [[ $(scratch_ipc shell summon omarchy.menu "{\"menu\":\"$route\"}" 2>/dev/null || true) == "ok" ]] && break
+    sleep 0.1
+  done
+  wait_scratch_layer omarchy-menu mapped
+}
+hide_menu() {
+  scratch_ipc_quiet shell hide omarchy.menu >/dev/null 2>&1 || true
+  wait_scratch_layer omarchy-menu absent
+}
+# Shot of the menu at <route>, plain, then filtered by typing <filter>.
+menu_shots() {
+  local name="$1" route="$2" filter="$3"
+  scratch_ipc_quiet shell call omarchy.menu refresh '{}' >/dev/null 2>&1
+  sleep 0.5
+  if summon_menu "$route"; then
+    sleep 1.5
+    shot "$name"
+    if [[ -n $filter ]] && command -v wtype >/dev/null; then
+      wtype "$filter"
+      sleep 1.5
+      shot "$name-filtered"
+    fi
+  else
+    reason "$name" "the menu at $route did not map"
+  fi
+  hide_menu
+  sleep 0.5
+}
+
+capture_main() {
+  # This checkout's Hyprland rules in the session's Hyprland: its modules
+  # ahead of the release's on the module path, then a reload.
+  local cfg="$HOME/.config/hypr/hyprland.lua"
+  cp "$cfg" "$OUT/hyprland.lua.orig"
+  sed -i "/bootstrap.lua/a package.path = \"$ROOT/?.lua;\" .. package.path" "$cfg"
+  hyprctl reload >>"$OUT/log.txt" 2>&1
+  sleep 2
+  local errors
+  errors=$(hyprctl configerrors 2>&1)
+  log "configerrors after reload: $errors"
+  log "package.path: $(hyprctl repl 'return package.path' 2>&1 | head -c 400)"
+
+  # A GTK app on the seat, through the seat's own run command.
+  local program='
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+window = Gtk.Window(title="Agent seat app")
+window.set_default_size(640, 360)
+label = Gtk.Label(label="An app on the agent seat.\nThe agent drives it with its own pointer and keyboard.")
+window.add(label)
+window.connect("destroy", Gtk.main_quit)
+window.show_all()
+Gtk.main()
+'
+  local window
+  window=$(OMARCHY_PATH="$ROOT" PATH="$ROOT/bin:$PATH" omarchy-agent-seat-run /usr/bin/python3 -c "$program" 2>>"$OUT/log.txt")
+  log "seat window: '$window'"
+  sleep 2
+  local clients agent
+  clients=$(hyprctl clients -j)
+  agent=$(jq -c '[.[] | select(.class | test("^agent-[0-9]+")) | {class, title, tags, ws: .workspace.id, address}][0] // empty' <<<"$clients")
+  log "agent client: ${agent:-none}"
+
+  # The Agent menu with the seat running: "Agent Seat" and "Stop Agent Seat".
+  menu_shots agent-menu-seat-rows agent "Seat"
+
+  local ws
+  ws=$(jq -r '.ws // empty' <<<"$agent")
+  local trimmed=${errors//[[:space:]]/}
+  if [[ -n $agent && -n $ws && ( -z $trimmed || $errors == *"no errors"* ) ]] && jq -e '.tags | any(test("^agent-seat"))' <<<"$agent" >/dev/null 2>&1; then
+    hyprctl dispatch workspace "$ws" >>"$OUT/log.txt" 2>&1
+    sleep 1.5
+    shot agent-window-outlined
+  else
+    reason agent-window-outlined "no agent window tagged agent-seat on a workspace, or config errors: ${agent:-none} / $errors"
+  fi
+
+  OMARCHY_PATH="$ROOT" PATH="$ROOT/bin:$PATH" omarchy-agent-seat-stop >>"$OUT/log.txt" 2>&1
+  cp "$OUT/hyprland.lua.orig" "$cfg"
+}
+
+capture_main
+
+hide_menu
+stop_scratch_shell
+log "scratch shell log tail:"
+tail -n 40 "$SCRATCH_LOG" >>"$OUT/log.txt" 2>&1
+cp "$SCRATCH_LOG" "$OUT/quickshell.log" 2>/dev/null
+ls -la "$OUT" >>"$OUT/log.txt"
+exit 0
