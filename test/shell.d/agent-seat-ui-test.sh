@@ -351,9 +351,12 @@ Gtk.main()
   [[ $(seat omarchy-agent-seat-ui "$window" --json | jq -r '.source') == "atspi" ]] || fail "a GTK window is read over AT-SPI"
   pass "ui reads a GTK window's accessibility tree over the private bus"
 
-  # The button's centre, in screenshot pixels, must be on the button.
+  # The button's centre, in screenshot pixels, must be on the button. The
+  # button spans the window less the box's 20-unit margins, so in screenshot
+  # pixels it starts 20 x scale in and is (width - 40) x scale wide, give or
+  # take rounding: at scale 1 that is also its size in surface units.
   button=$(seat omarchy-agent-seat-ui "$window" --find Fill --json) || true
-  jq -e --argjson state "$state" '($state[0].size | map(. * $state[0].scale)) as [$width, $height] | .x > .box[0] and .x < .box[0] + .box[2] and .box[0] + .box[2] <= $width and .box[1] + .box[3] <= $height and .box[2] > $state[0].size[0]' <<<"$button" >/dev/null || fail "ui positions are in screenshot pixels" "$button $state"
+  jq -e --argjson state "$state" '$state[0] as $s | ($s.size | map(. * $s.scale)) as [$width, $height] | def near($want): (. - $want | fabs) <= 2; .x > .box[0] and .x < .box[0] + .box[2] and .box[0] + .box[2] <= $width and .box[1] + .box[3] <= $height and (.box[0] | near(20 * $s.scale)) and (.box[2] | near(($s.size[0] - 40) * $s.scale))' <<<"$button" >/dev/null || fail "ui positions are in screenshot pixels" "$button $state"
   pass "ui positions controls in screenshot pixels"
 
   seat omarchy-agent-seat-click-ui "$window" "Fill" >/dev/null || fail "click-ui clicks a button by name"
