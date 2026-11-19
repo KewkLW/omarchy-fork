@@ -11,6 +11,15 @@ require_command python3
 require_command jq
 require_command xkbcli
 
+# The timed checks below each take the fastest of several runs and compare
+# two paths timed together, their slack scaled to this machine; on one over
+# 8x slower than the reference laptop they are left out (docs/testing.md).
+SPEED_PERCENT=$(process_speed_percent)
+export SPEED_PERCENT
+timed_checks() {
+  (( SPEED_PERCENT <= 800 ))
+}
+
 test_dir=$(mktemp -d)
 mkdir -p "$test_dir/bin" "$test_dir/runtime" "$test_dir/home"
 
@@ -828,8 +837,10 @@ class Seat:
         opcode = next(i for i, m in enumerate(table) if m[0] == name)
         data, fds = broker.encode(object_id, opcode, table[opcode][1], args)
         if kind == "requests":
+            # Each request a read of its own, ended as pump() ends one.
             self.client.down.infds.extend(os.dup(fd) for fd in fds)
             self.client.request(object_id, opcode, data)
+            self.client.copy_pixels()
         else:
             self.client.up.infds.extend(os.dup(fd) for fd in fds)
             self.client.event(object_id, opcode, data)
@@ -838,8 +849,8 @@ class Seat:
         self.send("requests", object_id, name, *args)
 
     def pump_requests(self, *requests):
-        """Send several requests as one batch through pump(), so _flush_stale
-        runs at the batch end as it does in production."""
+        """Send several requests as the app does, for the broker to take in
+        one read through pump(); at most 64 KiB of them."""
         buf = b""
         for object_id, name, *args in requests:
             table = broker.PROTOCOLS[self.client.objects[object_id][0]]["requests"]
@@ -919,6 +930,16 @@ RED, GREEN, BLUE, WHITE = b"\x00\x00\xff\xff", b"\x00\xff\x00\xff", b"\xff\x00\x
 def check(problems, what, got, want):
     if got != want:
         problems.append(f"{what}: got {got!r}, want {want!r}")
+
+SPEED = int(os.environ.get("SPEED_PERCENT", "100")) / 100  # process_speed_percent, as a factor
+
+def timing(problems, what, ok):
+    """A timing check, left out on a machine over 8x slower than the reference laptop."""
+    if SPEED <= 8:
+        check(problems, what, ok, True)
+
+def fastest(run, times=3):
+    return min(run() for _ in range(times))
 
 def forwarded(seat, *names):
     """The arguments of each named request the broker passed on to Hyprland, by name."""
@@ -1791,14 +1812,14 @@ def commit_storm(seat, problems):
         for _ in range(commits):
             seat.request(surface, "commit")
         return time.monotonic() - start
-    lone = timed(50)
+    lone = fastest(lambda: timed(50))
     for name, surface in (("a window of 604 subsurfaces", 20), ("a window of 256 desynchronized subsurfaces with frames under them", 30), ("the leaf of 800 nested subsurfaces", parent), ("the leaf of 800 nested desynchronized subsurfaces", parent)):
         if "desynchronized subsurfaces" in name and surface == parent:
             for i in range(800):
                 seat.request(12001 + 2 * i, "set_desync")
             seat.queued("requests")
-        took = timed(surface)
-        check(problems, f"4096 commits of {name} took {took:.3f}s against {lone:.3f}s for a lone window", took < 3 * lone + 0.05, True)
+        took = fastest(lambda: timed(surface))
+        timing(problems, f"4096 commits of {name} took {took:.3f}s against {lone:.3f}s for a lone window", took < 3 * lone + 0.05 * SPEED)
 
 def subsurface_caps(seat, problems):
     # Beside 3900 other surfaces, making and destroying subsurfaces costs
@@ -1815,11 +1836,11 @@ def subsurface_caps(seat, problems):
             seat.queued("requests")
             seat.event(1, "delete_id", 300000)  # as Hyprland frees the id
         return time.monotonic() - start
-    alone = cycles()
+    alone = fastest(cycles)
     for i in range(3900):
         seat.request(COMPOSITOR, "create_surface", 200000 + i)
-    beside = cycles()
-    check(problems, f"4000 subsurfaces made and destroyed beside 3900 surfaces took {beside:.3f}s against {alone:.3f}s", beside < 3 * alone + 0.02, True)
+    beside = fastest(cycles)
+    timing(problems, f"4000 subsurfaces made and destroyed beside 3900 surfaces took {beside:.3f}s against {alone:.3f}s", beside < 3 * alone + 0.02 * SPEED)
     seat.queued("requests")
     seat.queued("events")
     for i in range(3900):
@@ -1969,9 +1990,9 @@ def big_backlog(seat, problems):
     drain(64)
     small = broker.MAX_TYPE_EVENTS // 16
     alone = drain(small)
-    bound = 3 * 16 * alone + 0.1
+    bound = 3 * 16 * alone + 0.1 * SPEED
     took = drain(broker.MAX_TYPE_EVENTS, bound)
-    check(problems, f"sending {broker.MAX_TYPE_EVENTS} characters took {took:.3f}s, at most 3 x 16 x {alone:.3f}s ({small} characters) + 0.1", took <= bound, True)
+    timing(problems, f"sending {broker.MAX_TYPE_EVENTS} characters took {took:.3f}s, at most 3 x 16 x {alone:.3f}s ({small} characters) + {0.1 * SPEED:.2f}", took <= bound)
 
     # An app that reads as fast as the broker sends: one pass still sends
     # about FLUSH_BYTES and serves the other app, leaving the rest queued.
@@ -2017,114 +2038,189 @@ def shm_formats(seat, problems):
     os.close(memory)
 
 def snapshot_stall(seat, problems):
-    # After a screenshot, bare commits of a large buffer stay cheap: the
-    # first commit copies the pixels, and subsequent bare commits reuse
-    # that copy instead of reading the pool again.
+    # After a screenshot, a storm of commits of a 3072x2048 buffer in one
+    # read copies it once, not once a commit: bare commits, attach and
+    # commit, damage and commit, and two buffers taking turns. Each
+    # screenshot after shows the frame committed last, not what the app
+    # drew after the read.
     seat.window(20, 21, 22)
     W, H = 3072, 2048
-    pool_id, buffer_id = seat.next_pool + 1, seat.next_pool + 2
-    seat.next_pool += 2
-    memory = os.memfd_create("big")
-    os.ftruncate(memory, W * H * 4)
-    os.pwrite(memory, RED * W * H, 0)
-    seat.request(SHM, "create_pool", pool_id, memory, W * H * 4)
-    seat.request(pool_id, "create_buffer", buffer_id, 0, W, H, W * 4, XRGB)
-    seat.request(20, "attach", buffer_id, 0, 0)
+    memories, buffers = [], []
+    for colour in (RED, GREEN):
+        pool, buffer = seat.next_pool + 1, seat.next_pool + 2
+        seat.next_pool += 2
+        memory = os.memfd_create("big")
+        os.ftruncate(memory, W * H * 4)
+        os.pwrite(memory, colour * W * H, 0)
+        seat.request(SHM, "create_pool", pool, memory, W * H * 4)
+        seat.request(pool, "create_buffer", buffer, 0, W, H, W * 4, XRGB)
+        memories.append(memory)
+        buffers.append(buffer)
+    seat.request(20, "attach", buffers[0], 0, 0)
     seat.request(20, "commit")
+    copies = []
+    snapshot = seat.client.snapshot
+    seat.client.snapshot = lambda surface, buffer: copies.append(surface) or snapshot(surface, buffer)
 
-    seat.window(30, 31, 32)
-    seat.draw(30, 4, 4, RED)
+    def storm(name, requests, want):
+        seat.client.capture(22)
+        copies.clear()
+        seat.pump_requests(*requests)
+        for memory in memories:
+            os.pwrite(memory, BLUE * W * H, 0)
+        check(problems, f"copies of {name}", len(copies), 1)
+        check(problems, f"a screenshot after {name}", seat.pixel(22, 0, 0), want)
+        for memory, colour in zip(memories, (RED, GREEN)):
+            os.pwrite(memory, colour * W * H, 0)
 
-    COMMITS = 8192
-    def timed(surface, toplevel, reattach=None):
-        seat.client.capture(toplevel)
-        start = time.monotonic()
-        for _ in range(COMMITS):
-            if reattach is not None:
-                seat.request(surface, "attach", reattach, 0, 0)
-            seat.request(surface, "commit")
-        return time.monotonic() - start
+    storm("8192 bare commits", [(20, "commit")] * 8192, "ff0000")
+    storm("2048 attaches and commits", [(20, "attach", buffers[0], 0, 0), (20, "commit")] * 2048, "ff0000")
+    storm("2048 damages and commits", [(20, "damage_buffer", 0, 0, W, H), (20, "commit")] * 2048, "ff0000")
+    storm("1024 commits of two buffers in turn", [(20, "attach", buffers[0], 0, 0), (20, "commit"), (20, "attach", buffers[1], 0, 0), (20, "commit")] * 1024, "00ff00")
+    seat.client.snapshot = snapshot
+    for memory in memories:
+        os.close(memory)
 
-    small = min(timed(30, 32) for _ in range(3))
-    big = min(timed(20, 22) for _ in range(3))
-    check(problems, f"{COMMITS} commits of a {W}x{H} buffer took {big:.3f}s against {small:.3f}s for 4x4",
-          big < 3 * small + 0.1, True)
+def pixel_oracle(seat, problems):
+    # Random reads of attach, damage, commit and sync mode changes on a
+    # window with a subsurface and one under that, the pools written between
+    # reads, against a model that copies each commit's pixels as it arrives
+    # and shows them as Wayland does: every screenshot must show what the
+    # model does. Seeded, so a failure names the reads that made it.
+    import random
+    broker.SNAPSHOT_SECONDS = 1e9  # the copies are under test, not the clock
+    sizes = {20: 40, 30: 12, 40: 12}
+    parents = {30: 20, 40: 30}
+    points = {20: (4, 4), 30: (30, 10), 40: (30, 26)}  # where each shows alone
+    palette = [RED, GREEN, BLUE, WHITE, b"\x00\xff\xff\xff", b"\xff\x00\xff\xff"]
+    seat.window(20, 21, 22)
+    roles = {30: seat.subsurface(30, 20, 24, 4), 40: seat.subsurface(40, 30, 0, 16)}
+    buffers = {}
+    for surface, n in sizes.items():
+        for k in (0, 1):
+            pool, buffer = seat.next_pool + 1, seat.next_pool + 2
+            seat.next_pool += 2
+            memory = os.memfd_create("oracle")
+            os.ftruncate(memory, n * n * 4)
+            seat.request(SHM, "create_pool", pool, memory, n * n * 4)
+            seat.request(pool, "create_buffer", buffer, 0, n, n, n * 4, XRGB)
+            buffers[surface, k] = (buffer, memory)
 
-    # Re-attaching the same buffer before each commit must stay cheap too.
-    big_reattach = min(timed(20, 22, reattach=buffer_id) for _ in range(3))
-    check(problems, f"{COMMITS} attach+commit of the same buffer took {big_reattach:.3f}s against {small:.3f}s for 4x4",
-          big_reattach < 3 * small + 0.1, True)
+    def run(label, rng, reads, modes={30: True, 40: True}):
+        pool = {}
+        def scribble(key, colour):
+            os.pwrite(buffers[key][1], colour * sizes[key[0]] ** 2, 0)
+            pool[key] = colour
+        # The same start every time: each surface showing its first buffer,
+        # the subsurfaces in the modes given.
+        for key in buffers:
+            scribble(key, palette[(key[0] // 10 + key[1]) % len(palette)])
+        seat.pump_requests(*[(roles[c], "set_sync") for c in roles], *[r for s in (40, 30, 20) for r in ((s, "attach", buffers[s, 0][0], 0, 0), (s, "commit"))])
+        seat.pump_requests(*[(roles[c], "set_sync" if modes[c] else "set_desync") for c in roles])
+        sync = dict(modes)
+        pending = {s: {} for s in sizes}
+        cached = {s: {} for s in sizes}
+        shown = {s: {"buffer": (s, 0), "pixels": pool[s, 0]} for s in sizes}
 
-    # A screenshot after the storm still shows the red frame.
-    seat.client.capture(22)
-    seat.request(20, "commit")
-    check(problems, "screenshot after commit storm shows the red frame",
-          seat.pixel(22, 0, 0), "ff0000")
+        def synchronized(s):
+            while s in parents:
+                if sync[s]:
+                    return True
+                s = parents[s]
+            return False
 
-    # After a new attach, the next commit copies fresh pixels.
-    os.pwrite(memory, BLUE * W * H, 0)
-    seat.client.capture(22)
-    seat.request(20, "attach", buffer_id, 0, 0)
-    seat.request(20, "commit")
-    check(problems, "screenshot after re-attach shows the new frame",
-          seat.pixel(22, 0, 0), "0000ff")
+        def apply(s):
+            shown[s].update(cached[s])
+            cached[s] = {}
+            for child, parent in parents.items():
+                if parent == s and synchronized(child):
+                    apply(child)
 
-    # Repainting the same buffer with damage shows the new frame, not the
-    # stale snapped copy.  Sequence: capture -> bare commit (blue) -> pwrite
-    # red -> attach same buffer + damage + commit -> screenshot.
-    seat.client.capture(22)
-    seat.request(20, "commit")  # copies blue, adds to snapped
-    os.pwrite(memory, RED * W * H, 0)
-    seat.request(20, "attach", buffer_id, 0, 0)
-    seat.request(20, "damage_buffer", 0, 0, W, H)
-    seat.request(20, "commit")
-    seat.client._flush_stale()
-    check(problems, "damage on the same buffer shows the repainted frame",
-          seat.pixel(22, 0, 0), "ff0000")
+        def model(op, s, *args):
+            if op == "attach":
+                pending[s]["buffer"] = args[0]
+            elif op == "commit":
+                pending[s]["pixels"] = pool[pending[s].get("buffer", cached[s].get("buffer", shown[s]["buffer"]))]
+                cached[s].update(pending[s])
+                pending[s] = {}
+                if not synchronized(s):
+                    apply(s)
+            elif op == "sync":
+                sync[s] = True
+            elif op == "desync":
+                sync[s] = False
+                if not synchronized(s):
+                    apply(s)
 
-    # Two damaged commits through pump(): the second defers to _flush_stale
-    # at the batch end.  Scribbling after the batch must not change it.
-    os.pwrite(memory, GREEN * W * H, 0)
-    seat.client.capture(22)
-    seat.pump_requests(
-        (20, "damage_buffer", 0, 0, W, H), (20, "commit"),
-        (20, "damage_buffer", 0, 0, W, H), (20, "commit"))
-    os.pwrite(memory, BLUE * W * H, 0)
-    check(problems, "two damaged commits through pump, screenshot shows the committed frame",
-          seat.pixel(22, 0, 0), "00ff00")
+        log = []
+        for read in reads(rng):
+            if read[0] == "scribble":
+                scribble(read[1], read[2])
+                log.append(f"write {read[1]} {read[2].hex()}")
+                continue
+            if read[0] == "screenshot":
+                canvas, width, _, _ = seat.client.capture(22)
+                got = {s: bytes(canvas[(y * width + x) * 4 : (y * width + x) * 4 + 3][::-1]).hex() for s, (x, y) in points.items()}
+                want = {s: bytes(shown[s]["pixels"][:3][::-1]).hex() for s in sizes}
+                if got != want:
+                    problems.append(f"{label}: screenshot after " + "; ".join(log) + f": got {got}, want {want}")
+                    return False
+                log.append("screenshot")
+                continue
+            requests = []
+            for op, s, *args in read:
+                if op == "attach":
+                    requests.append((s, "attach", buffers[s, args[0]][0], 0, 0))
+                    model(op, s, (s, args[0]))
+                elif op in ("damage", "damage_buffer"):
+                    requests.append((s, op, 0, 0, sizes[s], sizes[s]))
+                elif op == "commit":
+                    requests.append((s, "commit"))
+                    model(op, s)
+                else:
+                    requests.append((roles[s], f"set_{op}"))
+                    model(op, s)
+            seat.pump_requests(*requests)
+            log.append("read " + ", ".join(" ".join(map(str, step)) for step in read))
+        return True
 
-    # damage_buffer without a following commit does not change the screenshot.
-    os.pwrite(memory, RED * W * H, 0)
-    seat.client.capture(22)
-    seat.request(20, "commit")
-    seat.client._flush_stale()
-    os.pwrite(memory, GREEN * W * H, 0)
-    seat.request(20, "damage_buffer", 0, 0, W, H)
-    check(problems, "damage_buffer without commit does not leak into a screenshot",
-          seat.pixel(22, 0, 0), "ff0000")
+    # A synchronized subsurface draws and commits twice in one read, its
+    # parent not at all: the user still sees its first buffer.
+    run("a synchronized subsurface's two commits in one read", None, lambda _: [
+        ("screenshot",), [("attach", 30, 1), ("damage_buffer", 30), ("commit", 30), ("damage_buffer", 30), ("commit", 30)], ("screenshot",)])
 
-    # A storm of damage+commit pairs on a large buffer stays bounded.
-    def timed_damaged(surface, toplevel):
-        seat.client.capture(toplevel)
-        start = time.monotonic()
-        for _ in range(COMMITS):
-            seat.request(surface, "damage_buffer", 0, 0, W, H)
-            seat.request(surface, "commit")
-        return time.monotonic() - start
-    big_damaged = min(timed_damaged(20, 22) for _ in range(3))
-    check(problems, f"{COMMITS} damage+commit of a {W}x{H} buffer took {big_damaged:.3f}s against {small:.3f}s for 4x4",
-          big_damaged < 3 * small + 0.1, True)
+    # One subsurface changes mode in a sequence; the other keeps its own.
+    # The leaf stays synchronized while the middle one changes: a leaf of
+    # its own desynchronized, whose commit waited for a synchronized middle
+    # one, is left waiting when the middle one goes desynchronized and back
+    # (a known gap in how the broker follows nested modes, not in the copies).
+    def random_reads(rng, toggled):
+        yield ("screenshot",)
+        ops = ["commit"] * 4 + ["attach"] * 2 + ["damage", "damage_buffer", "sync", "desync"]
+        for _ in range(40):
+            read = []
+            for _ in range(rng.randint(1, 6)):
+                op = rng.choice(ops)
+                s = toggled if op in ("sync", "desync") else rng.choice([20, 30, 40])
+                read.append((op, s, rng.randint(0, 1)) if op == "attach" else (op, s))
+            yield read
+            for _ in range(rng.choice([0, 0, 1, 2])):
+                yield ("scribble", (rng.choice(list(sizes)), rng.randint(0, 1)), rng.choice(palette))
+            if rng.random() < 0.5:
+                yield ("screenshot",)
+        yield ("screenshot",)
 
-    # A screenshot after a damaged storm still shows the latest frame.
-    os.pwrite(memory, BLUE * W * H, 0)
-    seat.client.capture(22)
-    seat.request(20, "damage_buffer", 0, 0, W, H)
-    seat.request(20, "commit")
-    seat.client._flush_stale()
-    check(problems, "screenshot after damaged storm shows the latest frame",
-          seat.pixel(22, 0, 0), "0000ff")
-
-    os.close(memory)
+    failed = 0
+    for seed in range(100):
+        rng = random.Random(seed)
+        toggled = rng.choice([30, 40])
+        modes = {30: True, 40: True} if toggled == 30 else {30: rng.random() < 0.5, 40: True}
+        if not run(f"seed {seed}", rng, lambda rng: random_reads(rng, toggled), modes):
+            failed += 1
+            if failed == 3:
+                break
+    for _, memory in buffers.values():
+        os.close(memory)
 
 problems = []
 globals()[sys.argv[3]](Seat(sys.argv[2]), problems)
@@ -2274,8 +2370,12 @@ result=$(inproc shm_formats)
 pass "only ARGB8888 and XRGB8888 are offered and accepted as buffer formats"
 
 result=$(inproc snapshot_stall)
-[[ $result == "ok" ]] || fail "commits of a large buffer after a screenshot stay cheap and screenshots show the last committed frame" "$result"
-pass "commits of a large buffer after a screenshot stay cheap and screenshots show the last committed frame"
+[[ $result == "ok" ]] || fail "a storm of commits in one read copies a large buffer once, and a screenshot shows the frame committed last" "$result"
+pass "a storm of commits in one read copies a large buffer once, and a screenshot shows the frame committed last"
+
+result=$(inproc pixel_oracle)
+[[ $result == "ok" ]] || fail "screenshots show what a model copying every commit shows, through random reads of commits, sync changes and pool writes" "$result"
+pass "screenshots show what a model copying every commit shows, through random reads of commits, sync changes and pool writes"
 
 result=$(inproc limits)
 [[ $result == "ok" ]] || fail "a screenshot is at most 4096 pixels a side and 4 pixels per surface unit" "$result"
@@ -2301,16 +2401,26 @@ pass "an app shrinking its pool under a screenshot leaves the broker running"
 
 # Another app keeps being served while a large translucent window's
 # screenshot is composed.
+# Timed against the screenshot itself, the best of up to three: composed in
+# the loop, a round trip would wait most of the screenshot out; on its own
+# thread, at most a small part of it (about a sixth today, here and in CI).
 start_draw glass
 window=$(window_of glass)
-python3 "$test_dir/app.py" "$socket" latency >"$test_dir/latency.out" &
-latency_pid=$!
-for _ in {1..50}; do [[ -s $test_dir/latency.out ]] && break; sleep 0.1; done
-shot=$(run_broker omarchy-agent-seat-screenshot "$window" 2>&1) || fail "a large translucent window gets a screenshot" "$shot"
-wait "$latency_pid" || fail "a large screenshot does not hold up other apps" "$(cat "$test_dir/latency.out")"
-slowest=$(tail -1 "$test_dir/latency.out")
-[[ $(python3 "$test_dir/pixels.py" "$shot" 0,0 1999,1999) == "2000x2000 7f8000 7f8000" ]] || fail "a large translucent window's screenshot is blended" "$(python3 "$test_dir/pixels.py" "$shot" 0,0)"
-(( slowest < 100 )) || fail "a large screenshot does not hold up other apps" "a round trip took ${slowest} ms"
+held=""
+for _ in 1 2 3; do
+  python3 "$test_dir/app.py" "$socket" latency >"$test_dir/latency.out" &
+  latency_pid=$!
+  for _ in {1..50}; do [[ -s $test_dir/latency.out ]] && break; sleep 0.1; done
+  started=$EPOCHREALTIME
+  shot=$(run_broker omarchy-agent-seat-screenshot "$window" 2>&1) || fail "a large translucent window gets a screenshot" "$shot"
+  took=$(( (${EPOCHREALTIME/[.,]/} - ${started/[.,]/}) / 1000 ))
+  wait "$latency_pid" || fail "a large screenshot does not hold up other apps" "$(cat "$test_dir/latency.out")"
+  [[ $(python3 "$test_dir/pixels.py" "$shot" 0,0 1999,1999) == "2000x2000 7f8000 7f8000" ]] || fail "a large translucent window's screenshot is blended" "$(python3 "$test_dir/pixels.py" "$shot" 0,0)"
+  slowest=$(tail -1 "$test_dir/latency.out")
+  held="${held:+$held, }${slowest} ms of ${took} ms"
+  (( 3 * slowest < took )) && break
+done
+! timed_checks || (( 3 * slowest < took )) || fail "a large screenshot does not hold up other apps" "the slowest round trip against the screenshot's time, each try: $held"
 stop_draw
 pass "a large screenshot does not hold up other apps"
 
@@ -2387,17 +2497,27 @@ stop_draw
 
 # A caller that never finishes its request, one that sends too much, and a
 # slow Hyprland all leave the broker answering everyone else.
+# The stalled caller says when the broker gives up on it, after
+# REQUEST_SECONDS: status must be answered before that, not after.
 exec {stalled}< <(python3 -c '
-import socket, sys, time
+import socket, sys
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(sys.argv[1])
 sock.sendall(b"{\"command\": ")
 print("connected", flush=True)
-time.sleep(3)
+sock.settimeout(30)
+try:
+    sock.recv(1)
+    print("dropped", flush=True)
+except socket.timeout:
+    pass
 ' "$test_dir/runtime/omarchy/agent-seat/control")
 stalled_pid=$!
+line=""
 read -r -t 5 line <&"$stalled" || true
-timeout 1 bash -c "HOME='$test_dir/home' XDG_RUNTIME_DIR='$test_dir/runtime' PATH='$test_dir/bin:$ROOT/bin:$PATH' omarchy-agent-seat-status" >/dev/null || fail "a caller that never finishes its request does not hold up the broker"
+[[ $line == "connected" ]] || fail "a caller that never finishes its request connects"
+timeout 20 bash -c "HOME='$test_dir/home' XDG_RUNTIME_DIR='$test_dir/runtime' PATH='$test_dir/bin:$ROOT/bin:$PATH' omarchy-agent-seat-status" >/dev/null || fail "a caller that never finishes its request does not hold up the broker"
+! read -r -t 0 <&"$stalled" || fail "a caller that never finishes its request does not hold up the broker" "status was answered only once the broker dropped the stalled caller"
 exec {stalled}<&-
 kill "$stalled_pid" 2>/dev/null || true
 oversized=$(python3 -c '
