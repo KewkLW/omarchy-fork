@@ -460,6 +460,24 @@ class Pool:
   __del__ = close
 
 
+class Copy:
+  """The pixels of a buffer as one commit showed it, read at the end of the
+  read that brought the commit (see Client.copy_pixels). It goes with the
+  rest of that commit's state, so a screenshot draws it only once the
+  commit shows. pixels stays None when there was nothing to read or the
+  app's copies were already at SNAPSHOT_BYTES."""
+
+  __slots__ = ("buffer", "pixels", "done")
+
+  def __init__(self, buffer):
+    self.buffer, self.pixels, self.done = buffer, None, False
+
+
+def held(copy):
+  """How many bytes a surface's copy holds."""
+  return len(copy.pixels) if copy is not None and copy.pixels is not None else 0
+
+
 def screenshot_path(path, caller):
   """Where a caller may have a screenshot written: the seat's runtime directory, or under its working directory."""
   if not os.path.isabs(path) or not path.lower().endswith(".png"):
@@ -854,11 +872,7 @@ class Client:
     self.syncs = set()  # callbacks of wl_display.sync in self.objects, see check_objects
     self.pid, self.sandbox = 0, None  # the app's, once accepted
     self.snapshots_until = 0  # commits copy their pixels until then (time.monotonic)
-    self.snapped = set()  # surfaces that already copied their pixels this snapshot window
-    self.pending_damage = set()  # surfaces with wl_surface.damage not yet committed
-    self.damaged = set()  # surfaces whose last commit carried damage
-    self.copied_this_pump = set()  # surfaces already copied on their first commit in this pump batch
-    self.stale = set()  # surfaces that need a re-copy at the end of this pump batch
+    self.uncopied = set()  # surfaces that committed a Copy in this read, filled at its end
     self.advertised = {}
     self.pointers, self.keyboards = {}, {}  # object -> the surface this app believes it is focused on
     self.pointer_positions = {}  # pointer -> (x, y) where this app believes it is in that surface
@@ -888,8 +902,6 @@ class Client:
   # Plumbing
 
   def pump(self, channel):
-    if channel is self.down:
-      self.copied_this_pump = set()
     if not channel.receive():
       raise ConnectionError("closed")
     for object_id, opcode, message in channel.messages():
@@ -898,29 +910,25 @@ class Client:
       else:
         self.event(object_id, opcode, message)
     if channel is self.down:
-      self._flush_stale()
+      self.copy_pixels()
     self.flush()
 
-  def _flush_stale(self):
-    """Copy pixels for every surface marked stale during this pump batch.
-    Called after all commits in a batch, so the copy reflects the last
-    committed frame, not the first."""
-    if not self.stale or time.monotonic() >= self.snapshots_until:
-      self.stale.clear()
-      return
-    for surface in list(self.stale):
+  def copy_pixels(self):
+    """Fill the copies this read's commits left, before Hyprland sees them.
+    Only those still in a surface's shown or cached state are read: a later
+    commit in the same read replaced the rest, so a storm of commits costs a
+    copy of each buffer still in use, not one per commit."""
+    for surface in self.uncopied:
       state = self.surfaces.get(surface)
       if state is None:
         continue
-      buffer = state["cached"].get("buffer", state.get("buffer"))
-      if buffer and isinstance(buffer[2], tuple):
-        pixels = self.snapshot(surface, buffer)
-        if pixels is not None:
-          state["pixels"] = pixels
-          if "pixels" in state["cached"]:
-            state["cached"]["pixels"] = pixels
-          self.snapped.add(surface)
-    self.stale.clear()
+      read = {}
+      for copy in (state["pixels"], state["cached"].get("pixels")):
+        if copy is not None and not copy.done:
+          if id(copy.buffer) not in read:  # the same buffer in both holds the same pixels
+            read[id(copy.buffer)] = self.snapshot(surface, copy.buffer)
+          copy.pixels, copy.done = read[id(copy.buffer)], True
+    self.uncopied.clear()
 
   def flush(self):
     for channel in (self.up, self.down):
@@ -1207,30 +1215,19 @@ class Client:
   # The pixels are another matter: they live in the app's shared memory,
   # which it can write again without committing, and copying every frame
   # would cost too much. So for SNAPSHOT_SECONDS after a screenshot, and
-  # while one is being taken, the first commit of a surface in a pump
-  # batch copies its pixels immediately (isolation from later scribbles),
-  # and subsequent commits of the same surface defer to _flush_stale at
-  # the end of the batch. The batch-end copy reflects the last committed
-  # frame, so a storm of commits pays for at most two copies per read
-  # batch per surface and the screenshot
-  # gets the newest frame. Damage stays pending until a commit promotes
-  # it, so a screenshot never reads pixels the compositor has not been
-  # told to apply. A commit that carries no damage and no attach reuses
-  # the existing copy.
-
-  def request_wl_surface_damage(self, surface, args):
-    self.pending_damage.add(surface)
-    return True
-
-  def request_wl_surface_damage_buffer(self, surface, args):
-    self.pending_damage.add(surface)
-    return True
+  # while one is being taken, each commit keeps a Copy of its buffer's
+  # pixels, which goes with the rest of what it committed: cached while a
+  # synchronized subsurface waits for its parent, and shown once applied.
+  # The next screenshot draws those: what the app last committed and the
+  # user sees. The copy is read at the end of the read that brought the
+  # commit, before Hyprland gets it, so it holds what Hyprland reads too,
+  # and a storm of commits in one read pays for one copy, not one each.
+  # Otherwise, as for an agent's first look in a while, a screenshot reads
+  # the pool as it is then, which can hold drawing the app has not
+  # committed and the user does not see yet.
 
   def request_wl_surface_attach(self, surface, args):
-    new = self.buffers.get(args[0], (0, 0, None)) if args[0] else None
-    state = self.surfaces[surface]
-    state["pending"]["buffer"] = new
-    self.snapped.discard(surface)
+    self.surfaces[surface]["pending"]["buffer"] = self.buffers.get(args[0], (0, 0, None)) if args[0] else None
     return True
 
   def request_wl_surface_commit(self, surface, _):
@@ -1238,27 +1235,12 @@ class Client:
     kept = self.input_rectangles(surface)
     pending = state["pending"]
     buffer = pending["buffer"] if "buffer" in pending else state["cached"].get("buffer", state["buffer"])
-    if surface in self.pending_damage:
-      self.damaged.add(surface)
-      self.pending_damage.discard(surface)
-    has_damage = surface in self.damaged
-    has_attach = "buffer" in pending
-    if time.monotonic() < self.snapshots_until:
-      if surface in self.snapped and not has_damage and not has_attach:
-        pending["pixels"] = state["cached"].get("pixels") or state.get("pixels")
-      elif surface not in self.copied_this_pump:
-        pending["pixels"] = self.snapshot(surface, buffer)
-        if pending["pixels"] is not None:
-          self.snapped.add(surface)
-        self.copied_this_pump.add(surface)
-      else:
-        self.stale.add(surface)
-        self.snapped.discard(surface)
-        pending["pixels"] = None
-      self.damaged.discard(surface)
+    # A copy of an earlier commit's pixels never outlives a later commit.
+    if time.monotonic() < self.snapshots_until and buffer and isinstance(buffer[2], tuple):
+      pending["pixels"] = Copy(buffer)
+      self.uncopied.add(surface)
     else:
       pending["pixels"] = None
-      self.damaged.discard(surface)
     positions = state["pending"].pop("positions", {})
     state["cached"].update(state["pending"])
     state["cached"].setdefault("positions", {}).update(positions)  # one commit's moves add to an earlier one's
@@ -1279,7 +1261,9 @@ class Client:
     if width <= 0 or height <= 0 or stride < 0 or offset < 0 or pool.fd < 0:
       return None
     length = stride * (height - 1) + width * 4
-    kept = sum(len(state["pixels"] or b"") + (len(state["cached"].get("pixels") or b"") if other != surface else 0) for other, state in self.surfaces.items())
+    # Shown copies, and committed ones not shown yet but this surface's,
+    # which this one replaces.
+    kept = sum(held(state["pixels"]) + (held(state["cached"].get("pixels")) if other != surface else 0) for other, state in self.surfaces.items())
     if kept + length > SNAPSHOT_BYTES:
       return None
     end = min(pool.size, os.fstat(pool.fd).st_size)
@@ -1516,11 +1500,7 @@ class Client:
     it. Called when the app destroys the surface and again when Hyprland
     frees the id, since an event already on its way can name it in between.
     """
-    self.snapped.discard(surface)
-    self.pending_damage.discard(surface)
-    self.damaged.discard(surface)
-    self.copied_this_pump.discard(surface)
-    self.stale.discard(surface)
+    self.uncopied.discard(surface)
     for role in [role for role, target in self.roles.items() if target == surface]:
       del self.roles[role]
     for xdg in self.xdg_surfaces.values():
@@ -1893,15 +1873,13 @@ class Client:
     """What a screenshot of the window draws, taken from the app's state now
     so a thread can compose it while the app goes on changing that state."""
     self.snapshots_until = time.monotonic() + SNAPSHOT_SECONDS
-    self.snapped = set()
-    self.copied_this_pump = set()
     scale = self.scale(toplevel)
     layers = []
     for surface, x, y in self.layers(self.toplevels[toplevel]["xdg"], 0, 0):
       buffer = self.surfaces[surface]["buffer"]
-      pixels = self.surfaces[surface]["pixels"]
-      if pixels is not None and isinstance(buffer[2], tuple):
-        buffer = (buffer[0], buffer[1], (pixels, *buffer[2][1:]))  # as committed
+      copy = self.surfaces[surface]["pixels"]
+      if copy is not None and copy.pixels is not None and isinstance(buffer[2], tuple):
+        buffer = (buffer[0], buffer[1], (copy.pixels, *buffer[2][1:]))  # as committed
       if buffer and buffer[2]:
         # Only the part of the window geometry the surface really covers: the
         # app declares the geometry and could make it any size.
@@ -2373,9 +2351,6 @@ class Broker:
     self.shots.remove(shot)
     shot.plan.release()
     shot.client.snapshots_until = time.monotonic() + SNAPSHOT_SECONDS  # counted from the end of a long screenshot too
-    shot.client.snapped = set()
-    shot.client.copied_this_pump = set()
-    shot.client.stale = set()
     if shot.result and self.windows.get(shot.window) == (shot.client, shot.toplevel):
       self.captures[shot.window] = shot.plan.origin
     self.answer_shot(shot, shot.result, shot.error)
