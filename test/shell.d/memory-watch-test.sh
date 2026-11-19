@@ -665,7 +665,9 @@ kill -TERM -- -"$group"
 sleep 0.5
 touch "$hold"
 wait "$watch_job" || true
-! pgrep -g "$group" >/dev/null || fail "a TERM during the brake still stops the watcher"
+! pgrep -g "$group" >/dev/null ||
+  fail "a TERM during the brake still stops the watcher" \
+    "$(ps -o pid,ppid,stat,etimes,args -p "$(pgrep -d, -g "$group")" 2>&1; sleep 2; echo after 2s:; pgrep -a -g "$group")"
 grep -Fq $'\t'"$locked_pid"$'\t' "$state/frozen.tsv" ||
   fail "a TERM between the SIGSTOP and its record still records the pause" "$(cat "$state/frozen.tsv")"
 run "$ROOT/bin/omarchy-memory-resume" >/dev/null
