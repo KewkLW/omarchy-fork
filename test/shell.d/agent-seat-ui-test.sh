@@ -492,7 +492,11 @@ Gtk.main()
   # TEMP herald (scratch branch only, never upstream): the shipped browser
   # through the seat's own run command, as its examples launch it, then ui and
   # click-ui on a control of the page it shows. Fails, never skips.
-  command -v google-chrome-stable >/dev/null || fail "TEMP herald: google-chrome-stable is not in the CI image"
+  # Chrome when test/ci-vm could install it, the image's own chromium if not.
+  herald_browser=google-chrome-stable
+  command -v google-chrome-stable >/dev/null || herald_browser=chromium
+  herald_version=$(timeout 20 "$herald_browser" --version 2>&1 | head -n 1)
+  echo "# herald: browser $herald_browser ($herald_version) at $(readlink -f "$(command -v "$herald_browser")")"
   mkdir -p "$test_dir/herald"
   cat >"$test_dir/herald/page.html" <<'HTML'
 <!doctype html><title>Herald page</title><body style="margin: 40px; font: 24px sans-serif">
@@ -501,20 +505,20 @@ Gtk.main()
 HTML
   herald_started=$SECONDS
   herald_code=0
-  herald_window=$(seat omarchy-agent-seat-run --cdp --share-ro "$test_dir/herald" google-chrome-stable "file://$test_dir/herald/page.html" 2>"$test_dir/herald/run.err") || herald_code=$?
+  herald_window=$(seat omarchy-agent-seat-run --cdp --share-ro "$test_dir/herald" "$herald_browser" "file://$test_dir/herald/page.html" 2>"$test_dir/herald/run.err") || herald_code=$?
   echo "# herald: run exited $herald_code after $(( SECONDS - herald_started )) s, printed '$herald_window', stderr: $(tr '\n' ' ' <"$test_dir/herald/run.err")"
   if [[ ! $herald_window =~ ^[0-9]+$ ]]; then
     # Slow, or never: keep looking for a window for another 60 s.
     for _ in {1..60}; do
       herald_windows=$(seat omarchy-agent-seat-windows 2>&1) || true
-      herald_window=$(jq -r '[.[] | select((.title // "") | test("Herald|Chrome"))][0].window // empty' <<<"$herald_windows" 2>/dev/null) || true
+      herald_window=$(jq -r '[.[] | select((.title // "") | test("Herald|Chrom"))][0].window // empty' <<<"$herald_windows" 2>/dev/null) || true
       [[ $herald_window =~ ^[0-9]+$ ]] && break
       sleep 1
     done
     echo "# herald: after polling $(( SECONDS - herald_started )) s: window '$herald_window', windows: $(tr '\n' ' ' <<<"$herald_windows")"
-    [[ $herald_window =~ ^[0-9]+$ ]] || fail "TEMP herald: run --cdp google-chrome-stable opens a window on the seat" "$(tail -n 60 "$runtime/omarchy/agent-seat/apps.log" 2>&1)"
+    [[ $herald_window =~ ^[0-9]+$ ]] || fail "TEMP herald: run --cdp $herald_browser opens a window on the seat" "$(tail -n 60 "$runtime/omarchy/agent-seat/apps.log" 2>&1)"
   fi
-  pass "TEMP herald: run --cdp google-chrome-stable opened window $herald_window after $(( SECONDS - herald_started )) s"
+  pass "TEMP herald: run --cdp $herald_browser ($herald_version) opened window $herald_window after $(( SECONDS - herald_started )) s"
 
   herald_tree=""
   for _ in {1..60}; do
@@ -526,7 +530,7 @@ HTML
   [[ $(jq -r '.source' <<<"$herald_tree" 2>/dev/null) == "cdp" ]] || fail "TEMP herald: ui reads the Chrome window over the DevTools route" "$herald_tree $(tail -n 40 "$runtime/omarchy/agent-seat/apps.log" 2>&1)"
   herald_found=$(seat omarchy-agent-seat-ui "$herald_window" --find "Herald press" 2>&1) || fail "TEMP herald: ui --find finds the page's button" "$herald_found"
   echo "# herald: ui --find: $herald_found"
-  pass "TEMP herald: ui --find reads the page's button over DevTools: $herald_found"
+  pass "TEMP herald: ui --find reads $herald_browser's page button over DevTools: $herald_found"
 
   herald_clicked=$(seat omarchy-agent-seat-click-ui "$herald_window" "Herald press" 2>&1) || fail "TEMP herald: click-ui clicks the page's button" "$herald_clicked"
   echo "# herald: click-ui: $herald_clicked"
@@ -539,7 +543,7 @@ HTML
   herald_out=$(seat omarchy-agent-seat-ui "$herald_window" --find Pressed 2>&1) || true
   echo "# herald: after the click: title '$herald_title', ui --find Pressed: $herald_out"
   [[ $herald_title == "Herald clicked"* ]] || fail "TEMP herald: the click reaches the page (its title changes)" "$herald_title / $herald_out"
-  pass "TEMP herald: click-ui's click ran the page's handler: window title '$herald_title'"
+  pass "TEMP herald: click-ui's click ran the page's handler in $herald_browser: window title '$herald_title'"
 
   herald_pid=$(seat omarchy-agent-seat-state "$herald_window" --json 2>/dev/null | jq -r '.[0].pid') || true
   [[ $herald_pid =~ ^[0-9]+$ ]] && kill "$herald_pid" 2>/dev/null || true

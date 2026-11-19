@@ -118,6 +118,10 @@ if ! ssh_vm 'systemd-run --user --quiet --collect --wait omarchy-toggle-idle sta
   exit 1
 fi
 
+# TEMP herald (scratch branch only): the shipped browser, google-chrome, is not
+# in the release image; install it when sudo needs no password.
+ssh_vm 'if sudo -n true 2>/dev/null; then sudo -n pacman -Sy --noconfirm --needed google-chrome 2>&1 | tail -n 5; else echo "sudo needs a password"; fi; echo "google-chrome-stable: $(command -v google-chrome-stable || echo missing)"' 2>&1 | sed 's/^/test\/ci-vm: TEMP herald: /' || true
+
 # From the user manager: what an Omarchy terminal sees, with default signals.
 # A session whose OMARCHY_PATH is this checkout, with its bin/ first as
 # default/bash/env-bootstrap puts it: the tests call commands by name, and the
