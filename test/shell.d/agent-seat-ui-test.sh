@@ -25,6 +25,24 @@ if compositor_reachable; then
   [[ $compositor == /* ]] || compositor="$XDG_RUNTIME_DIR/$compositor"
 fi
 
+# TEMP herald (scratch branch only, never upstream): read-only probes of the
+# CI image, printed as TAP comments.
+{
+  echo "# herald: command -v chromium google-chrome-stable grim foot: $(command -v chromium google-chrome-stable grim foot | tr '\n' ' ')"
+  echo "# herald: chromium --version: $(timeout 20 chromium --version 2>&1 | head -n 1)"
+  echo "# herald: google-chrome-stable --version: $(timeout 20 google-chrome-stable --version 2>&1 | head -n 1)"
+  echo "# herald: compositor: ${compositor:-none}"
+  echo "# herald: hyprctl version: $(hyprctl version 2>&1 | head -n 1)"
+  echo "# herald: monitors: $(hyprctl monitors -j 2>&1 | jq -c '[.[] | {name, width, height, scale, ws: .activeWorkspace.id}]' 2>&1)"
+  echo "# herald: configerrors: $(hyprctl configerrors 2>&1 | tr '\n' ' ')"
+  echo "# herald: session env: $(systemctl --user show-environment 2>&1 | grep -E '^(OMARCHY_PATH|XDG_SESSION_TYPE|WAYLAND_DISPLAY)=' | tr '\n' ' ')"
+  session_path=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OMARCHY_PATH=//p')
+  echo "# herald: session agent-seat.lua: $(ls -l "${session_path:-/usr/share/omarchy}/default/hypr/agent-seat.lua" 2>&1)"
+  echo "# herald: package.path: $(hyprctl repl 'return package.path' 2>&1 | head -c 600 | tr '\n' ' ')"
+  echo "# herald: user hyprland.lua head: $(head -n 5 ~/.config/hypr/hyprland.lua 2>&1 | tr '\n' ' ')"
+  echo "# herald: clients: $(hyprctl clients -j 2>&1 | jq -c '[.[] | {class, workspace: .workspace.id}]' 2>&1)"
+} || true
+
 # A home of the test's own: a launch makes the seat's home under it, and moves
 # one it finds at the old place, which must never be the developer's own.
 seat() {
@@ -470,6 +488,65 @@ Gtk.main()
   missing=$(PYTHONPATH="$test_dir/no-gi" seat omarchy-agent-seat-ui "$window" 2>&1) || code=$?
   (( code == 2 )) && [[ $missing == "Install python-gobject and at-spi2-core to read accessibility trees" ]] || fail "ui without python-gobject says what to install and exits 2" "$missing"
   pass "ui without python-gobject says what to install and exits 2"
+
+  # TEMP herald (scratch branch only, never upstream): the shipped browser
+  # through the seat's own run command, as its examples launch it, then ui and
+  # click-ui on a control of the page it shows. Fails, never skips.
+  command -v google-chrome-stable >/dev/null || fail "TEMP herald: google-chrome-stable is not in the CI image"
+  mkdir -p "$test_dir/herald"
+  cat >"$test_dir/herald/page.html" <<'HTML'
+<!doctype html><title>Herald page</title><body style="margin: 40px; font: 24px sans-serif">
+<button id="press" style="font-size: 24px; padding: 12px 24px" onclick="document.title = 'Herald clicked'; document.getElementById('out').textContent = 'Pressed'">Herald press</button>
+<p id="out">Waiting</p>
+HTML
+  herald_started=$SECONDS
+  herald_code=0
+  herald_window=$(seat omarchy-agent-seat-run --cdp --share-ro "$test_dir/herald" google-chrome-stable "file://$test_dir/herald/page.html" 2>"$test_dir/herald/run.err") || herald_code=$?
+  echo "# herald: run exited $herald_code after $(( SECONDS - herald_started )) s, printed '$herald_window', stderr: $(tr '\n' ' ' <"$test_dir/herald/run.err")"
+  if [[ ! $herald_window =~ ^[0-9]+$ ]]; then
+    # Slow, or never: keep looking for a window for another 60 s.
+    for _ in {1..60}; do
+      herald_windows=$(seat omarchy-agent-seat-windows 2>&1) || true
+      herald_window=$(jq -r '[.[] | select((.title // "") | test("Herald|Chrome"))][0].window // empty' <<<"$herald_windows" 2>/dev/null) || true
+      [[ $herald_window =~ ^[0-9]+$ ]] && break
+      sleep 1
+    done
+    echo "# herald: after polling $(( SECONDS - herald_started )) s: window '$herald_window', windows: $(tr '\n' ' ' <<<"$herald_windows")"
+    [[ $herald_window =~ ^[0-9]+$ ]] || fail "TEMP herald: run --cdp google-chrome-stable opens a window on the seat" "$(tail -n 60 "$runtime/omarchy/agent-seat/apps.log" 2>&1)"
+  fi
+  pass "TEMP herald: run --cdp google-chrome-stable opened window $herald_window after $(( SECONDS - herald_started )) s"
+
+  herald_tree=""
+  for _ in {1..60}; do
+    herald_tree=$(seat omarchy-agent-seat-ui "$herald_window" --json 2>&1) && [[ $(jq -r '.source' <<<"$herald_tree" 2>/dev/null) == "cdp" ]] && jq -e '.nodes[] | select(.name == "Herald press")' <<<"$herald_tree" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  echo "# herald: state: $(seat omarchy-agent-seat-state "$herald_window" --json 2>&1 | tr '\n' ' ')"
+  echo "# herald: ui --json: $(head -c 2000 <<<"$herald_tree" | tr '\n' ' ')"
+  [[ $(jq -r '.source' <<<"$herald_tree" 2>/dev/null) == "cdp" ]] || fail "TEMP herald: ui reads the Chrome window over the DevTools route" "$herald_tree $(tail -n 40 "$runtime/omarchy/agent-seat/apps.log" 2>&1)"
+  herald_found=$(seat omarchy-agent-seat-ui "$herald_window" --find "Herald press" 2>&1) || fail "TEMP herald: ui --find finds the page's button" "$herald_found"
+  echo "# herald: ui --find: $herald_found"
+  pass "TEMP herald: ui --find reads the page's button over DevTools: $herald_found"
+
+  herald_clicked=$(seat omarchy-agent-seat-click-ui "$herald_window" "Herald press" 2>&1) || fail "TEMP herald: click-ui clicks the page's button" "$herald_clicked"
+  echo "# herald: click-ui: $herald_clicked"
+  herald_title=""
+  for _ in {1..40}; do
+    herald_title=$(seat omarchy-agent-seat-state "$herald_window" --json 2>/dev/null | jq -r '.[0].title') || true
+    [[ $herald_title == "Herald clicked"* ]] && break
+    sleep 0.25
+  done
+  herald_out=$(seat omarchy-agent-seat-ui "$herald_window" --find Pressed 2>&1) || true
+  echo "# herald: after the click: title '$herald_title', ui --find Pressed: $herald_out"
+  [[ $herald_title == "Herald clicked"* ]] || fail "TEMP herald: the click reaches the page (its title changes)" "$herald_title / $herald_out"
+  pass "TEMP herald: click-ui's click ran the page's handler: window title '$herald_title'"
+
+  herald_pid=$(seat omarchy-agent-seat-state "$herald_window" --json 2>/dev/null | jq -r '.[0].pid') || true
+  [[ $herald_pid =~ ^[0-9]+$ ]] && kill "$herald_pid" 2>/dev/null || true
+  for _ in {1..50}; do
+    seat omarchy-agent-seat-state "$herald_window" --json 2>/dev/null | jq -e 'length > 0' >/dev/null 2>&1 || break
+    sleep 0.2
+  done
 fi
 
 # The DevTools route, against a fake DevTools endpoint ------------------------------------

@@ -154,6 +154,12 @@ echo "test/ci-vm: tests done after $(seconds) s"
 rc=$(ssh_vm 'cat ~/rc')
 ssh_vm 'cat ~/run.log' >"$out/run.log"
 echo "rc=$rc" >>"$out/run.log"
+# TEMP herald (scratch branch only, never upstream): the seat UI test's
+# whole output and its ok count, which a green run otherwise never prints.
+herald_section=$(sed -n '/^==> test\/shell.d\/agent-seat-ui-test.sh$/,/^==> /p' "$out/run.log" | sed '$d')
+echo "test/ci-vm: TEMP herald: agent-seat-ui-test.sh output follows"
+printf '%s\n' "$herald_section"
+echo "test/ci-vm: TEMP herald: agent-seat-ui-test.sh ok lines: $(grep -c '^ok - ' <<<"$herald_section"), of which SKIP: $(grep -c '^ok - .* # SKIP$' <<<"$herald_section"), TEMP herald: $(grep -c '^ok - TEMP herald' <<<"$herald_section")"
 pull_shell_logs
 if [[ $rc != "0" ]]; then
   (print_failure_logs "$out") || true
