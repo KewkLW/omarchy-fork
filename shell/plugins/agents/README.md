@@ -99,6 +99,7 @@ light surfaces — and the bar glyph stands in when there is none.
 | `claude` | Anthropic's OAuth usage endpoint (5-hour session + 7-day weekly) | `~/.claude/projects` transcripts, opencode sessions on an Anthropic provider, plus `stats-cache.json` and `history.jsonl` as fallback |
 | `codex` | The Codex app-server RPC | native Codex CLI session files (plus pi and opencode sessions) |
 | `fireworks` | Estimated prepaid balance: configured funding minus rated account costs | Fireworks billing API, grouped by day and model for the last 30 days |
+| `opencode` | None: these providers bill per token | opencode sessions on every provider except Anthropic and OpenAI, which the `claude` and `codex` collectors count (OpenRouter, OpenCode Zen, Hugging Face, local gateways) |
 
 Claude tabs can also show Claude Code's own OpenTelemetry (live sessions,
 cost per bounty and model), read from

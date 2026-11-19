@@ -1,0 +1,306 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the OpenCode usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect OpenCode usage into one display-ready JSON record.
+
+opencode keeps per-message provider, model and token usage in its own
+database. Sessions that ran on the Anthropic or OpenAI provider are a Claude
+or Codex subscription at work, and those collectors already count them; this
+one counts everything else (OpenRouter, OpenCode Zen, Hugging Face, local
+gateways...), so each message lands in exactly one tab. There is no rate
+limit to report: these providers bill per token. The agents panel only ever
+reads the JSON this prints.
+"""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+AGENT_ID = "opencode"
+AGENT_NAME = "OpenCode"
+
+# Exact provider ids the claude and codex collectors claim from this same
+# database. Exact match on purpose, as there: opencode provider ids are
+# free-form, and an "openai-local" gateway is not the Codex subscription.
+CLAIMED_PROVIDERS = {"anthropic", "openai"}
+
+# Display names for the plan line; an unknown provider shows its own id.
+PROVIDER_LABELS = {
+  "openrouter": "OpenRouter",
+  "opencode": "OpenCode Zen",
+  "huggingface": "Hugging Face",
+  "fireworks-ai": "Fireworks",
+  "deepseek": "DeepSeek",
+  "google": "Google",
+  "xai": "xAI",
+  "groq": "Groq",
+  "ollama": "Ollama",
+}
+
+# Same reuse contract as the codex collector: a scan this recent only dedups
+# concurrent collector runs; --limits-only may reuse one for 15 minutes.
+SCAN_REUSE_SECONDS = 20
+LIMITS_ONLY_REUSE_SECONDS = 900
+
+
+def number(value):
+  try:
+    return int(value or 0)
+  except Exception:
+    return 0
+
+
+now = datetime.now()
+today = now.strftime("%Y-%m-%d")
+recent_dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+
+
+def database_path():
+  return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "opencode.db"
+
+
+def scan_opencode():
+  """Aggregate every unclaimed assistant message. Returns (stats, complete).
+
+  complete is False when a database error cut the scan short: what was read
+  still serves this run, but must not be cached as the whole story.
+  """
+  recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+  today_tokens_by_model = {}
+  model_usage = {}
+  provider_tokens = {}
+  today_sessions = set()
+  total_sessions = set()
+  active_days = set()
+  today_prompts = 0
+  today_total_tokens = 0
+  total_prompts = 0
+  complete = True
+
+  db = database_path()
+  if db.is_file():
+    conn = None
+    try:
+      # Read-only: opencode may be writing right now.
+      conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+      conn.execute("PRAGMA query_only = ON")
+      # opencode databases grow huge (every historical message, JSON
+      # included), so the fields are pulled out in SQL as one small JSON array
+      # per row instead of loading each blob into Python. The LIKE gate skips
+      # rows that cannot be assistant messages before any JSON is parsed.
+      # json_extract() RAISES on malformed JSON, and SQLite does not promise
+      # that AND terms evaluate left to right, so json_valid guards it from
+      # inside a CASE rather than as a separate term.
+      rows = conn.execute(
+        "SELECT session_id, time_created,"
+        " CASE WHEN json_valid(data) THEN json_extract(data,"
+        " '$.role', '$.providerID', '$.modelID', '$.tokens.input', '$.tokens.output',"
+        " '$.tokens.reasoning', '$.tokens.cache.read', '$.tokens.cache.write', '$.time.created') END"
+        " FROM message"
+        " WHERE data LIKE '%\"role\"%:%\"assistant\"%'"
+      )
+      for session_id, row_created, fields in rows:
+        # One odd row must not abort the scan, so every shape assumption
+        # lives inside the try.
+        try:
+          if not fields:
+            continue
+          role, provider, model_id, t_in, t_out, t_reason, t_read, t_write, created = json.loads(fields)
+          if role != "assistant":
+            continue
+          provider = str(provider or "")
+          if not provider or provider in CLAIMED_PROVIDERS:
+            continue
+          input_tokens = number(t_in)
+          # opencode keeps thinking tokens out of output; both are generated.
+          output_tokens = number(t_out) + number(t_reason)
+          cache_read = number(t_read)
+          cache_write = number(t_write)
+          total = input_tokens + output_tokens + cache_read + cache_write
+          if total <= 0:
+            continue
+          created = number(created) or number(row_created)
+          day = datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d") if created > 0 else today
+          model = str(model_id or "").rstrip("/").split("/")[-1] or "opencode"
+        except Exception:
+          continue
+
+        session_key = "opencode:" + str(session_id)
+        total_prompts += 1
+        total_sessions.add(session_key)
+        active_days.add(day)
+        provider_tokens[provider] = provider_tokens.get(provider, 0) + total
+
+        bucket = model_usage.setdefault(model, {
+          "inputTokens": 0,
+          "outputTokens": 0,
+          "cacheReadInputTokens": 0,
+          "cacheCreationInputTokens": 0,
+        })
+        bucket["inputTokens"] += input_tokens
+        bucket["outputTokens"] += output_tokens
+        bucket["cacheReadInputTokens"] += cache_read
+        bucket["cacheCreationInputTokens"] += cache_write
+
+        if day in recent:
+          recent[day]["messageCount"] += total
+        if day == today:
+          today_prompts += 1
+          today_sessions.add(session_key)
+          today_total_tokens += total
+          today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
+    except sqlite3.Error:
+      # Transient lock, schema migration, corruption: the numbers stop here,
+      # incomplete.
+      complete = False
+    finally:
+      if conn is not None:
+        conn.close()
+
+  # The plan line names where the tokens went, heaviest provider first.
+  ranked = sorted(provider_tokens, key=lambda provider: (-provider_tokens[provider], provider))
+  labels = [PROVIDER_LABELS.get(provider, provider) for provider in ranked[:2]]
+  if len(ranked) > 2:
+    labels.append(f"+{len(ranked) - 2}")
+
+  stats = {
+    "tierLabel": " · ".join(labels),
+    "todayPrompts": today_prompts,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": today_total_tokens,
+    "todayTokensByModel": today_tokens_by_model,
+    "recentDays": [recent[day] for day in recent_dates],
+    "totalPrompts": total_prompts,
+    "totalSessions": len(total_sessions),
+    # The dates travel with the count: merging snapshots from several
+    # machines needs their union, which a count alone cannot give.
+    "activeDays": len(active_days),
+    "activeDates": sorted(active_days),
+    "modelUsage": model_usage,
+  }
+  return stats, complete
+
+
+def cache_root():
+  root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def scan_cache_paths():
+  digest = hashlib.sha1(str(database_path()).encode("utf-8")).hexdigest()[:16]
+  root = cache_root()
+  return root / f"opencode-scan-{digest}.json", root / f"opencode-scan-{digest}.lock"
+
+
+def write_json(path, payload):
+  # A temp name unique to this writer: several collectors can run at once.
+  handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    tmp.chmod(0o644)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+
+
+# The cache payload is a versioned envelope around the stats dict, so a
+# corrupted or foreign-shaped file is a cache miss instead of a garbage record.
+def read_cached_stats(cache_file, max_age_seconds):
+  if max_age_seconds <= 0 or not cache_file.exists():
+    return None
+  try:
+    # A negative age means the clock moved backwards since the write.
+    age = time.time() - cache_file.stat().st_mtime
+    if not 0 <= age <= max_age_seconds:
+      return None
+    cached = json.loads(cache_file.read_text(encoding="utf-8"))
+  except Exception:
+    return None
+  if not isinstance(cached, dict) or cached.get("schemaVersion") != 1:
+    return None
+  # today* fields only mean "today" on the day they were scanned.
+  if cached.get("scanDate") != today:
+    return None
+  stats = cached.get("stats")
+  if not isinstance(stats, dict):
+    return None
+  if not all(key in stats for key in ("todayPrompts", "todayTotalTokens", "recentDays", "activeDates", "modelUsage")):
+    return None
+  return stats
+
+
+def _cached_stats(max_age):
+  cache_file, lock_file = scan_cache_paths()
+  cached = read_cached_stats(cache_file, max_age)
+  if cached is not None:
+    return cached
+
+  with lock_file.open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    cached = read_cached_stats(cache_file, max_age)
+    if cached is not None:
+      return cached
+    stats, complete = scan_opencode()
+    # An interrupted scan still serves this run, but caching it would hide the
+    # missing usage from every reader until the cache expires.
+    if complete:
+      try:
+        write_json(cache_file, {"schemaVersion": 1, "scanDate": today, "stats": stats})
+      except Exception as exc:
+        print(f"omarchy-agent-usage-opencode: could not write usage cache ({exc})", file=sys.stderr)
+    return stats
+
+
+def cached_stats(max_age):
+  """Stats, with the cache as a pure optimization: any cache-layer failure
+  degrades to a direct scan and a warning. The JSON record is the contract."""
+  try:
+    return _cached_stats(max_age)
+  except Exception as exc:
+    print(f"omarchy-agent-usage-opencode: cache unavailable ({exc}); scanning directly", file=sys.stderr)
+    stats, _ = scan_opencode()
+    return stats
+
+
+def main():
+  parser = argparse.ArgumentParser()
+  # --limits-only is accepted for the panel's refreshLimits() call. There are
+  # no limits to fetch, so it only means a recent scan may be reused longer.
+  parser.add_argument("--force", action="store_true")
+  parser.add_argument("--limits-only", action="store_true")
+  args = parser.parse_args()
+
+  max_age = 0 if args.force else (LIMITS_ONLY_REUSE_SECONDS if args.limits_only else SCAN_REUSE_SECONDS)
+  stats = cached_stats(max_age)
+
+  record = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "cli": AGENT_ID,
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+    "ready": True,
+    "hasLocalStats": True,
+    "limits": [],
+    "usageStatusText": "",
+    "authHelpText": "",
+  }
+  record.update(stats)
+  print(json.dumps(record, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+  main()
