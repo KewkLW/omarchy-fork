@@ -49,8 +49,8 @@ jobs:
       - name: Fetch the VM image
         run: |
           mkdir -p /dev/shm/image && cd /dev/shm/image
-          curl -fsS --retry 3 -o latest.json "$SITE/stable/latest.json"
-          jq -r '"Image: Omarchy \(.omarchy_version), kernel \(.kernel)"' latest.json | tee -a "$GITHUB_STEP_SUMMARY"
+          curl -fsS --retry 3 -o latest.json "$SITE/edge/latest.json"
+          jq -r '"Image: \(.channel) \(.version) built \(.built_at), Omarchy \(.omarchy_version) (\(.omarchy_commit)), kernel \(.kernel)"' latest.json | tee -a "$GITHUB_STEP_SUMMARY"
           unpacked=$(jq -r .vm.unpacked latest.json)
           for file in vmlinuz initrd cmdline; do
             curl -fsS --retry 3 -o "$file" "$unpacked$file"

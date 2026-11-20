@@ -90,14 +90,23 @@ capture_main() {
   local cfg="$HOME/.config/hypr/hyprland.lua"
   cp "$cfg" "$OUT/hyprland.lua.orig"
   sed -i "/bootstrap.lua/a package.path = \"$ROOT/?.lua;\" .. package.path" "$cfg"
+  if grep -qF "package.path = \"$ROOT/?.lua;\"" "$cfg"; then
+    log "package.path line inserted after bootstrap.lua"
+  else
+    log "package.path line NOT inserted: no bootstrap.lua line in $cfg"
+    reason agent-window-outlined "this checkout's rules were not put on the module path"
+    cp "$OUT/hyprland.lua.orig" "$cfg"
+    return
+  fi
   hyprctl reload >>"$OUT/log.txt" 2>&1
   sleep 2
   local errors
   errors=$(hyprctl configerrors 2>&1)
-  log "configerrors after reload: $errors"
+  log "configerrors after reload (raw): $(printf %q "$errors")"
+  log "packages: $(pacman -Q hyprland google-chrome chromium 2>&1 | tr '\n' ';')"
   log "package.path: $(hyprctl repl 'return package.path' 2>&1 | head -c 400)"
 
-  # The image's chromium on the seat, through the documented invocation, on a
+  # The image's Google Chrome on the seat, through the documented invocation, on a
   # local page shared read-only.
   local page_dir="$HOME/herald-page"
   mkdir -p "$page_dir"
@@ -106,13 +115,13 @@ capture_main() {
 <html><head><meta charset="utf-8"><title>A page on the agent seat</title>
 <style>body{font:20px sans-serif;margin:48px;background:#fafafa;color:#222}button{font:18px sans-serif;padding:10px 18px}</style>
 </head><body><h1>A page on the agent seat</h1>
-<p>Chromium runs sandboxed on the seat. The agent reads this page through DevTools and clicks with its own pointer.</p>
+<p>Google Chrome runs sandboxed on the seat. The agent reads this page through DevTools and clicks with its own pointer.</p>
 <button>Press</button></body></html>
 HTML
   seat() { OMARCHY_PATH="$ROOT" PATH="$ROOT/bin:$PATH" "$@"; }
   local window run_code=0
-  window=$(seat omarchy-agent-seat-run --cdp --share-ro "$page_dir" chromium "file://$page_dir/page.html" 2>>"$OUT/log.txt") || run_code=$?
-  log "run --cdp chromium: code $run_code, window '$window', $(chromium --version 2>&1)"
+  window=$(seat omarchy-agent-seat-run --cdp --share-ro "$page_dir" google-chrome-stable "file://$page_dir/page.html" 2>>"$OUT/log.txt") || run_code=$?
+  log "run --cdp google-chrome-stable: code $run_code, window '$window', $(google-chrome-stable --version 2>&1)"
 
   local drawn=""
   for _ in {1..60}; do
