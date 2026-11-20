@@ -1,0 +1,165 @@
+#!/bin/bash
+
+# TEMP herald (scratch branch only, never upstream): runs candidate
+# reproduction steps for #15409 and #17823 in the CI VM, on base (this
+# checkout, quattro) and on head (quattro with the PR merged; the changed
+# files are copied under test/herald-head*). test/ci-vm runs it in place of the
+# tests. It reports what it saw and always exits 0.
+
+set +e +u
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+OUT="$HOME/shell-logs/herald"
+mkdir -p "$OUT"
+log() { printf 'herald: %s\n' "$*" | tee -a "$OUT/log.txt"; }
+
+log "root $ROOT, $(hyprctl version 2>&1 | head -n 1)"
+log "session OMARCHY_PATH: $(systemctl --user show-environment | sed -n 's/^OMARCHY_PATH=//p')"
+log "omarchy package: $(pacman -Q omarchy 2>&1)"
+
+# Head trees: quattro with each PR's changed files over it.
+head15409="$HOME/head15409"
+cp -a "$ROOT" "$head15409"
+cp -a "$ROOT/test/herald-head15409/." "$head15409/"
+
+# ---------------------------------------------------------------- #15409
+log "=== #15409"
+log "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
+log "ulimit -c: $(ulimit -c)"
+log "installed watcher: $(ls -l /usr/bin/omarchy-crash-watch 2>&1)"
+log "crash-watch unit: $(systemctl --user is-active omarchy-crash-watch.service 2>&1) / $(systemctl --user is-enabled omarchy-crash-watch.service 2>&1)"
+log "default agent before: '$(cat ~/.config/omarchy/defaults/agent 2>&1)'"
+log "groups: $(id -nG)"
+
+# Setup step: an agent chosen, or the watcher drops every crash. Only the file
+# omarchy-default-agent reads; nothing is installed and nothing is clicked.
+mkdir -p ~/.config/omarchy/defaults
+[[ -s ~/.config/omarchy/defaults/agent ]] || echo claude >~/.config/omarchy/defaults/agent
+systemctl --user stop omarchy-crash-watch.service
+log "unit after stop: $(systemctl --user is-active omarchy-crash-watch.service 2>&1)"
+
+# Three programs, copies of sleep, so each scenario has its own name and the
+# watcher's 60 s per-name dedupe never hides one.
+for name in herald-plain herald-marked herald-stamped; do cp /usr/bin/sleep "/tmp/$name"; done
+
+# The notifier, logged and then sent for real.
+stub="$HOME/herald-stub"
+mkdir -p "$stub"
+
+crash_round() {
+  local label=$1 tree=$2 notes="$OUT/notify-$1.txt"
+  : >"$notes"
+  cat >"$stub/omarchy-notification-send" <<EOF
+#!/bin/bash
+printf '%q ' "\$@" >>"$notes"
+echo >>"$notes"
+exec "$tree/bin/omarchy-notification-send" "\$@"
+EOF
+  chmod +x "$stub/omarchy-notification-send"
+  rm -rf ~/.local/state/omarchy/crash-diagnosis
+
+  OMARCHY_PATH="$tree" PATH="$stub:$tree/bin:$PATH" "$tree/bin/omarchy-crash-watch" >"$OUT/watch-$label.log" 2>&1 &
+  local watcher=$!
+  sleep 3
+
+  # 1. No marker, no stamp: offered on both.
+  /tmp/herald-plain 60 &
+  local p=$!
+  sleep 0.5
+  kill -SEGV "$p"
+  # 2. The diagnosis marker in the crashing process's environment.
+  OMARCHY_CRASH_DIAGNOSIS="$$:$(date +%s)" /tmp/herald-marked 60 &
+  p=$!
+  sleep 0.5
+  kill -SEGV "$p"
+  # 3. An "under way" stamp for the program, no marker.
+  mkdir -p ~/.local/state/omarchy/crash-diagnosis
+  echo "$$:$(date +%s)" >~/.local/state/omarchy/crash-diagnosis/herald-stamped
+  /tmp/herald-stamped 60 &
+  p=$!
+  sleep 0.5
+  kill -SEGV "$p"
+
+  for _ in {1..30}; do
+    (($(wc -l <"$notes") >= 3)) && break
+    sleep 1
+  done
+  sleep 2
+  kill "$watcher" 2>/dev/null
+  pkill -P "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
+  log "#15409 $label: $(wc -l <"$notes") notifications"
+  sed "s/^/herald:   $label notify: /" "$notes" | tee -a "$OUT/log.txt"
+  log "#15409 $label watcher output: $(tr '\n' ' ' <"$OUT/watch-$label.log" | head -c 600)"
+}
+
+crash_round base "$ROOT"
+crash_round head "$head15409"
+log "coredumpctl: $(coredumpctl list --no-pager 2>&1 | grep -c herald) herald dumps"
+coredumpctl list --no-pager 2>&1 | grep herald | sed 's/^/herald:   /' | tee -a "$OUT/log.txt"
+rm -rf ~/.local/state/omarchy/crash-diagnosis
+systemctl --user start omarchy-crash-watch.service
+
+# ---------------------------------------------------------------- #17823
+log "=== #17823"
+installed="$(systemctl --user show-environment | sed -n 's/^OMARCHY_PATH=//p')"
+installed=${installed:-/usr/share/omarchy}
+log "installed battlenet.lua vs quattro's: $(diff -q "$installed/default/hypr/apps/battlenet.lua" "$ROOT/default/hypr/apps/battlenet.lua" 2>&1 || true) $(diff -q "$installed/default/hypr/apps/battlenet.lua" "$ROOT/default/hypr/apps/battlenet.lua" >/dev/null 2>&1 && echo same)"
+log "terminals: $(command -v foot alacritty kitty ghostty | tr '\n' ' ')"
+
+# One file per side, put ahead of the release's on Hyprland's module path:
+# default.hypr.apps.battlenet then resolves there and every other module falls
+# through to the release.
+mkdir -p "$HOME/bn-base/default/hypr/apps" "$HOME/bn-head/default/hypr/apps"
+cp "$ROOT/default/hypr/apps/battlenet.lua" "$HOME/bn-base/default/hypr/apps/"
+cp "$ROOT/test/herald-head17823/default/hypr/apps/battlenet.lua" "$HOME/bn-head/default/hypr/apps/"
+cfg="$HOME/.config/hypr/hyprland.lua"
+cp "$cfg" "$OUT/hyprland.lua.orig"
+
+standin() {
+  local title=$1
+  if command -v foot >/dev/null; then
+    foot --app-id steam_app_battlenet --title "$title" sleep 120 >/dev/null 2>&1 &
+  elif command -v alacritty >/dev/null; then
+    alacritty --class steam_app_battlenet --title "$title" -e sleep 120 >/dev/null 2>&1 &
+  else
+    kitty --class steam_app_battlenet --title "$title" sleep 120 >/dev/null 2>&1 &
+  fi
+}
+
+bn_round() {
+  local label=$1 dir=$2
+  cp "$OUT/hyprland.lua.orig" "$cfg"
+  sed -i "/bootstrap.lua/a package.path = \"$dir/?.lua;\" .. package.path" "$cfg"
+  log "#17823 $label reload: $(hyprctl reload 2>&1)"
+  sleep 1
+  log "#17823 $label configerrors: $(hyprctl configerrors 2>&1 | tr '\n' ' ')"
+  log "#17823 $label package.path: $(hyprctl repl 'return package.path' 2>&1 | head -c 300)"
+  log "#17823 $label module file: $(hyprctl repl 'return package.searchpath("default.hypr.apps.battlenet", package.path)' 2>&1 | head -c 300)"
+  standin "World of Warcraft"
+  standin "Battle.net"
+  local clients=""
+  for _ in {1..40}; do
+    clients=$(hyprctl clients -j | jq -c '[.[] | select(.class == "steam_app_battlenet") | {address, title}]')
+    (($(jq length <<<"$clients") >= 2)) && break
+    sleep 0.25
+  done
+  log "#17823 $label windows: $clients"
+  local addr title
+  while IFS=$'\t' read -r addr title; do
+    [[ -n $addr ]] || continue
+    log "#17823 $label getprop '$title': $(hyprctl getprop "address:$addr" focus_on_activate 2>&1 | tr '\n' ' ')"
+    log "#17823 $label getprop -j '$title': $(hyprctl getprop "address:$addr" focus_on_activate -j 2>&1 | tr '\n' ' ')"
+  done < <(jq -r '.[] | [.address, .title] | @tsv' <<<"$clients")
+  jq -r '.[].address' <<<"$clients" | while read -r addr; do
+    hyprctl dispatch "hl.dsp.window.close({ window = \"address:$addr\" })" >/dev/null 2>&1
+  done
+  sleep 1
+  pkill -f "sleep 120" 2>/dev/null
+}
+
+bn_round base "$HOME/bn-base"
+bn_round head "$HOME/bn-head"
+cp "$OUT/hyprland.lua.orig" "$cfg"
+hyprctl reload >/dev/null 2>&1
+log "done"
+exit 0
