@@ -16,149 +16,184 @@ log "root $ROOT, $(hyprctl version 2>&1 | head -n 1)"
 log "session OMARCHY_PATH: $(systemctl --user show-environment | sed -n 's/^OMARCHY_PATH=//p')"
 log "omarchy package: $(pacman -Q omarchy 2>&1)"
 
-# Head trees: quattro with each PR's changed files over it.
+# Head trees: quattro with each PR's changed files over it; base15409 is
+# quattro with only the PR's new test file added, to run it against base code.
 head15409="$HOME/head15409"
 cp -a "$ROOT" "$head15409"
 cp -a "$ROOT/test/herald-head15409/." "$head15409/"
+base15409="$HOME/base15409"
+cp -a "$ROOT" "$base15409"
+cp "$head15409/test/shell.d/crash-watch-test.sh" "$base15409/test/shell.d/"
+sudo_() { printf 'omarchy\n' | sudo -S -p '' "$@"; }
 
 # ---------------------------------------------------------------- #15409
 log "=== #15409"
 log "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
-log "ulimit -c: $(ulimit -c)"
-log "installed watcher: $(ls -l /usr/bin/omarchy-crash-watch 2>&1)"
 log "crash-watch unit: $(systemctl --user is-active omarchy-crash-watch.service 2>&1) / $(systemctl --user is-enabled omarchy-crash-watch.service 2>&1)"
+log "unit file: $(systemctl --user cat omarchy-crash-watch.service 2>&1 | grep -E '^(# /|ExecStart|ConditionPath)' | tr '\n' ' ')"
+log "toggles: $(ls ~/.local/state/omarchy/toggles 2>&1 | tr '\n' ' ')"
 log "default agent before: '$(cat ~/.config/omarchy/defaults/agent 2>&1)'"
-log "groups: $(id -nG)"
+log "installed watcher vs quattro's: $(cmp /usr/bin/omarchy-crash-watch "$ROOT/bin/omarchy-crash-watch" 2>&1 && echo same)"
+log "installed agent-crash vs quattro's: $(cmp /usr/bin/omarchy-agent-crash "$ROOT/bin/omarchy-agent-crash" 2>&1 && echo same)"
+log "sudo -S: $(sudo_ true 2>&1 && echo works)"
 
-# Setup step: an agent chosen, or the watcher drops every crash. Only the file
-# omarchy-default-agent reads; nothing is installed and nothing is clicked.
+# Floor, no desktop needed: the PR's own test file, against base and head.
+for side in base head; do
+  tree=$base15409
+  [[ $side == "head" ]] && tree=$head15409
+  (cd "$tree" && OMARCHY_PATH="$tree" PATH="$tree/bin:$PATH" bash test/shell.d/crash-watch-test.sh) >"$OUT/crash-watch-test-$side.txt" 2>&1
+  code=$?
+  log "#15409 crash-watch-test.sh on $side: exit $code, ok $(grep -c '^ok' "$OUT/crash-watch-test-$side.txt"), not ok $(grep -c '^not ok' "$OUT/crash-watch-test-$side.txt")"
+  grep -m 3 -A 3 '^not ok' "$OUT/crash-watch-test-$side.txt" | head -c 1200 | sed "s/^/herald:   $side: /" | tee -a "$OUT/log.txt"
+  tail -n 3 "$OUT/crash-watch-test-$side.txt" | sed "s/^/herald:   $side tail: /" | tee -a "$OUT/log.txt"
+done
+
+# Live: real core dumps, the real unit, the session's own shell taking the
+# toasts. Setup: an agent chosen (only the file; nothing installed or clicked).
 mkdir -p ~/.config/omarchy/defaults
 [[ -s ~/.config/omarchy/defaults/agent ]] || echo claude >~/.config/omarchy/defaults/agent
-systemctl --user stop omarchy-crash-watch.service
-log "unit after stop: $(systemctl --user is-active omarchy-crash-watch.service 2>&1)"
-
-# Three programs, copies of sleep, so each scenario has its own name and the
-# watcher's 60 s per-name dedupe never hides one.
 for name in herald-plain herald-marked herald-stamped; do cp /usr/bin/sleep "/tmp/$name"; done
 
-# The notifier, logged and then sent for real.
-stub="$HOME/herald-stub"
-mkdir -p "$stub"
-
-crash_round() {
-  local label=$1 tree=$2 notes="$OUT/notify-$1.txt"
-  : >"$notes"
-  cat >"$stub/omarchy-notification-send" <<EOF
-#!/bin/bash
-printf '%q ' "\$@" >>"$notes"
-echo >>"$notes"
-exec "$tree/bin/omarchy-notification-send" "\$@"
-EOF
-  chmod +x "$stub/omarchy-notification-send"
+live_round() {
+  local label=$1 calls="$OUT/notify-$1.json"
   rm -rf ~/.local/state/omarchy/crash-diagnosis
-
-  OMARCHY_PATH="$tree" PATH="$stub:$tree/bin:$PATH" "$tree/bin/omarchy-crash-watch" >"$OUT/watch-$label.log" 2>&1 &
-  local watcher=$!
+  busctl --user monitor --json=short --match "type=method_call,interface=org.freedesktop.Notifications,member=Notify" >"$calls" 2>"$OUT/monitor-$label.err" &
+  local monitor=$!
+  systemctl --user restart omarchy-crash-watch.service
   sleep 3
+  log "#15409 $label unit: $(systemctl --user is-active omarchy-crash-watch.service) pid $(systemctl --user show -p MainPID --value omarchy-crash-watch.service), ExecStart binary $(sha256sum /usr/bin/omarchy-crash-watch | cut -c1-12)"
 
-  # 1. No marker, no stamp: offered on both.
   /tmp/herald-plain 60 &
   local p=$!
   sleep 0.5
   kill -SEGV "$p"
-  # 2. The diagnosis marker in the crashing process's environment.
   OMARCHY_CRASH_DIAGNOSIS="$$:$(date +%s)" /tmp/herald-marked 60 &
   p=$!
   sleep 0.5
   kill -SEGV "$p"
-  # 3. An "under way" stamp for the program, no marker.
   mkdir -p ~/.local/state/omarchy/crash-diagnosis
   echo "$$:$(date +%s)" >~/.local/state/omarchy/crash-diagnosis/herald-stamped
   /tmp/herald-stamped 60 &
   p=$!
   sleep 0.5
   kill -SEGV "$p"
-
   for _ in {1..30}; do
-    (($(wc -l <"$notes") >= 3)) && break
+    (($(grep -c Notify "$calls") >= 3)) && break
     sleep 1
   done
   sleep 2
-  kill "$watcher" 2>/dev/null
-  pkill -P "$watcher" 2>/dev/null
-  wait "$watcher" 2>/dev/null
-  log "#15409 $label: $(wc -l <"$notes") notifications"
-  sed "s/^/herald:   $label notify: /" "$notes" | tee -a "$OUT/log.txt"
-  log "#15409 $label watcher output: $(tr '\n' ' ' <"$OUT/watch-$label.log" | head -c 600)"
+  kill "$monitor" 2>/dev/null
+  wait "$monitor" 2>/dev/null
+  log "#15409 $label: $(grep -c Notify "$calls") Notify calls; monitor stderr: $(head -c 300 "$OUT/monitor-$label.err")"
+  jq -c 'select(.member == "Notify") | .payload.data | {app: .[0], summary: .[3], body: .[4], hints: (.[6] | with_entries(.value = (.value.data | tostring | .[0:160])))}' "$calls" 2>&1 | sed "s/^/herald:   $label toast: /" | tee -a "$OUT/log.txt"
+  log "#15409 $label unit journal: $(journalctl --user -u omarchy-crash-watch.service -n 5 --no-pager -o cat 2>&1 | tr '\n' ' ' | head -c 500)"
+  grim "$OUT/toasts-$label.png" 2>/dev/null
 }
 
-crash_round base "$ROOT"
-crash_round head "$head15409"
+live_round base
+# Head: the PR's two commands over the installed ones, and its seven crash.*
+# strings merged into the installed English catalog (the rest of the head's
+# catalog is older than the image's).
+catalog=/usr/share/omarchy/default/i18n/en/cli.json
+jq -s '.[0] + (.[1] | with_entries(select(.key | startswith("crash."))))' "$catalog" "$head15409/default/i18n/en/cli.json" >"$OUT/cli.json"
+sudo_ install -m 755 "$head15409/bin/omarchy-crash-watch" "$head15409/bin/omarchy-agent-crash" /usr/bin/
+sudo_ install -m 644 "$OUT/cli.json" "$catalog"
+log "installed watcher now head: $(cmp /usr/bin/omarchy-crash-watch "$head15409/bin/omarchy-crash-watch" 2>&1 && echo yes); catalog has crash.crashedDuringDiagnosis: $(jq -r '."crash.crashedDuringDiagnosis"' "$catalog")"
+live_round head
 log "coredumpctl: $(coredumpctl list --no-pager 2>&1 | grep -c herald) herald dumps"
-coredumpctl list --no-pager 2>&1 | grep herald | sed 's/^/herald:   /' | tee -a "$OUT/log.txt"
 rm -rf ~/.local/state/omarchy/crash-diagnosis
-systemctl --user start omarchy-crash-watch.service
 
 # ---------------------------------------------------------------- #17823
 log "=== #17823"
 installed="$(systemctl --user show-environment | sed -n 's/^OMARCHY_PATH=//p')"
 installed=${installed:-/usr/share/omarchy}
-log "installed battlenet.lua vs quattro's: $(diff -q "$installed/default/hypr/apps/battlenet.lua" "$ROOT/default/hypr/apps/battlenet.lua" 2>&1 || true) $(diff -q "$installed/default/hypr/apps/battlenet.lua" "$ROOT/default/hypr/apps/battlenet.lua" >/dev/null 2>&1 && echo same)"
-log "terminals: $(command -v foot alacritty kitty ghostty | tr '\n' ' ')"
+log "installed battlenet.lua vs quattro's: $(cmp "$installed/default/hypr/apps/battlenet.lua" "$ROOT/default/hypr/apps/battlenet.lua" 2>&1 && echo same)"
+log "DISPLAY '${DISPLAY:-}', X sockets: $(ls /tmp/.X11-unix 2>&1 | tr '\n' ' ')"
+[[ -n ${DISPLAY:-} ]] || export DISPLAY=":$(ls /tmp/.X11-unix 2>/dev/null | sed -n 's/^X//p' | head -n 1)"
 
-# One file per side, put ahead of the release's on Hyprland's module path:
-# default.hypr.apps.battlenet then resolves there and every other module falls
-# through to the release.
 mkdir -p "$HOME/bn-base/default/hypr/apps" "$HOME/bn-head/default/hypr/apps"
 cp "$ROOT/default/hypr/apps/battlenet.lua" "$HOME/bn-base/default/hypr/apps/"
 cp "$ROOT/test/herald-head17823/default/hypr/apps/battlenet.lua" "$HOME/bn-head/default/hypr/apps/"
 cfg="$HOME/.config/hypr/hyprland.lua"
 cp "$cfg" "$OUT/hyprland.lua.orig"
+events="$OUT/socket2.txt"
+socat -u "UNIX-CONNECT:$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock" - >"$events" 2>&1 &
+socat_pid=$!
 
-standin() {
-  local title=$1
-  if command -v foot >/dev/null; then
-    foot --app-id steam_app_battlenet --title "$title" sleep 120 >/dev/null 2>&1 &
-  elif command -v alacritty >/dev/null; then
-    alacritty --class steam_app_battlenet --title "$title" -e sleep 120 >/dev/null 2>&1 &
-  else
-    kitty --class steam_app_battlenet --title "$title" sleep 120 >/dev/null 2>&1 &
-  fi
-}
+bn_clients() { hyprctl clients -j | jq -c '[.[] | select(.class == "steam_app_battlenet") | {address, title, pid, xwayland, tags}]'; }
 
 bn_round() {
-  local label=$1 dir=$2
+  local label=$1 dir=$2 probe=${3:-}
+  log "#17823 $label clients before: $(bn_clients)"
   cp "$OUT/hyprland.lua.orig" "$cfg"
   sed -i "/bootstrap.lua/a package.path = \"$dir/?.lua;\" .. package.path" "$cfg"
+  if [[ -n $probe ]]; then
+    cat >>"$cfg" <<'LUA'
+-- herald probe: tag what the PR's matcher matches, and set the property on one more title
+o.window({ class = "^steam_app_battlenet$", title = "negative:^(Battle\\.net|Blizzard).*$" }, { tag = "+herald-game" })
+o.window({ class = "^steam_app_battlenet$", title = "^Herald true$" }, { focus_on_activate = true })
+LUA
+  fi
   log "#17823 $label reload: $(hyprctl reload 2>&1)"
   sleep 1
-  log "#17823 $label configerrors: $(hyprctl configerrors 2>&1 | tr '\n' ' ')"
-  log "#17823 $label package.path: $(hyprctl repl 'return package.path' 2>&1 | head -c 300)"
-  log "#17823 $label module file: $(hyprctl repl 'return package.searchpath("default.hypr.apps.battlenet", package.path)' 2>&1 | head -c 300)"
-  standin "World of Warcraft"
-  standin "Battle.net"
+  log "#17823 $label configerrors: '$(hyprctl configerrors 2>&1 | tr '\n' ' ')'"
+  log "#17823 $label module file: $(hyprctl repl 'return package.searchpath("default.hypr.apps.battlenet", package.path)' 2>&1 | head -c 200)"
+  log "#17823 $label global misc:focus_on_activate: $(hyprctl getoption misc:focus_on_activate 2>&1 | tr '\n' ' ')"
+
+  # Wayland stand-ins: what getprop and the rules report.
+  local titles=("World of Warcraft" "Battle.net")
+  [[ -n $probe ]] && titles+=("Herald true")
+  local t
+  for t in "${titles[@]}"; do
+    foot --app-id steam_app_battlenet --title "$t" sleep 60 >/dev/null 2>&1 &
+  done
   local clients=""
   for _ in {1..40}; do
-    clients=$(hyprctl clients -j | jq -c '[.[] | select(.class == "steam_app_battlenet") | {address, title}]')
-    (($(jq length <<<"$clients") >= 2)) && break
+    clients=$(bn_clients)
+    (($(jq length <<<"$clients") >= ${#titles[@]})) && break
     sleep 0.25
   done
-  log "#17823 $label windows: $clients"
+  log "#17823 $label wayland windows: $clients"
   local addr title
   while IFS=$'\t' read -r addr title; do
-    [[ -n $addr ]] || continue
     log "#17823 $label getprop '$title': $(hyprctl getprop "address:$addr" focus_on_activate 2>&1 | tr '\n' ' ')"
-    log "#17823 $label getprop -j '$title': $(hyprctl getprop "address:$addr" focus_on_activate -j 2>&1 | tr '\n' ' ')"
   done < <(jq -r '.[] | [.address, .title] | @tsv' <<<"$clients")
-  jq -r '.[].address' <<<"$clients" | while read -r addr; do
-    hyprctl dispatch "hl.dsp.window.close({ window = \"address:$addr\" })" >/dev/null 2>&1
-  done
+  [[ -n $probe ]] && log "#17823 $label getprop nonsense: $(hyprctl getprop "address:$(jq -r '.[0].address' <<<"$clients")" herald_no_such_prop 2>&1 | tr '\n' ' ')"
+  pkill -f "foot --app-id steam_app_battlenet"
   sleep 1
-  pkill -f "sleep 120" 2>/dev/null
+
+  # XWayland stand-ins: Battle.net focused, then World of Warcraft asks to be
+  # activated with _NET_ACTIVE_WINDOW, the request Wine makes.
+  : >"$OUT/x11-$label.txt"
+  python3 "$ROOT/test/herald-x11-standin.py" 4 6 >"$OUT/x11-$label.txt" 2>&1 &
+  local x11=$!
+  for _ in {1..30}; do
+    clients=$(bn_clients)
+    (($(jq length <<<"$clients") >= 2)) && break
+    sleep 0.1
+  done
+  log "#17823 $label x11 windows: $clients"
+  local bnet wow
+  bnet=$(jq -r '.[] | select(.title == "Battle.net") | .address' <<<"$clients")
+  wow=$(jq -r '.[] | select(.title == "World of Warcraft") | .address' <<<"$clients")
+  hyprctl dispatch "hl.dsp.focus({ window = \"address:$bnet\" })" >/dev/null 2>&1
+  sleep 1
+  log "#17823 $label x11 active before the request: $(hyprctl activewindow -j | jq -c '{title, address}')"
+  local mark
+  mark=$(wc -l <"$events")
+  sleep 4
+  log "#17823 $label x11: $(tr '\n' ' ' <"$OUT/x11-$label.txt")"
+  log "#17823 $label x11 active after the request: $(hyprctl activewindow -j | jq -c '{title, address}') (Battle.net $bnet, World of Warcraft $wow)"
+  log "#17823 $label x11 events after the request: $(tail -n +$((mark + 1)) "$events" | grep -E "^(activewindow|activewindowv2|urgent)>>" | tr '\n' ' ' | head -c 600)"
+  wait "$x11"
+  sleep 1
+  log "#17823 $label clients after: $(bn_clients)"
 }
 
 bn_round base "$HOME/bn-base"
 bn_round head "$HOME/bn-head"
+bn_round head-probe "$HOME/bn-head" probe
+kill "$socat_pid" 2>/dev/null
 cp "$OUT/hyprland.lua.orig" "$cfg"
 hyprctl reload >/dev/null 2>&1
 log "done"
