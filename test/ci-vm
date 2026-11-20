@@ -118,6 +118,11 @@ if ! ssh_vm 'systemd-run --user --quiet --collect --wait omarchy-toggle-idle sta
   exit 1
 fi
 
+# TEMP herald (scratch branch only): what the image ships, printed before the
+# tests start, so the facts exist even if they never run. Nothing is installed.
+ssh_vm 'echo "omarchy package: $(pacman -Q omarchy 2>&1)"; pacman -Q hyprland google-chrome chromium 2>&1; echo "command -v: $(command -v google-chrome-stable chromium | tr "\n" " ")"; echo "hyprctl version: $(hyprctl version 2>&1 | head -n 1)"; echo "session OMARCHY_PATH: $(systemctl --user show-environment | sed -n "s/^OMARCHY_PATH=//p")"' 2>&1 | sed 's/^/test\/ci-vm: TEMP herald image: /' || true
+
+
 # From the user manager: what an Omarchy terminal sees, with default signals.
 # A session whose OMARCHY_PATH is this checkout, with its bin/ first as
 # default/bash/env-bootstrap puts it: the tests call commands by name, and the
@@ -125,7 +130,7 @@ fi
 # neither the commands nor the files added since.
 # The exit status goes to a file of its own, renamed into place whole: the
 # tests print lines like "rc=0" themselves, so the log cannot carry it.
-command='export OMARCHY_PATH=~/src/omarchy PATH=~/src/omarchy/bin:$PATH; cd ~/src/omarchy && date +%s.%N >~/started && ./test/all >~/run.log 2>&1; echo "$?" >~/rc.next && mv ~/rc.next ~/rc'
+command='export OMARCHY_PATH=~/src/omarchy PATH=~/src/omarchy/bin:$PATH; cd ~/src/omarchy && date +%s.%N >~/started && bash test/shell.d/agent-seat-ui-test.sh >~/run.log 2>&1; echo "$?" >~/rc.next && mv ~/rc.next ~/rc'
 ssh_vm "systemd-run --user --quiet --collect --same-dir \
   -E OMARCHY_PKGS_PATH=\$HOME/src/omarchy-pkgs bash -c $(printf %q "$command")"
 last_report="" next_report=0
@@ -154,6 +159,17 @@ echo "test/ci-vm: tests done after $(seconds) s"
 rc=$(ssh_vm 'cat ~/rc')
 ssh_vm 'cat ~/run.log' >"$out/run.log"
 echo "rc=$rc" >>"$out/run.log"
+# TEMP herald (scratch branch only, never upstream): only the seat UI test
+# runs, its whole output printed. Green needs its three TEMP checks, which sit
+# behind a compositor guard and would otherwise pass by being skipped.
+echo "test/ci-vm: TEMP herald: agent-seat-ui-test.sh output follows"
+sed 's/^/  /' "$out/run.log"
+herald_temp=$(grep -c '^ok - TEMP herald' "$out/run.log" || true)
+echo "test/ci-vm: TEMP herald: ok lines: $(grep -c '^ok - ' "$out/run.log"), of which SKIP: $(grep -c '^ok - .* # SKIP$' "$out/run.log"), TEMP herald: $herald_temp, not ok: $(grep -c '^not ok' "$out/run.log")"
+if [[ $herald_temp != "3" ]]; then
+  echo "test/ci-vm: TEMP herald: expected 3 TEMP ok lines, got $herald_temp" >&2
+  rc=97
+fi
 pull_shell_logs
 if [[ $rc != "0" ]]; then
   (print_failure_logs "$out") || true
