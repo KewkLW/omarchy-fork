@@ -26,7 +26,6 @@ step1() {
   mark=$(wc -l <"$events")
   log "#17823 $label step 1 output: $(cd "$HOME" && timeout 60 bash "$ROOT/test/herald-17823-step1.sh" 2>&1 | tr '\n' '|')"
   log "#17823 $label events: $(tail -n +$((mark + 1)) "$events" | grep -E "^(activewindow|urgent)>>" | tr '\n' ' ' | head -c 600)"
-  wait
   sleep 2
 }
 
