@@ -876,10 +876,12 @@ pass "ui and click-ui spell out the control characters in what a page names inst
 
 # An overflow container a transform scales to twice its size shows twice its
 # client width: a button in the second half of it shows, and ui places it
-# there. Headless Chromium runs ui's own clip on such a page.
-if command -v chromium >/dev/null; then
+# there. Headless Chromium runs ui's own clip on such a page: the image's
+# chromium, or Google Chrome where that is the browser installed.
+browser=$(command -v chromium || command -v google-chrome-stable || true)
+if [[ -n $browser ]]; then
   mkdir -p "$test_dir/scaled"
-  scaled=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" "$test_dir/scaled" <<'EOF'
+  scaled=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" "$test_dir/scaled" "$browser" <<'EOF'
 import importlib.machinery, importlib.util, re, subprocess, sys
 loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
 spec = importlib.util.spec_from_loader("seat_ui", loader)
@@ -890,7 +892,7 @@ with open(f"{sys.argv[2]}/page.html", "w") as page:
 <div style="position: absolute; left: 10px; top: 10px; width: 100px; height: 50px; overflow: hidden; transform: scale(2); transform-origin: 0 0">
 <button id="zoomed" style="position: absolute; left: 60px; top: 5px; width: 30px; height: 20px">Zoomed</button></div>
 <pre id="clip"></pre><script>document.getElementById("clip").textContent = JSON.stringify(({ui.CLIP}).call(document.getElementById("zoomed")));</script>""")
-dom = subprocess.run(["timeout", "30", "chromium", "--headless", "--disable-gpu", "--no-first-run", f"--user-data-dir={sys.argv[2]}/profile", "--dump-dom", f"file://{sys.argv[2]}/page.html"], capture_output=True, text=True).stdout
+dom = subprocess.run(["timeout", "30", sys.argv[3], "--headless", "--disable-gpu", "--no-first-run", f"--user-data-dir={sys.argv[2]}/profile", "--dump-dom", f"file://{sys.argv[2]}/page.html"], capture_output=True, text=True).stdout
 print((re.search(r'<pre id="clip">([^<]*)</pre>', dom) or [None, ""])[1])
 EOF
   )
@@ -923,7 +925,7 @@ if (location.search) {
 }
 </script>
 EOF
-  lying=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" "$test_dir/lying" <<'EOF'
+  lying=$(python3 - "$ROOT/bin/omarchy-agent-seat-ui" "$test_dir/lying" "$browser" <<'EOF'
 import importlib.machinery, importlib.util, json, os, signal, subprocess, sys, time, urllib.request
 loader = importlib.machinery.SourceFileLoader("seat_ui", sys.argv[1])
 spec = importlib.util.spec_from_loader("seat_ui", loader)
@@ -932,7 +934,7 @@ loader.exec_module(ui)
 state = {"title": "Seat page", "geometry": [0, 0, 800, 600], "origin": [0, 0, 1], "scale": 1}
 # Headless, so it opens no window, and without the extensions a system may
 # install, which open tabs of their own over the page.
-chromium = subprocess.Popen(["timeout", "60", "chromium", "--headless", "--disable-gpu", "--no-first-run", "--disable-extensions", "--remote-debugging-port=0", "--window-size=800,600", f"--user-data-dir={sys.argv[2]}/profile", "about:blank"], stderr=subprocess.PIPE, text=True, start_new_session=True)
+chromium = subprocess.Popen(["timeout", "60", sys.argv[3], "--headless", "--disable-gpu", "--no-first-run", "--disable-extensions", "--remote-debugging-port=0", "--window-size=800,600", f"--user-data-dir={sys.argv[2]}/profile", "about:blank"], stderr=subprocess.PIPE, text=True, start_new_session=True)
 try:
   port = next(int(line.split("127.0.0.1:")[1].split("/")[0]) for line in chromium.stderr if "DevTools listening on" in line)
 
@@ -967,7 +969,7 @@ EOF
   [[ $(jq -c '.lying' <<<"$lying") == "$honest" ]] || fail "ui places a page that lies about its viewport, boxes and styles where it is" "$lying"
   pass "ui places a page whose scripts lie about its viewport, boxes and styles where it really is"
 else
-  skip "no Chromium; skipping the clip of a scaled overflow container and the page that lies about itself"
+  skip "no chromium or google-chrome-stable; skipping the clip of a scaled overflow container and the page that lies about itself"
 fi
 
 # click-ui hands --page to ui and the rest to the pointer.
