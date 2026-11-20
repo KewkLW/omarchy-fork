@@ -19,7 +19,7 @@ A seat of the agent's own, made in userspace. Apps an agent needs run sandboxed 
 Agents use it through ordinary commands:
 
 ```bash
-window=$(omarchy agent seat run google-chrome-stable https://omarchy.org)
+window=$(omarchy agent seat run google-chrome-stable https://omarchy.org)   # chromium on installs from before Chrome
 omarchy agent seat screenshot "$window"          # a PNG path to read
 omarchy agent seat pointer "$window" click 640 360
 omarchy agent seat type "$window" "hello" --key enter

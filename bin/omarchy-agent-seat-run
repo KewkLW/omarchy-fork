@@ -2,7 +2,7 @@
 
 # omarchy:summary=Launch a sandboxed app on the agent seat and print its agent window number
 # omarchy:args=[--no-wait] [--cdp] [--share <path>] [--share-ro <path>] <command> [args...]
-# omarchy:examples=omarchy agent seat run google-chrome-stable https://omarchy.org | omarchy agent seat run foot | omarchy agent seat run --share ~/Projects/site google-chrome-stable ~/Projects/site/index.html
+# omarchy:examples=omarchy agent seat run google-chrome-stable https://omarchy.org | omarchy agent seat run chromium https://omarchy.org | omarchy agent seat run foot | omarchy agent seat run --share ~/Projects/site google-chrome-stable ~/Projects/site/index.html
 
 # The app runs in a bubblewrap sandbox whose only way to the desktop is the
 # agent seat broker. It gets no Hyprland IPC, no user Wayland or X11 socket, no
