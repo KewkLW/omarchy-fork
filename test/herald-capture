@@ -1,0 +1,165 @@
+#!/bin/bash
+
+# TEMP warden (scratch branch only, never upstream; Herald's capture script): screenshots of this
+# checkout's visible changes in the CI VM, run by test/ci-vm in place of the
+# tests. Every shot writes a PNG or a reason, and the script always exits 0.
+
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/shell.d/base-test.sh"
+set +e +u
+set +o pipefail
+
+OUT="$HOME/shell-logs/herald"
+mkdir -p "$OUT"
+log() { printf 'herald: %s\n' "$*" | tee -a "$OUT/log.txt"; }
+reason() { printf '%s\n' "$2" >"$OUT/$1.reason.txt"; log "no $1: $2"; }
+shot() {
+  local name="$1"
+  if grim "$OUT/$name.png" 2>>"$OUT/log.txt"; then
+    log "shot $name.png"
+  else
+    reason "$name" "grim failed"
+  fi
+}
+
+session_path=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OMARCHY_PATH=//p' | tail -n 1)
+log "root $ROOT, session OMARCHY_PATH ${session_path:-unset}, $(hyprctl version | head -n 1)"
+log "monitors $(hyprctl monitors -j | jq -c '[.[] | {name, width, height, scale, ws: .activeWorkspace.id}]')"
+
+# One shell on screen, this checkout's: the session's own shell (the
+# release's) is stopped with its launcher, and a scratch shell of this
+# checkout takes over the bar, the menu and the notifications.
+pkill -f omarchy-launch-shell
+[[ -n $session_path ]] && timeout 30 quickshell kill -p "$session_path/shell" --any-display >/dev/null 2>&1
+sleep 1
+log "quickshell after stopping the session's: $(quickshell list -a -j 2>&1 | jq -c '[.[].config_path]' 2>&1)"
+
+setup_scratch_shell
+# The VM user's theme and shell settings, so the scratch shell looks as the
+# session's does.
+mkdir -p "$SCRATCH_HOME/.local/state/omarchy" "$SCRATCH_HOME/.config"
+cp -a "$HOME/.local/state/omarchy/current" "$SCRATCH_HOME/.local/state/omarchy/" 2>>"$OUT/log.txt"
+cp -a "$HOME/.config/omarchy" "$SCRATCH_HOME/.config/" 2>>"$OUT/log.txt"
+log "seeded theme: $(readlink "$SCRATCH_HOME/.local/state/omarchy/current/theme" 2>&1)"
+start_scratch_shell
+shell_up=""
+for _ in {1..150}; do
+  [[ $(scratch_ipc shell ping 2>/dev/null || true) == "ok" ]] && { shell_up=1; break; }
+  kill -0 "$SCRATCH_PID" 2>/dev/null || break
+  sleep 0.2
+done
+log "scratch shell answers: ${shell_up:-no}"
+sleep 3
+log "org.freedesktop.Notifications owner pid: $(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetConnectionUnixProcessID s org.freedesktop.Notifications 2>&1), scratch shell pid $SCRATCH_PID"
+
+# Opens the scratch shell's menu at <route> and waits for it to map.
+summon_menu() {
+  local route="$1"
+  for _ in {1..80}; do
+    [[ $(scratch_ipc shell summon omarchy.menu "{\"menu\":\"$route\"}" 2>/dev/null || true) == "ok" ]] && break
+    sleep 0.1
+  done
+  wait_scratch_layer omarchy-menu mapped
+}
+hide_menu() {
+  scratch_ipc_quiet shell hide omarchy.menu >/dev/null 2>&1 || true
+  wait_scratch_layer omarchy-menu absent
+}
+# Shot of the menu at <route>, plain, then filtered by typing <filter>.
+menu_shots() {
+  local name="$1" route="$2" filter="$3"
+  scratch_ipc_quiet shell call omarchy.menu refresh '{}' >/dev/null 2>&1
+  sleep 0.5
+  if summon_menu "$route"; then
+    sleep 1.5
+    shot "$name"
+    if [[ -n $filter ]] && command -v wtype >/dev/null; then
+      wtype "$filter"
+      sleep 1.5
+      shot "$name-filtered"
+    fi
+  else
+    reason "$name" "the menu at $route did not map"
+  fi
+  hide_menu
+  sleep 0.5
+}
+
+capture_main() {
+  local flag="$SCRATCH_HOME/.local/state/omarchy/toggles/memory-watch-on"
+  # The watchdog off: the toggle menu offers "Memory Watch On".
+  rm -f "$flag"
+  menu_shots memory-menu-watch-off trigger.toggle "Memory"
+  # On: it offers "Memory Watch Off".
+  mkdir -p "${flag%/*}" && touch "$flag"
+  menu_shots memory-menu-watch-on trigger.toggle "Memory"
+  rm -f "$flag"
+
+  # The brake, on readings past its lines (swap 80% and RAM 88% used), told to
+  # pick only a demo process holding 1200M (over the default 1024M floor): it pauses it and sends its toast.
+  local fake demo
+  fake=$(mktemp -d)
+  printf 'MemTotal: 1000000 kB\nMemAvailable: 120000 kB\nSwapTotal: 1000000 kB\nSwapFree: 200000 kB\n' >"$fake/meminfo"
+  printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n' >"$fake/pressure"
+  setsid bash -c 'exec -a omarchy-herald-demo python3 -c "import time; b = bytearray(1200 * 1024 * 1024); b[::4096] = b\"x\" * len(b[::4096]); time.sleep(600)"' &
+  demo=$!
+  sleep 3
+  log "demo $demo: $(ps -o pid,stat,rss,comm,args -p "$demo" | tail -n 1)"
+  local state="$SCRATCH_HOME/.local/state/omarchy/memory-watch"
+  (
+    export HOME="$SCRATCH_HOME" XDG_CONFIG_HOME="$SCRATCH_HOME/.config" XDG_STATE_HOME="$SCRATCH_HOME/.local/state" OMARCHY_PATH="$ROOT" PATH="$ROOT/bin:$PATH"
+    exec env OMARCHY_MEMORY_MEMINFO="$fake/meminfo" OMARCHY_MEMORY_PRESSURE="$fake/pressure" OMARCHY_MEMORY_APP_PRESSURE="$fake/app-pressure" \
+      OMARCHY_MEMORY_INTERVAL=0.5 OMARCHY_MEMORY_ONLY='^omarchy-herald-demo( |$)' OMARCHY_MEMORY_RESUME_HOLDOFF=0 \
+      timeout 15 "$ROOT/bin/omarchy-memory-watch"
+  ) >"$OUT/watch.out" 2>&1 &
+  local watcher=$! braked=""
+  for _ in {1..100}; do
+    grep -q 'brake: paused' "$state/watch.log" 2>/dev/null && { braked=1; break; }
+    sleep 0.1
+  done
+  log "toast owner at the brake: $(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetConnectionUnixProcessID s org.freedesktop.Notifications 2>&1)"
+  if [[ -n $braked ]]; then
+    sleep 2
+    shot memory-brake-toast
+  else
+    reason memory-brake-toast "no 'brake: paused' in watch.log"
+  fi
+  cp "$state/watch.log" "$OUT/watch.log" 2>/dev/null
+  log "demo state after: $(ps -o stat= -p "$demo")"
+  wait "$watcher"
+  HOME="$SCRATCH_HOME" XDG_STATE_HOME="$SCRATCH_HOME/.local/state" OMARCHY_PATH="$ROOT" "$ROOT/bin/omarchy-memory-resume" >>"$OUT/log.txt" 2>&1
+  kill -CONT "$demo" 2>/dev/null
+  kill "$demo" 2>/dev/null
+  rm -rf "$fake"
+
+  # Worst-case bodies, through the PR's own catalog keys and in the order the
+  # watcher composes them: a 15-character name (the most /proc's comm holds),
+  # 65536M and 100% figures. Only the two of them on screen.
+  worst_toasts memory-toasts-worst "Isolated Web Co"
+  worst_toasts memory-toasts-worst-wide "WWWWWWWWWWWWWWW"
+}
+
+worst_toasts() {
+  local name="$1" leader="$2" glyph=$'\U000f035b'
+  scratch_ipc notifications dismissAll >>"$OUT/log.txt" 2>&1
+  sleep 1
+  (
+    export HOME="$SCRATCH_HOME" XDG_CONFIG_HOME="$SCRATCH_HOME/.config" XDG_STATE_HOME="$SCRATCH_HOME/.local/state" OMARCHY_PATH="$ROOT" PATH="$ROOT/bin:$PATH"
+    omarchy-notification-send --urgency critical --glyph "$glyph" "$(omarchy-i18n memory.runningOut)" \
+      "$(omarchy-i18n memory.warnLargest "$leader" 65536 "omarchy memory top") $(omarchy-i18n memory.warnSwap 100 100)"
+    sleep 0.5
+    omarchy-notification-send --urgency critical --glyph "$glyph" "$(omarchy-i18n memory.brakePaused "$leader")" \
+      "$(omarchy-i18n memory.brakePausedBody 65536 "omarchy memory resume")"
+  ) >>"$OUT/log.txt" 2>&1
+  sleep 2
+  shot "$name"
+}
+
+capture_main
+
+hide_menu
+stop_scratch_shell
+log "scratch shell log tail:"
+tail -n 40 "$SCRATCH_LOG" >>"$OUT/log.txt" 2>&1
+cp "$SCRATCH_LOG" "$OUT/quickshell.log" 2>/dev/null
+ls -la "$OUT" >>"$OUT/log.txt"
+exit 0
