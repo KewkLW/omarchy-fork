@@ -77,7 +77,10 @@ trap cleanup EXIT
 # A key made for this run only, handed in through the firmware tables as a
 # systemd credential: the image holds no key, and no run can reuse another's.
 ssh-keygen -q -t ed25519 -N '' -C ci-vm -f "$state/id_ed25519"
-keys=$(printf 'd /home/omarchy/.ssh 0700 omarchy omarchy -\nf+ /home/omarchy/.ssh/authorized_keys 0600 omarchy omarchy - %s\n' \
+# TEMP tryit (scratch, never upstream): sudo without a password for the VM's
+# user, from the same root tmpfiles credential as the key: pkg add, dev link,
+# dev unlink and the reboots need sudo, where a tester types their password.
+keys=$(printf 'd /home/omarchy/.ssh 0700 omarchy omarchy -\nf+ /home/omarchy/.ssh/authorized_keys 0600 omarchy omarchy - %s\nf+ /etc/sudoers.d/zz-ci-tryit 0440 root root - omarchy ALL=(ALL) NOPASSWD: ALL\n' \
   "$(cat "$state/id_ed25519.pub")" | base64 -w0)
 
 qemu-img create -qf qcow2 -b "$(realpath "$image/base.qcow2")" -F qcow2 "$state/run.qcow2"
@@ -127,60 +130,85 @@ if ! ssh_vm 'systemd-run --user --quiet --collect --wait omarchy-toggle-idle sta
   exit 1
 fi
 
-# From the user manager: what an Omarchy terminal sees, with default signals.
-# A session whose OMARCHY_PATH is this checkout, with its bin/ first as
-# default/bash/env-bootstrap puts it: the tests call commands by name, and the
-# commands read their files from OMARCHY_PATH. The installed release has
-# neither the commands nor the files added since.
-# The exit status goes to a file of its own, renamed into place whole: the
-# tests print lines like "rc=0" themselves, so the log cannot carry it.
-args_quoted=""
-if (( ${#suite_args[@]} > 0 )); then
-  printf -v args_quoted ' %q' "${suite_args[@]}"
-fi
-comp_jobs_env=""
-if [[ -n ${OMARCHY_TEST_COMP_JOBS:-} ]]; then
-  printf -v comp_jobs_env ' OMARCHY_TEST_COMP_JOBS=%q' "$OMARCHY_TEST_COMP_JOBS"
-fi
-command="export OMARCHY_PATH=~/src/omarchy PATH=~/src/omarchy/bin:\$PATH OMARCHY_TEST_USE_LIVE_COMPOSITOR=1${comp_jobs_env}; cd ~/src/omarchy && date +%s.%N >~/started && ./test/all${args_quoted} >~/run.log 2>&1; echo \"\$?\" >~/rc.next && mv ~/rc.next ~/rc"
-ssh_vm "systemd-run --user --quiet --collect --same-dir \
-  -E OMARCHY_PKGS_PATH=\$HOME/src/omarchy-pkgs bash -c $(printf %q "$command")"
-last_report="" next_report=0
-until ssh_vm '[[ -s ~/rc ]]' 2>/dev/null; do
-  if (( $(seconds) >= ${CI_VM_TIMEOUT:-1500} )); then
-    echo "test/ci-vm: the tests did not finish in ${CI_VM_TIMEOUT:-1500} s" >&2
-    ssh_vm 'cat ~/run.log' >"$out/run.log" || true
-    pull_shell_logs
-    (print_failure_logs "$out") || true
-    pull_kernel_log
-    pull_user_journal
-    exit 1
-  else
-    if (( $(seconds) >= next_report )); then
-      report=$(shell_progress 2>/dev/null || true)
-      if [[ -n $report && $report != "$last_report" ]]; then
-        echo "test/ci-vm: $report after $(seconds) s"
-        last_report=$report
-      fi
-      next_report=$(( $(seconds) + 15 ))
-    fi
-    sleep 2
-  fi
-done
-echo "test/ci-vm: tests done after $(seconds) s"
-
-rc=$(ssh_vm 'cat ~/rc')
-ssh_vm 'cat ~/run.log' >"$out/run.log"
-echo "rc=$rc" >>"$out/run.log"
-pull_shell_logs
-if [[ $rc != "0" ]]; then
-  (print_failure_logs "$out") || true
+# TEMP tryit (scratch, never upstream): the "Try it" section of PR #15087 on
+# this VM, in place of ./test/all (the suite arguments are ignored).
+# test/tryit/steps runs the section's lines verbatim in the desktop session,
+# phase by phase; this file does the reboots between them, as a tester does.
+: "${suite_args[@]+}"
+tryit_say() { echo "test/ci-vm: TEMP tryit: $*"; }
+pull_shots() {
+  ssh_vm 'mkdir -p ~/tryit-shots && tar cf - -C ~ tryit-shots' | tar xf - --no-same-owner -C "$out" 2>/dev/null || true
+}
+tryit_fail() {
+  echo "test/ci-vm: TEMP tryit: FAIL: $*" >&2
+  pull_shots
   pull_user_journal
-fi
-ssh_vm 'systemd-analyze; systemd-analyze blame | head -25' >"$out/boot.txt" 2>&1 || true
-ssh_vm 'echo "source tree: $(cd ~/src/omarchy && git status --porcelain | wc -l) changed files"'
-pull_kernel_log
+  pull_kernel_log
+  exit 1
+}
+# A connection of its own, bounded and never shared, for a machine that is
+# going down or coming up.
+tryit_ssh() {
+  timeout "$1" ssh -i "$state/id_ed25519" -p "$port" -o BatchMode=yes -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2 -o LogLevel=ERROR \
+    -o ControlMaster=no -o ControlPath=none omarchy@127.0.0.1 "${@:2}"
+}
+# A guest reboot comes back through the same kernel and the overlay keeps the
+# disk, so the VM reboots as a laptop does; wait for its session as at boot.
+tryit_reboot() {
+  local before after deadline
+  before=$(ssh_vm 'cat /proc/sys/kernel/random/boot_id')
+  tryit_ssh 30 'sudo -n systemctl reboot' >/dev/null 2>&1 || true
+  ssh -o ControlPath="$state/ssh.sock" -O exit omarchy@127.0.0.1 2>/dev/null || true
+  rm -f "$state/ssh.sock"
+  deadline=$(( SECONDS + 300 ))
+  until after=$(tryit_ssh 20 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null) && [[ -n $after && $after != "$before" ]]; do
+    (( SECONDS < deadline )) || tryit_fail "the VM did not come back from a reboot within 300 s"
+    sleep 1
+  done
+  until ssh_vm 'systemctl --user show-environment | grep -q ^HYPRLAND_INSTANCE_SIGNATURE='; do
+    (( SECONDS < deadline )) || tryit_fail "no desktop session within 300 s of a reboot"
+    sleep 0.5
+  done
+  # The shell and the first-login notifications settle before the next phase.
+  sleep 10
+  ssh_vm 'systemd-run --user --quiet --collect --wait omarchy-toggle-idle stay-awake' >/dev/null || tryit_say "could not keep the session awake after a reboot"
+  tryit_say "rebooted (boot $after), desktop up after $(seconds) s"
+}
+# One phase of test/tryit/steps in the desktop session's user manager: the
+# environment a terminal opened in the session gets.
+tryit_phase() {
+  local rc=0
+  tryit_say "phase $1 starts after $(seconds) s"
+  ssh_vm "timeout 900 systemd-run --user --quiet --collect --wait --pipe bash ~/src/omarchy/test/tryit/steps $1" </dev/null 2>&1 | tee "$out/tryit-$1.log" || rc=$?
+  tryit_say "phase $1 ended with $rc after $(seconds) s; $(grep -c ' ok - ' "$out/tryit-$1.log") ok, $(grep -c ' FAIL - ' "$out/tryit-$1.log") FAIL"
+  pull_shots
+  return "$rc"
+}
 
-sed -n '/^\(Skipped checks in\|All [0-9][0-9]* test files passed\.\|[0-9][0-9]* test files completed without failures\|[0-9][0-9]* of [0-9][0-9]* test files failed:\|Slowest test files:\)/,$p' "$out/run.log"
-# The tests' verdict is the run's verdict.
-[[ $rc == "0" ]]
+ssh_vm 'sudo -n true' || tryit_fail "sudo without a password: $(ssh_vm 'sudo -n -l 2>&1; ls -l /etc/sudoers.d 2>&1' || true)"
+tryit_say "image: $(ssh_vm 'pacman -Q omarchy hyprland chromium google-chrome bubblewrap wayland-protocols wtype 2>&1 | tr "\n" " "')"
+tryit_say "tested tree: $(ssh_vm 'cd ~/src/omarchy && git log --format="%H %s" -3 | tr "\n" ";"')"
+date +%s >/dev/null
+ssh_vm 'date +%s.%N >~/started'
+
+results=()
+tryit_phase quick && results+=("quick=ok") || results+=("quick=FAIL")
+[[ $(ssh_vm 'cat /etc/omarchy.conf') == *omarchy-agent-seat* ]] || tryit_fail "the quick phase did not link the clone; the rest needs it"
+tryit_reboot
+
+# The harness's own keyboard for pressing the binding and picking menu rows:
+# not a tester's step.
+ssh_vm 'sudo -n pacman -S --noconfirm --needed wtype >/dev/null 2>&1 || sudo -n pacman -Sy --noconfirm --needed wtype >/dev/null 2>&1; pacman -Q wtype' | sed 's/^/test\/ci-vm: TEMP tryit: harness: /' || true
+tryit_phase linked && results+=("linked=ok") || results+=("linked=FAIL")
+[[ $(ssh_vm 'cat /etc/omarchy.conf') == *'"/usr/share/omarchy"'* ]] || tryit_fail "the linked phase did not unlink; the rest needs it"
+tryit_reboot
+
+tryit_phase after && results+=("after=ok") || results+=("after=FAIL")
+
+pull_user_journal
+pull_kernel_log
+tryit_say "every check, in order:"
+grep -h -E '^TRYIT [a-z]+ (ok|FAIL) - ' "$out"/tryit-quick.log "$out"/tryit-linked.log "$out"/tryit-after.log 2>/dev/null | sed 's/^/  /'
+tryit_say "results: ${results[*]}"
+[[ ${results[*]} == "quick=ok linked=ok after=ok" ]]

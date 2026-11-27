@@ -1,0 +1,414 @@
+#!/bin/bash
+
+# TEMP tryit (scratch, never upstream): runs the lines of section.md, the "Try
+# it" section of PR #15087, verbatim and in order, inside the VM's desktop
+# session, and checks after each that it did what the section says. Every line
+# run goes through `step`, which refuses a line that is not a line of
+# section.md. test/ci-vm on this scratch branch calls it once per phase:
+#
+#   quick   the session runs the installed Omarchy; clone, export, pkg add,
+#           the first session, then omarchy dev link (the reboot follows)
+#   linked  after the reboot: the first session again, the binding, the menu
+#           rows, then omarchy dev unlink (the reboot follows)
+#   after   after the second reboot: what unlink left behind
+#
+# A check that fails prints "TRYIT <phase> FAIL - ..." and the phase exits 1 at
+# the end; it never skips.
+
+set -uo pipefail
+
+phase=$1
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+section=$here/section.md
+tested_tree=$(cd "$here/../.." && pwd)
+clone=$HOME/omarchy-agent-seat
+shots=$HOME/tryit-shots
+mkdir -p "$shots"
+tmp=$(mktemp -d)
+failures=0
+
+say() { printf 'TRYIT %s: %s\n' "$phase" "$*"; }
+ok() { printf 'TRYIT %s ok - %s\n' "$phase" "$*"; }
+bad() {
+  printf 'TRYIT %s FAIL - %s\n' "$phase" "$1"
+  [[ -z ${2:-} ]] || printf '%s\n' "$2" | sed 's/^/    | /'
+  failures=$((failures + 1))
+}
+indent() { sed "s/^/    $1 /"; }
+
+# One line of the section, read from stdin, run in this shell as a terminal
+# would run it; its output lands in $out and $err, its status in $rc.
+step() {
+  local cmd
+  cmd=$(cat)
+  grep -Fxq -- "$cmd" "$section" || bad "the harness ran a line that is not in section.md: $cmd"
+  printf 'TRYIT %s $ %s\n' "$phase" "$cmd"
+  eval "$cmd" </dev/null >"$tmp/out" 2>"$tmp/err"
+  rc=$?
+  out=$(cat "$tmp/out")
+  err=$(cat "$tmp/err")
+  [[ -z $out ]] || printf '%s\n' "$out" | head -n 80 | indent '>'
+  [[ -z $err ]] || printf '%s\n' "$err" | head -n 80 | indent '2>'
+  printf 'TRYIT %s   (exit %s)\n' "$phase" "$rc"
+}
+
+active_ws() { hyprctl activeworkspace -j | jq -r '.id'; }
+active_win() { hyprctl activewindow -j 2>/dev/null | jq -r '.class // ""' 2>/dev/null; }
+cursor() { hyprctl cursorpos; }
+agent_client() { hyprctl clients -j | jq -c --arg c "agent-$1." 'map(select(.class | startswith($c))) | first // empty'; }
+wait_client() {
+  local i
+  for i in {1..50}; do
+    client=$(agent_client "$1")
+    [[ -n $client ]] && return 0
+    sleep 0.2
+  done
+  return 1
+}
+shell_procs() { pgrep -u "$UID" -af 'quickshell|(^|/)qs ' | grep -v pgrep; }
+shot() { grim "$shots/$phase-$1.png" 2>&1 && say "screenshot $phase-$1.png"; }
+# The text block of the Agent seat binding in `hyprctl binds` (its JSON is
+# not valid on Hyprland 0.56).
+seat_bind() {
+  hyprctl binds | awk '
+    /^bind/ { if (block ~ /description: Agent seat\n/) printf "%s", block; block = $0 "\n"; next }
+    { block = block $0 "\n" }
+    END { if (block ~ /description: Agent seat\n/) printf "%s", block }'
+}
+pressed() {
+  wtype "$@" 2>&1
+}
+
+say "environment: OMARCHY_PATH=${OMARCHY_PATH-<unset>}; omarchy is $(command -v omarchy); $(hyprctl version | head -n 1)"
+say "chromium: $(chromium --version 2>&1 | head -n 1); google-chrome-stable: $(command -v google-chrome-stable || echo none)"
+say "monitors: $(hyprctl monitors -j | jq -c 'map({name, width, height, scale, activeWorkspace: .activeWorkspace.id})')"
+
+# The section's first session; $1 is quick or linked, for what the window
+# does in Hyprland.
+first_session() {
+  local mode=$1 ws_before win_before cur_before ws_now win_now tries
+
+  ws_before=$(active_ws)
+  win_before=$(active_win)
+  cur_before=$(cursor)
+  say "before run: workspace $ws_before, focused window '${win_before}', cursor $cur_before"
+
+  step <<'EOF'
+printf '<title>Seat test</title><input aria-label="Name" oninput="document.title=value">' >/tmp/seat-test.html
+EOF
+  [[ $rc == 0 && -s /tmp/seat-test.html ]] && ok "the test page is written" || bad "the test page is written" "rc $rc"
+
+  w=""
+  step <<'EOF'
+w=$(omarchy agent seat run --cdp --share-ro /tmp/seat-test.html chromium file:///tmp/seat-test.html)
+EOF
+  say "\$w is '$w'"
+  if [[ $rc != 0 || ! $w =~ ^[0-9]+$ ]]; then
+    bad "run prints the agent window's number" "rc $rc, w '$w', stderr: $err
+$(tail -n 40 "$XDG_RUNTIME_DIR/omarchy/agent-seat/apps.log" "$XDG_RUNTIME_DIR/omarchy/agent-seat/broker.log" 2>&1)"
+    return
+  fi
+  ok "run exited 0 and \$w holds window $w"
+
+  if ! wait_client "$w"; then
+    bad "Hyprland lists the agent window" "$(hyprctl clients -j | jq -c 'map({class, title, workspace: .workspace.id})')"
+  else
+    sleep 1
+    client=$(agent_client "$w")
+    ws_now=$(active_ws)
+    win_now=$(active_win)
+    say "agent window: $(jq -c '{class, title, workspace: .workspace.id, tags, floating}' <<<"$client"); now on workspace $ws_now, focused '$win_now'"
+    local client_ws tagged
+    client_ws=$(jq -r '.workspace.id' <<<"$client")
+    tagged=$(jq -r '.tags | any(startswith("agent-seat"))' <<<"$client")
+    if [[ $mode == quick ]]; then
+      [[ $client_ws == "$ws_before" ]] && ok "quick: the window opened on the workspace the user is on ($client_ws), not the seat's" || bad "quick: the window opens on the user's workspace" "window on $client_ws, user was on $ws_before"
+      [[ $win_now == "agent-$w."* ]] && ok "quick: the window took the user's focus (focused: $win_now)" || bad "quick: the window takes the user's focus" "focused '$win_now'"
+      [[ $tagged == false ]] && ok "quick: no agent-seat tag, so no orange outline (tags $(jq -c .tags <<<"$client"))" || bad "quick: the window has no seat outline" "$client"
+    else
+      [[ $client_ws == 10 ]] && ok "linked: the window opened on workspace 10, the focused monitor's tenth" || bad "linked: the window opens on workspace 10" "$client"
+      [[ $tagged == true ]] && ok "linked: the window carries the agent-seat tag, the outline rule's match (tags $(jq -c .tags <<<"$client"))" || bad "linked: the window is tagged for the outline" "$client"
+      [[ $ws_now == "$ws_before" && $win_now == "$win_before" ]] && ok "linked: the user's workspace ($ws_now) and focus ('$win_now') did not change" || bad "linked: run leaves the user's workspace and focus alone" "before $ws_before '$win_before', after $ws_now '$win_now'"
+      border=$(hyprctl getprop "address:$(jq -r .address <<<"$client")" active_border_color 2>&1 || true)
+      say "linked: window border property: $border"
+    fi
+  fi
+
+  step <<'EOF'
+omarchy agent seat ui "$w"
+EOF
+  tries=1
+  while [[ $out != *'textbox "Name"'* ]] && (( tries < 30 )); do
+    sleep 1
+    tries=$((tries + 1))
+    out=$(omarchy agent seat ui "$w" 2>&1)
+  done
+  if [[ $out == *'textbox "Name"'* ]]; then
+    ok "ui lists the page's textbox on try $tries: $(grep -F 'textbox "Name"' <<<"$out" | head -n 1 | sed 's/^ *//')"
+    (( tries == 1 )) || printf '%s\n' "$out" | head -n 20 | indent "try $tries >"
+  else
+    bad "ui lists textbox \"Name\"" "$out"
+  fi
+
+  step <<'EOF'
+omarchy agent seat click-ui "$w" Name
+EOF
+  [[ $rc == 0 && $out == 'Clicked textbox "Name" at '* ]] && ok "click-ui: $out" || bad "click-ui prints Clicked textbox \"Name\" at x,y" "rc $rc: $out $err"
+
+  step <<'EOF'
+omarchy agent seat type "$w" "hello from the agent"
+EOF
+  [[ $rc == 0 && -z $out && -z $err ]] && ok "type exited 0 and printed nothing" || bad "type prints nothing" "rc $rc: $out $err"
+
+  step <<'EOF'
+omarchy agent seat state "$w"
+EOF
+  tries=1
+  while [[ $out != *'"hello from the agent'* ]] && (( tries < 20 )); do
+    sleep 0.5
+    tries=$((tries + 1))
+    out=$(omarchy agent seat state "$w" 2>&1)
+  done
+  [[ $out == *'"hello from the agent'* ]] && ok "state shows the typed title on try $tries: $(head -n 1 <<<"$out")" || bad "state shows the title starting with hello from the agent" "$out"
+  [[ $out == *"focus:  agent acted last"* ]] && ok "state: $(grep 'focus:' <<<"$out" | sed 's/^ *//')" || bad "state says focus:  agent acted last" "$out"
+
+  [[ $(cursor) == "$cur_before" ]] && ok "the user's cursor did not move through click-ui and type ($cur_before)" || bad "the user's cursor stays put" "before $cur_before, after $(cursor)"
+  ws_now=$(active_ws)
+  win_now=$(active_win)
+  say "after click-ui and type: workspace $ws_now, focused '$win_now'"
+  if [[ $mode == linked ]]; then
+    [[ $ws_now == "$ws_before" && $win_now == "$win_before" ]] && ok "linked: workspace and focus unchanged through click-ui and type" || bad "linked: workspace and focus unchanged through click-ui and type" "before $ws_before '$win_before', after $ws_now '$win_now'"
+  fi
+
+  step <<'EOF'
+omarchy agent seat screenshot "$w"
+EOF
+  if [[ $rc == 0 && -f $out && $(head -c 8 "$out" | od -An -tx1 | tr -d ' \n') == 89504e470d0a1a0a ]]; then
+    cp "$out" "$shots/$phase-agent-window.png"
+    ok "screenshot printed $out, a PNG of $(stat -c %s "$out") bytes"
+  else
+    bad "screenshot prints the path of a PNG" "rc $rc: $out $err"
+  fi
+  shot after-session
+}
+
+failure_report() {
+  step <<'EOF'
+omarchy agent seat status --json; omarchy dev status; hyprctl version | head -n 1; hyprctl configerrors
+EOF
+  jq -e '.running == true' <<<"$(sed -n '1,/^}/p' <<<"$out")" >/dev/null 2>&1 && ok "the report's first line runs and shows the seat running" || bad "the failure report's first line runs" "rc $rc: $out"
+  step <<'EOF'
+tail -n 50 "$XDG_RUNTIME_DIR"/omarchy/agent-seat/{apps,broker}.log
+EOF
+  [[ $rc == 0 && $out == *"apps.log <=="* && $out == *"broker.log <=="* ]] && ok "the report's second line shows both logs" || bad "the failure report's tail shows both logs" "rc $rc"
+}
+
+stop_seat() {
+  step <<'EOF'
+omarchy agent seat stop
+EOF
+  [[ $rc == 0 && $out == "Agent seat: stopped" ]] && ok "stop printed '$out'" || bad "stop prints Agent seat: stopped" "rc $rc: $out $err"
+  if [[ -n ${w:-} ]]; then
+    local i
+    for i in {1..25}; do
+      [[ -z $(agent_client "$w") ]] && break
+      sleep 0.2
+    done
+    [[ -z $(agent_client "$w") ]] && ok "stop closed window $w" || bad "stop closes the window" "$(agent_client "$w")"
+  fi
+  omarchy-agent-seat-status >/dev/null && bad "status says stopped after stop" || ok "status exits 1 after stop: $(omarchy-agent-seat-status)"
+}
+
+case $phase in
+quick)
+  # --- Quick look --------------------------------------------------------------
+  say "installed: $(pacman -Q omarchy 2>&1); bubblewrap/wayland-protocols before: $(pacman -Q bubblewrap wayland-protocols 2>&1 | tr '\n' ' ')"
+  say "installed omarchy dev link: $(command -v omarchy-dev-link || echo none)"
+  [[ $(hyprctl binds | grep -c 'description: Agent seat') == 0 ]] && ok "quick: before anything, the session has no Agent seat binding" || bad "quick: no binding before anything"
+
+  step <<'EOF'
+git clone --depth 1 --branch agent-seat https://github.com/KewkLW/omarchy-fork.git ~/omarchy-agent-seat
+EOF
+  if [[ $rc == 0 && -d $clone/.git ]]; then
+    ok "the clone command works; it got $(git -C "$clone" rev-parse HEAD) from the fork's agent-seat"
+  else
+    bad "the clone command works" "rc $rc: $err"
+  fi
+  # The fork's agent-seat may not be the commit under test yet: the clone's
+  # place gets the tested tree, so every later line runs on it.
+  rm -rf "$clone"
+  cp -a "$tested_tree" "$clone"
+  say "harness: replaced ~/omarchy-agent-seat with the tested tree, $(git -C "$clone" log -1 --format='%h %s')"
+
+  step <<'EOF'
+export OMARCHY_PATH=~/omarchy-agent-seat PATH=~/omarchy-agent-seat/bin:$PATH
+EOF
+  [[ $OMARCHY_PATH == "$clone" && $(command -v omarchy) == "$clone/bin/omarchy" ]] && ok "the export puts the clone first: OMARCHY_PATH=$OMARCHY_PATH, omarchy is $(command -v omarchy)" || bad "the export points at the clone" "OMARCHY_PATH=$OMARCHY_PATH omarchy=$(command -v omarchy)"
+
+  step <<'EOF'
+omarchy pkg add bubblewrap wayland-protocols
+EOF
+  if [[ $rc != 0 ]]; then
+    say "harness: pkg add failed on the image's sync databases; syncing them (sudo pacman -Sy) and running the line again"
+    sudo -n pacman -Sy --noconfirm 2>&1 | tail -n 5 | indent 'sync>'
+    step <<'EOF'
+omarchy pkg add bubblewrap wayland-protocols
+EOF
+  fi
+  pkgs=$(pacman -Q bubblewrap wayland-protocols 2>&1)
+  [[ $rc == 0 ]] && pacman -Q bubblewrap wayland-protocols >/dev/null 2>&1 && ok "pkg add installed what was missing: $(tr '\n' ' ' <<<"$pkgs")" || bad "pkg add installs bubblewrap and wayland-protocols" "rc $rc: $pkgs"
+
+  first_session quick
+
+  # What the quick look does not show.
+  [[ $(hyprctl binds | grep -c 'description: Agent seat') == 0 ]] && ok "quick: Super + Ctrl + Alt + X is not bound (no Agent seat binding in hyprctl binds)" || bad "quick: no binding" "$(seat_bind)"
+  shell_cmd=$(shell_procs)
+  say "quick: the running shell: $shell_cmd"
+  [[ $shell_cmd != *"$clone"* ]] && ! grep -q agent-seat /usr/share/omarchy/default/omarchy/omarchy-menu.jsonc && ok "quick: the running shell is the installed one, whose menu has no agent-seat rows" || bad "quick: the menu has no seat rows" "$shell_cmd"
+  omarchy menu summon trigger >/dev/null 2>&1 && sleep 1.5 && shot menu-trigger
+  omarchy menu close >/dev/null 2>&1 || true
+
+  failure_report
+  stop_seat
+
+  # --- Full path: link ---------------------------------------------------------
+  step <<'EOF'
+omarchy dev link ~/omarchy-agent-seat
+EOF
+  say "omarchy dev link ran $(command -v omarchy-dev-link)"
+  conf=$(cat /etc/omarchy.conf 2>&1)
+  [[ $rc == 0 && $conf == "export OMARCHY_PATH=\"$clone\"" ]] && ok "dev link wrote /etc/omarchy.conf: $conf" || bad "dev link points /etc/omarchy.conf at the clone" "rc $rc: $conf"
+  [[ $out == *"Pointed Omarchy at $clone"* ]] && ok "dev link said: $(head -n 1 <<<"$out")" || bad "dev link reports what it did" "$out"
+  [[ ! -e $HOME/.local/state/omarchy/migrations/1795744236.sh ]] && ok "dev link ran no migration (the seat's is not marked done)" || bad "dev link runs no migration"
+  ;;
+
+linked)
+  # --- Full path: after the reboot ---------------------------------------------
+  [[ $OMARCHY_PATH == "$clone" && $(command -v omarchy) == "$clone/bin/omarchy" ]] && ok "linked: a new terminal's environment runs the clone: OMARCHY_PATH=$OMARCHY_PATH" || bad "linked: the session's OMARCHY_PATH is the clone" "OMARCHY_PATH=$OMARCHY_PATH omarchy=$(command -v omarchy)"
+  hypr_pid=$(pgrep -u "$UID" -x Hyprland | head -n 1 || pgrep -u "$UID" -x hyprland | head -n 1)
+  hypr_path=$(tr '\0' '\n' <"/proc/$hypr_pid/environ" 2>/dev/null | sed -n 's/^OMARCHY_PATH=//p')
+  [[ $hypr_path == "$clone" ]] && ok "linked: Hyprland ($hypr_pid) started with OMARCHY_PATH=$hypr_path" || bad "linked: Hyprland runs the clone" "$hypr_path"
+  errors=$(hyprctl configerrors 2>&1)
+  say "linked: hyprctl configerrors: $errors"
+  shell_cmd=$(shell_procs)
+  [[ $shell_cmd == *"$clone/shell"* ]] && ok "linked: the shell runs the clone's: $shell_cmd" || bad "linked: the shell runs the clone's shell/" "$shell_cmd"
+
+  pending=$(omarchy-migrate --pending 2>&1)
+  say "linked: pending migrations: $(sed '/^$/d' <<<"$pending" | wc -l), the seat's among them: $(grep -c '1795744236' <<<"$pending")"
+  say "linked: omarchy-migrate-notify: $(systemctl --user show -p ActiveState,Result,ExecMainStatus omarchy-migrate-notify.service 2>&1 | tr '\n' ' ')"
+  journalctl --user -b -u omarchy-migrate-notify.service --no-pager 2>&1 | tail -n 8 | indent 'journal>'
+  grep -q 1795744236 <<<"$pending" && ok "linked: the clone's migrations are pending, the seat's among them" || bad "linked: the seat's migration is pending" "$pending"
+
+  bind=$(seat_bind)
+  printf '%s\n' "$bind" | indent 'bind>'
+  [[ $bind == *"modmask: 76"* && $bind == *"omarchy-agent-seat-show"* ]] && ok "linked: Hyprland binds the Agent seat key with modmask 76 (Super + Ctrl + Alt) to omarchy-agent-seat-show" || bad "linked: the binding is Super + Ctrl + Alt + X to omarchy-agent-seat-show" "$bind"
+  [[ $(sed -n 's/^[[:space:]]*key: //p' <<<"$bind") == [xX] ]] && ok "linked: the binding's key is X" || bad "linked: the binding's key is X" "$bind"
+
+  first_session linked
+  failure_report
+
+  # The binding, pressed on a virtual keyboard.
+  ws_before=$(active_ws)
+  say "before the binding: workspace $ws_before, focused '$(active_win)'"
+  if command -v wtype >/dev/null; then
+    pressed -M logo -M ctrl -M alt -k x -m alt -m ctrl -m logo
+    for _ in {1..30}; do
+      [[ $(active_win) == "agent-$w."* ]] && break
+      sleep 0.1
+    done
+    if [[ $(active_win) == "agent-$w."* && $(active_ws) == 10 ]]; then
+      ok "linked: Super + Ctrl + Alt + X (pressed with wtype) took the user from workspace $ws_before to the seat's window on workspace 10"
+    else
+      bad "linked: Super + Ctrl + Alt + X takes the user to the seat's window" "workspace $(active_ws), focused '$(active_win)'"
+      omarchy-agent-seat-show && say "the bound command, run by hand, then: workspace $(active_ws), focused '$(active_win)'"
+    fi
+  else
+    bad "linked: the harness has wtype to press the binding" "$(command -v wtype)"
+  fi
+  sleep 1
+  shot seat-workspace
+
+  # The menu rows, while the seat runs.
+  omarchy menu summon trigger >/dev/null 2>&1
+  sleep 1.5
+  shot menu-trigger-running
+  omarchy-agent-seat-status >/dev/null && ok "linked: the Stop Agent Seat row's guard (omarchy-agent-seat-status) passes while the seat runs" || bad "linked: the Stop row's guard passes while running"
+  # Picking Stop Agent Seat by keyboard, as a tester would.
+  pressed "Stop Agent Seat"
+  sleep 1
+  shot menu-filter-stop
+  pressed -k Return
+  for _ in {1..50}; do
+    omarchy-agent-seat-status >/dev/null || break
+    sleep 0.2
+  done
+  if omarchy-agent-seat-status >/dev/null; then
+    bad "linked: Trigger > Stop Agent Seat stops the seat" "$(omarchy-agent-seat-status)"
+    omarchy menu close >/dev/null 2>&1 || true
+    failure_report
+    stop_seat
+  else
+    ok "linked: Trigger > Stop Agent Seat, picked in the menu, stopped the seat"
+  fi
+  [[ -z $(agent_client "$w") ]] && ok "linked: the seat's window is gone" || bad "linked: the window is gone after Stop Agent Seat" "$(agent_client "$w")"
+
+  # Agent Seat with nothing on the seat.
+  omarchy-agent-seat-status >/dev/null || ok "linked: the Stop row's guard fails once the seat is stopped"
+  say "default browser: $(omarchy-cmd-default-browser 2>&1)"
+  ws_before=$(active_ws)
+  omarchy menu summon trigger >/dev/null 2>&1
+  sleep 1.5
+  shot menu-trigger-stopped
+  pressed "Agent Seat"
+  sleep 1
+  shot menu-filter-seat
+  pressed -k Return
+  client=""
+  for _ in {1..100}; do
+    client=$(hyprctl clients -j | jq -c 'map(select(.class | test("^agent-[0-9]+\\."))) | first // empty')
+    [[ -n $client && $(active_win) == agent-* ]] && break
+    sleep 0.2
+  done
+  if [[ -n $client && $(jq -r '.workspace.id' <<<"$client") == 10 && $(active_win) == agent-* ]]; then
+    ok "linked: Trigger > Agent Seat, with nothing on the seat, opened the default browser there and took the user to it: $(jq -c '{class, workspace: .workspace.id}' <<<"$client") (user was on $ws_before)"
+  else
+    bad "linked: Trigger > Agent Seat opens the default browser on the seat and focuses it" "client ${client:-none}; active '$(active_win)' on $(active_ws)"
+  fi
+  sleep 2
+  shot agent-seat-row
+  omarchy-agent-seat-stop >/dev/null 2>&1
+  omarchy-agent-seat-status >/dev/null && bad "the seat stops at the end" || say "seat stopped (omarchy-agent-seat-stop)"
+
+  # --- Full path: unlink -------------------------------------------------------
+  say "omarchy dev unlink will run $(command -v omarchy-dev-unlink)"
+  step <<'EOF'
+omarchy dev unlink
+EOF
+  conf=$(cat /etc/omarchy.conf 2>&1)
+  [[ $rc == 0 && $conf == 'export OMARCHY_PATH="/usr/share/omarchy"' ]] && ok "unlink wrote /etc/omarchy.conf back: $conf" || bad "unlink points /etc/omarchy.conf at /usr/share/omarchy" "rc $rc: $conf"
+  sudo -n test -e /etc/sudoers.d/omarchy-dev-path && bad "unlink removes the sudo drop-in" || ok "unlink removed /etc/sudoers.d/omarchy-dev-path"
+  [[ -n $(seat_bind) ]] && ok "until the reboot the session still runs the clone (the Agent seat binding is still there)" || bad "the session keeps the clone until the reboot"
+  ;;
+
+after)
+  # --- After unlink and the reboot ---------------------------------------------
+  [[ $OMARCHY_PATH == /usr/share/omarchy ]] && ok "after: the session's OMARCHY_PATH is the package again" || bad "after: OMARCHY_PATH is /usr/share/omarchy" "$OMARCHY_PATH"
+  status=$(omarchy dev status 2>&1)
+  [[ $status == *"dev-link: inactive"* ]] && ok "after: omarchy dev status: $(tr '\n' ' ' <<<"$status")" || bad "after: dev status inactive" "$status"
+  [[ -z $(seat_bind) ]] && ok "after: no Agent seat binding" || bad "after: the binding is gone" "$(seat_bind)"
+  shell_cmd=$(shell_procs)
+  [[ -n $shell_cmd && $shell_cmd != *"$clone"* ]] && ok "after: the shell runs the package's: $shell_cmd" || bad "after: shell on the package" "$shell_cmd"
+  say "after: left behind: /etc/omarchy.conf: $(cat /etc/omarchy.conf)"
+  say "after: left behind: packages: $(pacman -Q bubblewrap wayland-protocols 2>&1 | tr '\n' ' ')"
+  say "after: left behind: clone: $(ls -d "$clone" 2>&1)"
+  say "after: left behind: seat home: $(du -sh "$HOME/.local/state/omarchy/agent-seat/home" 2>&1); browser profiles: $(ls "$HOME/.local/state/omarchy/agent-seat/home/.config/omarchy-seat-browser" 2>&1 | tr '\n' ' ')"
+  say "after: seat migration marked done: $(ls "$HOME/.local/state/omarchy/migrations/1795744236.sh" 2>&1)"
+  [[ -d $HOME/.local/state/omarchy/agent-seat/home ]] && ok "after: the seat's home is left behind" || bad "after: the seat's home is left" ""
+  pacman -Q bubblewrap wayland-protocols >/dev/null 2>&1 && ok "after: the two packages are left installed" || bad "after: packages left" ""
+  [[ -d $clone ]] && ok "after: the clone is left" || bad "after: the clone is left" ""
+  ;;
+esac
+
+rm -rf "$tmp"
+say "phase done with $failures failed checks"
+(( failures == 0 ))
