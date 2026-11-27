@@ -104,7 +104,7 @@ server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(path)
 server.listen(64)
 
-GLOBALS = {1: ("wl_seat", 9), 2: ("wl_compositor", 99), 3: ("xdg_wm_base", 6), 4: ("wl_data_device_manager", 3), 5: ("zwlr_virtual_pointer_manager_v1", 2), 6: ("zwp_linux_dmabuf_v1", 5), 7: ("wl_shm", 1), 8: ("wl_subcompositor", 1)}
+GLOBALS = {1: ("wl_seat", 9), 2: ("wl_compositor", 99), 3: ("xdg_wm_base", 6), 4: ("wl_data_device_manager", 3), 5: ("zwlr_virtual_pointer_manager_v1", 2), 6: ("zwp_linux_dmabuf_v1", 5), 7: ("wl_shm", 1), 8: ("wl_subcompositor", 1), 9: ("wp_viewporter", 1), 10: ("wp_single_pixel_buffer_manager_v1", 1)}
 SLOW_SYNC = 999  # a sync with this callback is answered late, for tests that need an event in flight
 POPUP = (30, 25, 20, 10)  # where every popup opens, relative to its parent
 
@@ -237,6 +237,21 @@ elif step == "versions":
     print(" ".join(f"{name}:{version}" for name, version in sorted(versions.items())))
 
 elif step == "hidden":
+    hidden = next(name for name in range(1, 50) if name not in globals_.values())
+    conn.send(message(2, 0, struct.pack("<I", hidden) + string("zwlr_virtual_pointer_manager_v1") + struct.pack("<II", 1, 4)))
+    try:
+        while conn.read() is not None:
+            pass
+        print("disconnected")
+    except ConnectionResetError:
+        print("disconnected")
+    except socket.timeout:
+        print("connected")
+
+elif step == "hidden-later":
+    # Connected now; once told to, binds a hidden global and so is dropped.
+    print("ready", flush=True)
+    sys.stdin.readline()
     hidden = next(name for name in range(1, 50) if name not in globals_.values())
     conn.send(message(2, 0, struct.pack("<I", hidden) + string("zwlr_virtual_pointer_manager_v1") + struct.pack("<II", 1, 4)))
     try:
@@ -503,6 +518,28 @@ if scene == "scene":
     conn.send(message(POPUP_XDG, 2, struct.pack("<III", POPUP, XDG, POSITIONER)))
     for surface_id in (CHILD, POPUP_SURFACE, ROOT):
         conn.send(message(surface_id, 6))
+elif scene == "solids":
+    # A 4096x4096 window of one red pixel, under eight translucent green
+    # ones each stretched over all of it: every layer is blended in full,
+    # each costing a second or more.
+    bind("wp_viewporter", 1, 30)
+    bind("wp_single_pixel_buffer_manager_v1", 1, 31)
+    side, full, half = 4096, 0xFFFFFFFF, 0x80000000
+    def solid(surface_id, viewport, buffer, *rgba):
+        conn.send(message(30, 1, struct.pack("<II", viewport, surface_id)))
+        conn.send(message(viewport, 2, struct.pack("<ii", side, side)))
+        conn.send(message(31, 1, struct.pack("<IIIII", buffer, *rgba)))
+        conn.send(message(surface_id, 1, struct.pack("<Iii", buffer, 0, 0)))
+    conn.send(message(COMPOSITOR, 0, struct.pack("<I", ROOT)))
+    solid(ROOT, 40, 41, full, 0, 0, full)
+    toplevel()
+    for layer in range(8):
+        surface_id = 100 + 4 * layer
+        conn.send(message(COMPOSITOR, 0, struct.pack("<I", surface_id)))
+        solid(surface_id, surface_id + 1, surface_id + 2, 0, half, 0, half)
+        conn.send(message(SUBCOMPOSITOR, 1, struct.pack("<III", surface_id + 3, surface_id, ROOT)))
+        conn.send(message(surface_id, 6))
+    conn.send(message(ROOT, 6))
 elif scene == "glass":
     # A red 2000x2000 window under a subsurface as large, green at half
     # opacity: every pixel of its screenshot is blended.
@@ -705,7 +742,7 @@ for _ in {1..50}; do [[ -S $socket ]] && break; sleep 0.1; done
 pass "control socket is private to the user"
 
 globals=$(python3 "$test_dir/app.py" "$socket" globals)
-[[ $globals == "wl_compositor wl_data_device_manager wl_seat wl_shm wl_subcompositor xdg_wm_base" ]] || fail "only allowlisted globals are advertised" "$globals"
+[[ $globals == "wl_compositor wl_data_device_manager wl_seat wl_shm wl_subcompositor wp_single_pixel_buffer_manager_v1 wp_viewporter xdg_wm_base" ]] || fail "only allowlisted globals are advertised" "$globals"
 pass "only allowlisted globals are advertised"
 
 versions=$(python3 "$test_dir/app.py" "$socket" versions)
@@ -2467,8 +2504,9 @@ pass "an app shrinking its pool under a screenshot leaves the broker running"
 # Another app keeps being served while a large translucent window's
 # screenshot is composed.
 # Timed against the screenshot itself, the best of up to three: composed in
-# the loop, a round trip would wait most of the screenshot out; on its own
-# thread, at most a small part of it (78 of 505 ms on the reference laptop).
+# the loop, a round trip waits most of the screenshot out; in a process of
+# its own, hardly any of it (2 of 500 ms on a desktop, under 15 of about 1000
+# on GitHub's runners, where a thread still held apps up for 235 to 739).
 start_draw glass
 window=$(window_of glass)
 held=""
@@ -2486,8 +2524,183 @@ for _ in 1 2 3; do
   (( 3 * slowest < took )) && break
 done
 ! timed_checks || (( 3 * slowest < took )) || fail "a large screenshot does not hold up other apps" "the slowest round trip against the screenshot's time, each try: $held"
-stop_draw
 pass "a large screenshot does not hold up other apps"
+
+# A screenshot of $window asked for straight through the control socket, its
+# answer in $1, written to $2 when given: shot_call waits for it, shot_start
+# leaves the caller itself running in the background as $!. The broker's
+# process composing one is found as its child; a process gone has been
+# reaped by whoever its parent is; nothing of an image means neither the
+# image nor the part it is written to first.
+shot_request() {
+  jq -cn --argjson window "$window" --arg path "${1:-}" '{command: "screenshot", args: ({window: $window} + if $path == "" then {} else {path: $path} end)}'
+}
+shot_call() {
+  HOME="$test_dir/home" XDG_RUNTIME_DIR="$test_dir/runtime" "$ROOT/bin/omarchy-agent-seat-broker" call "$(shot_request "${2:-}")" >"$1" 2>&1
+}
+shot_start() {
+  local request
+  request=$(shot_request "${2:-}")
+  (exec env HOME="$test_dir/home" XDG_RUNTIME_DIR="$test_dir/runtime" "$ROOT/bin/omarchy-agent-seat-broker" call "$request" >"$1" 2>&1) &
+}
+wait_for_child() {
+  child=""
+  for _ in {1..250}; do
+    child=$(pgrep -P "$broker" | head -n 1) || true
+    [[ -n $child ]] && return 0
+    sleep 0.02
+  done
+  return 1
+}
+gone() {
+  local tries=${2:-50}
+  for (( try = 0; try < tries; try++ )); do
+    [[ -e /proc/$1 ]] || return 0
+    sleep 0.1
+  done
+  return 1
+}
+no_image() {
+  [[ ! -e $1 ]] && ! compgen -G "$(dirname -- "$1")/.$(basename -- "$1").*.part" >/dev/null
+}
+start_broker() {
+  run_broker "$@" serve 2>>"$test_dir/broker.log" &
+  broker_pid=$!
+  broker=""
+  for _ in {1..100}; do
+    broker=$(run_broker omarchy-agent-seat-status --json 2>/dev/null | jq -r '.pid // empty') || true
+    [[ -n $broker ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+seat_runtime="$test_dir/runtime/omarchy/agent-seat"
+
+# The screenshot's process ends once its caller hangs up, writes nothing,
+# and is reaped.
+shot_start "$test_dir/hangup.out" "$seat_runtime/hangup.png"
+caller=$!
+wait_for_child || fail "a screenshot is composed in a process of its own"
+kill "$caller"
+wait "$caller" 2>/dev/null || true
+for _ in {1..50}; do pgrep -P "$broker" >/dev/null || break; sleep 0.1; done
+pgrep -P "$broker" >/dev/null && fail "a screenshot given up by its caller leaves no process behind" "$(ps -o pid,stat,etimes,args --ppid "$broker")"
+no_image "$seat_runtime/hangup.png" || fail "a screenshot given up by its caller writes nothing" "$(cat "$test_dir/hangup.out")"
+run_broker omarchy-agent-seat-status >/dev/null || fail "the broker answers after a screenshot is given up"
+pass "a screenshot given up by its caller leaves no process behind and writes nothing"
+
+# Four screenshots asked for at once get two processes at most, and the
+# broker refuses the others until those are done.
+callers=()
+for n in 1 2 3 4; do
+  shot_start "$test_dir/many.$n"
+  callers+=($!)
+done
+most=0
+for _ in {1..1500}; do
+  count=$(pgrep -c -P "$broker") || true
+  (( count > most )) && most=$count
+  running=0
+  for caller in "${callers[@]}"; do kill -0 "$caller" 2>/dev/null && running=1; done
+  (( running )) || break
+  sleep 0.01
+done
+for caller in "${callers[@]}"; do wait "$caller" 2>/dev/null || true; done
+(( most <= 2 )) || fail "at most two screenshots are composed at once" "$most at once"
+refused=$(cat "$test_dir"/many.* | grep -c "other screenshots are still being taken") || true
+(( refused >= 1 )) || fail "screenshots past the two being taken are refused" "$(cat "$test_dir"/many.*)"
+pass "at most two screenshots are composed at once, and others are refused meanwhile"
+
+# Stopping the seat while a screenshot is composed ends its process,
+# writing nothing.
+shot_start "$test_dir/stop.out" "$seat_runtime/stop.png"
+caller=$!
+wait_for_child || fail "a screenshot is composed in a process of its own"
+run_broker omarchy-agent-seat-stop >/dev/null 2>&1 || true
+wait "$caller" 2>/dev/null || true
+gone "$child" || fail "stopping the seat while a screenshot is composed leaves no process behind" "$(ps -o pid,stat,etimes,args -p "$child")"
+gone "$broker" || fail "the seat stops while a screenshot is composed"
+wait "$broker_pid" 2>/dev/null || true
+grep -q "The agent seat stopped" "$test_dir/stop.out" || fail "a screenshot cut short by stop says so" "$(cat "$test_dir/stop.out")"
+no_image "$seat_runtime/stop.png" || fail "a screenshot cut short by stop writes nothing"
+stop_draw
+pass "stopping the seat while a screenshot is composed ends its process, writing nothing"
+
+# A window of many translucent single pixel layers stretched over 4096x4096
+# takes minutes to compose. Meanwhile an app the broker drops sees its
+# connection end, as the screenshot's process holds none of the apps'
+# connections; and stopping the seat ends that process at once.
+start_broker omarchy-agent-seat-broker || fail "the broker starts again" "$(tail -5 "$test_dir/broker.log")"
+rm -f "$test_dir/later.in"
+mkfifo "$test_dir/later.in"
+exec {later_in}<>"$test_dir/later.in"
+python3 "$test_dir/app.py" "$socket" hidden-later <"$test_dir/later.in" >"$test_dir/later.out" 2>&1 &
+later=$!
+for _ in {1..50}; do [[ -s $test_dir/later.out ]] && break; sleep 0.1; done
+start_draw solids
+window=$(window_of solids)
+shot_start "$test_dir/solids.out" "$seat_runtime/solids.png"
+caller=$!
+wait_for_child || fail "a screenshot is composed in a process of its own"
+sleep 0.3
+echo go >&"$later_in"
+wait "$later" || true
+exec {later_in}>&-
+[[ $(tail -n 1 "$test_dir/later.out") == "disconnected" ]] || fail "an app the broker drops while a screenshot is composed sees its connection end" "$(cat "$test_dir/later.out")"
+pass "an app the broker drops while a screenshot is composed sees its connection end"
+run_broker omarchy-agent-seat-stop >/dev/null 2>&1 || true
+gone "$child" 15 || fail "stopping the seat ends a long screenshot's process within a second or so" "$(ps -o pid,stat,etimes,args -p "$child")"
+wait "$caller" 2>/dev/null || true
+wait "$broker_pid" 2>/dev/null || true
+no_image "$seat_runtime/solids.png" || fail "a long screenshot cut short by stop writes nothing"
+stop_draw
+pass "stopping the seat ends a long screenshot's process at once, writing nothing"
+
+# A screenshot's process leaves without running any of the broker's exit
+# code, whose exit hook here notes each process that runs it; and a broker
+# ended by SIGTERM while one is composed takes it along, nothing written.
+start_broker env EXIT_MARKER="$test_dir/exit-hook" python3 -c 'import atexit, os, runpy, sys
+atexit.register(lambda: open(os.environ["EXIT_MARKER"], "a").write(f"{os.getpid()}\n"))
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")' "$ROOT/bin/omarchy-agent-seat-broker" || fail "the broker starts with an exit hook" "$(tail -5 "$test_dir/broker.log")"
+start_draw glass
+window=$(window_of glass)
+shot_call "$test_dir/hook.out" "$seat_runtime/hook.png" || fail "a screenshot is taken by a broker with an exit hook" "$(cat "$test_dir/hook.out")"
+[[ -f $seat_runtime/hook.png ]] || fail "a screenshot is taken by a broker with an exit hook" "$(cat "$test_dir/hook.out")"
+sleep 0.2
+[[ ! -s $test_dir/exit-hook ]] || fail "a screenshot's process runs none of the broker's exit code" "$(cat "$test_dir/exit-hook")"
+pass "a screenshot's process runs none of the broker's exit code"
+shot_start "$test_dir/term.out" "$seat_runtime/term.png"
+caller=$!
+wait_for_child || fail "a screenshot is composed in a process of its own"
+kill -TERM "$broker"
+gone "$child" || fail "a broker ended by SIGTERM while a screenshot is composed leaves no process behind" "$(ps -o pid,stat,etimes,args -p "$child")"
+wait "$caller" 2>/dev/null || true
+wait "$broker_pid" 2>/dev/null || true
+no_image "$seat_runtime/term.png" || fail "a screenshot whose broker ended writes nothing"
+stop_draw
+pass "a broker ended by SIGTERM while a screenshot is composed leaves no process behind"
+
+# A screenshot past its deadline, here one of no time at all, is answered
+# with an error, and its process ends, writes nothing and is reaped by the
+# broker.
+sed 's/^CAPTURE_SECONDS = 10 /CAPTURE_SECONDS = 0 /' "$ROOT/bin/omarchy-agent-seat-broker" >"$test_dir/bin/omarchy-agent-seat-broker-no-time"
+chmod +x "$test_dir/bin/omarchy-agent-seat-broker-no-time"
+grep -q '^CAPTURE_SECONDS = 0 ' "$test_dir/bin/omarchy-agent-seat-broker-no-time" || fail "copy the broker with no time for a screenshot"
+start_broker omarchy-agent-seat-broker-no-time || fail "a broker with no time for a screenshot starts" "$(tail -5 "$test_dir/broker.log")"
+start_draw glass
+window=$(window_of glass)
+shot_call "$test_dir/deadline.out" "$seat_runtime/deadline.png" || true
+grep -q "the screenshot took more than 0s" "$test_dir/deadline.out" || fail "a screenshot past its deadline is answered with an error" "$(cat "$test_dir/deadline.out")"
+for _ in {1..50}; do pgrep -P "$broker" >/dev/null || break; sleep 0.1; done
+pgrep -P "$broker" >/dev/null && fail "a screenshot past its deadline leaves no process behind" "$(ps -o pid,stat,etimes,args --ppid "$broker")"
+no_image "$seat_runtime/deadline.png" || fail "a screenshot past its deadline writes nothing"
+kill -TERM "$broker"
+wait "$broker_pid" 2>/dev/null || true
+stop_draw
+pass "a screenshot past its deadline is given up, and its process ends and is reaped"
+
+start_broker omarchy-agent-seat-broker || fail "the broker starts again" "$(tail -5 "$test_dir/broker.log")"
 
 # The scene: a red 40x30 window (surface 20) taking input on its left half,
 # a green 10x10 subsurface (21) at 5,5 and a blue 20x10 popup (22) at 30,25.

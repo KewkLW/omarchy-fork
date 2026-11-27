@@ -34,18 +34,19 @@ import ctypes
 import ctypes.util
 import errno
 import functools
+import gc
 import glob
 import json
 import operator
 import os
 import re
 import selectors
+import signal
 import socket
 import stat
 import struct
 import subprocess
 import sys
-import threading
 import time
 import weakref
 import xml.etree.ElementTree as ET
@@ -123,6 +124,7 @@ RUN_GAP = 256  # buffer pixels between two needed ones that one read still spans
 MAX_CAPTURE_SCALE = 4  # screenshot pixels per surface unit, beyond any real output scale
 CAPTURE_SECONDS = 10  # to compose and write one screenshot
 MAX_CAPTURES = 2  # screenshots being taken at once
+PR_SET_PDEATHSIG = 1  # prctl(2): the signal a process gets when its parent dies
 SNAPSHOT_SECONDS = 2  # after a screenshot, how long an app's commits keep a copy of their pixels
 SNAPSHOT_BYTES = 64 << 20  # and at most how much one app keeps
 
@@ -435,8 +437,10 @@ class Keymap:
 class Pool:
   """A dup of an app's shared memory pool, kept while any buffer uses it.
 
-  A screenshot being composed holds it open: closed meanwhile, its
-  descriptor number could come back as another file and be read instead.
+  A screenshot's plan holds it from when the plan is made until the
+  screenshot is done. The process composing it has its own copy of the
+  descriptor from the fork, so a close here meanwhile can't change what it
+  reads.
   """
 
   def __init__(self, fd, size):
@@ -574,7 +578,15 @@ def buffer_pixel(transform, x, y, width, height):
   return ((x, y), (y, width - 1 - x), (width - 1 - x, height - 1 - y), (height - 1 - y, x))[transform & 3]
 
 
+def partial_path(path, pid):
+  """Where the process pid writes the image for path before it is renamed into place."""
+  return os.path.join(os.path.dirname(path), f".{os.path.basename(path)}.{pid}.part")
+
+
 def write_png(path, canvas, width, height):
+  """Write the canvas as a PNG at path, through a new file beside it that
+  is renamed into place, so a process killed while writing never leaves
+  part of an image under the name asked for."""
   rows, rgb = bytearray(), bytearray(width * 3)
   for y in range(height):
     row = canvas[y * width * 4 : (y + 1) * width * 4]
@@ -584,13 +596,26 @@ def write_png(path, canvas, width, height):
   def chunk(kind, data):
     return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
-  # Never through a symlink, into a FIFO or onto a device.
-  fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
-  with open(fd, "wb") as png:
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
-      raise ValueError(f"{path} is not a regular file")
-    png.truncate()
-    png.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(rows), 1)) + chunk(b"IEND", b""))
+  # Never through a symlink, into a FIFO or onto a device: the part is a
+  # new file, and the rename replaces a regular file or nothing, never what
+  # a link names.
+  part = partial_path(path, os.getpid())
+  fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+  try:
+    with open(fd, "wb") as png:
+      png.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(rows), 1)) + chunk(b"IEND", b""))
+    try:
+      if not stat.S_ISREG(os.lstat(path).st_mode):
+        raise ValueError(f"{path} is not a regular file")
+    except FileNotFoundError:
+      pass
+    os.rename(part, path)
+  except BaseException:
+    try:
+      os.unlink(part)
+    except OSError:
+      pass
+    raise
 
 
 class Plan:
@@ -609,11 +634,11 @@ class Plan:
     self.pools = []
 
 
-def compose(plan, cancelled=None):
+def compose(plan):
   """Draw a screenshot's layers from their buffers, bottom to top.
 
-  It touches nothing but the plan, so it can run on a thread of its own, and
-  gives up when cancelled is set.
+  It touches nothing but the plan, so it can run in a process of its own,
+  which the broker kills to give the screenshot up.
   """
   left, top, scale = plan.origin
   width, height = plan.width, plan.height
@@ -666,8 +691,6 @@ def compose(plan, cancelled=None):
     else:
       pixels = straight_rows(read, offset, stride, end, columns)
     for row, source_row in enumerate(rows):
-      if cancelled and cancelled.is_set():
-        raise TimeoutError("the screenshot was given up")
       line = pixels(source_row)
       if line is None:
         continue
@@ -1879,7 +1902,7 @@ class Client:
 
   def capture_plan(self, toplevel):
     """What a screenshot of the window draws, taken from the app's state now
-    so a thread can compose it while the app goes on changing that state."""
+    so a process can compose it while the app goes on changing that state."""
     self.snapshots_until = time.monotonic() + SNAPSHOT_SECONDS
     scale = self.scale(toplevel)
     layers = []
@@ -1959,28 +1982,104 @@ class Job:
 
 
 class Capture:
-  """A screenshot composed and written on a thread of its own, so every app
-  keeps being served meanwhile. The thread touches nothing but its plan and
-  the file, and says it is done through a pipe the broker waits on."""
+  """A screenshot composed and written in a process of its own, forked from
+  the broker, so every app keeps being served meanwhile.
+
+  Not on a thread: one composing hands the interpreter lock back on each of
+  the thousands of reads it makes, and the event loop, woken each time,
+  takes it only if it gets there before the thread is back; each wake-up
+  starts over the wait after which Python would force a switch, so that
+  never comes. On a slow virtual machine the loop lost nearly every race,
+  and a large screenshot held every app up for most of its time.
+
+  The child keeps only the plan's pools, the pipe it reports on and
+  stderr, so it holds no app connection or seat socket, and it dies with
+  the broker. Giving the screenshot up kills it: until the broker reaps it
+  its pid can name no other process. It writes the image under a name of
+  its own and renames it into place; the broker removes that file when the
+  child ends without a result, so only a broker killed meanwhile can leave
+  one behind.
+  """
 
   def __init__(self, conn, window, client, toplevel, plan, path):
     self.conn, self.window, self.client, self.toplevel, self.plan, self.path = conn, window, client, toplevel, plan, path
     self.deadline = time.monotonic() + CAPTURE_SECONDS  # then the caller gets an error
-    self.cancelled = threading.Event()
-    self.answered = False
+    self.answered = self.reaped = False
     self.result = self.error = None
-    self.done, self.finished = os.pipe()
-    self.thread = threading.Thread(target=self.run, daemon=True)
-    self.thread.start()
-
-  def run(self):
+    self.output = bytearray()
+    self.done, finished = os.pipe()
+    broker = os.getpid()
     try:
-      canvas = compose(self.plan, self.cancelled)
+      self.pid = os.fork()
+    except OSError:
+      os.close(self.done)
+      os.close(finished)
+      raise
+    if self.pid == 0:
+      self.run(finished, broker)
+    os.close(finished)
+    self.part = partial_path(path, self.pid)
+
+  def run(self, finished, broker):
+    """The child: compose, write, report as JSON on finished, and exit
+    without running anything of the broker's on the way out."""
+    status = 1
+    try:
+      # Killed when the broker dies; it may have died before this asked.
+      ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+      if os.getppid() != broker:
+        os._exit(status)
+      # Nothing of the broker's is collected here, so no pool closes a
+      # descriptor number this process has reused; then every descriptor
+      # but the plan's pools, the pipe and stderr is closed, so an app or
+      # Hyprland sees a connection the broker drops end at once.
+      gc.disable()
+      keep = sorted({2, finished, *(pool.fd for pool in self.plan.pools)})
+      for low, high in zip([-1, *keep], [*keep, os.sysconf("SC_OPEN_MAX")]):
+        os.closerange(low + 1, high)
+      canvas = compose(self.plan)
       write_png(self.path, canvas, self.plan.width, self.plan.height)
-      self.result = {"path": self.path, "width": self.plan.width, "height": self.plan.height}
-    except Exception as error:
-      self.error = error
-    os.write(self.finished, b"\0")
+      report, status = {"path": self.path, "width": self.plan.width, "height": self.plan.height}, 0
+    except BaseException as error:
+      report = {"error": str(error) or type(error).__name__}
+    try:
+      os.write(finished, json.dumps(report).encode())
+    finally:
+      os._exit(status)
+
+  def give_up(self):
+    if not self.reaped:
+      os.kill(self.pid, signal.SIGKILL)
+
+  def reap(self):
+    """Wait for the child to end, and remove what it left of an image it did not finish."""
+    try:
+      os.waitpid(self.pid, 0)
+    except ChildProcessError:
+      pass
+    self.reaped = True
+    if self.result is None:
+      try:
+        os.unlink(self.part)
+      except OSError:
+        pass
+
+  def read(self):
+    """Read what the child reported; True once it has ended and is reaped."""
+    data = os.read(self.done, 65536)
+    if data:
+      self.output += data
+      return False
+    try:
+      report = json.loads(self.output)
+    except ValueError:
+      report = {"error": "the screenshot's process ended without a result"}
+    if "error" in report:
+      self.error = report["error"]
+    else:
+      self.result = report
+    self.reap()
+    return True
 
 
 class Broker:
@@ -2016,9 +2115,6 @@ class Broker:
     if problem:
       log(problem)
       sys.exit(1)
-    # A screenshot's thread hands the interpreter back to the event loop
-    # within a millisecond rather than five, each time an app's message waits.
-    sys.setswitchinterval(0.001)
     os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
     os.chmod(RUNTIME_DIR, 0o700)
     self.selector.register(self.listen(WAYLAND_SOCKET, 0o600), selectors.EVENT_READ, ("wayland", None))
@@ -2237,6 +2333,7 @@ class Broker:
   def stop(self):
     for shot in list(self.shots):
       self.answer_shot(shot, error="The agent seat stopped")
+      shot.reap()
     for job in list(self.jobs):
       self.end_job(job)
       job.process.kill()
@@ -2321,8 +2418,9 @@ class Broker:
     left, top, scale = self.captures.get(int(window), (0, 0, client.scale(toplevel)))
     return [value / scale + (top if index % 2 else left) for index, value in enumerate(coordinates)]
 
-  # A screenshot is composed on a thread, so a large one holds up no app. The
-  # caller gets an error past CAPTURE_SECONDS, and hanging up gives it up.
+  # A screenshot is composed in a process of its own, so a large one holds up
+  # no app. The caller gets an error past CAPTURE_SECONDS, and hanging up
+  # gives it up.
 
   def defer_screenshot(self, conn, caller, window, path=None):
     client, toplevel = self.window(window)
@@ -2344,7 +2442,7 @@ class Broker:
     if shot.answered:
       return
     shot.answered = True
-    shot.cancelled.set()
+    shot.give_up()
     self.selector.unregister(shot.conn)
     if result or error:
       self.reply(shot.conn, result, error)
@@ -2352,10 +2450,10 @@ class Broker:
       shot.conn.close()
 
   def shot_taken(self, shot):
-    shot.thread.join()
+    if not shot.read():
+      return
     self.selector.unregister(shot.done)
     os.close(shot.done)
-    os.close(shot.finished)
     self.shots.remove(shot)
     shot.plan.release()
     shot.client.snapshots_until = time.monotonic() + SNAPSHOT_SECONDS  # counted from the end of a long screenshot too
