@@ -1,0 +1,245 @@
+#!/bin/bash
+
+# TEMP capture (scratch branch only, never upstream): screenshots of this
+# checkout's agent seat in the CI VM, run by test/ci-vm in place of the tests.
+# Each shot is independent: it writes a PNG or a .reason.txt, and the script
+# exits 1 when any shot is missing, after trying all of them.
+
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/shell.d/base-test.sh"
+set +e +u
+set +o pipefail
+
+OUT="$HOME/shell-logs/capture"
+mkdir -p "$OUT"
+WANTED=(trigger-menu-seat-rows trigger-menu-seat-rows-filtered agent-window-outlined)
+log() { printf 'capture: %s\n' "$*" | tee -a "$OUT/log.txt"; }
+reason() { printf '%s\n' "$2" >"$OUT/$1.reason.txt"; log "NO $1: $2"; }
+shot() {
+  local name="$1"
+  if grim "$OUT/$name.png" 2>>"$OUT/log.txt"; then
+    log "shot $name.png ($(stat -c %s "$OUT/$name.png") bytes)"
+  else
+    reason "$name" "grim failed"
+  fi
+}
+seat() { OMARCHY_PATH="$ROOT" PATH="$ROOT/bin:$PATH" "$@"; }
+
+session_path=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OMARCHY_PATH=//p' | tail -n 1)
+log "root $ROOT, commits $(git -C "$ROOT" log --format="%h %p %s" -4 2>&1 | tr "\n" ";"), session OMARCHY_PATH ${session_path:-unset}"
+log "$(hyprctl version | head -n 1)"
+log "monitors $(hyprctl monitors -j | jq -c '[.[] | {name, width, height, scale, ws: .activeWorkspace.id}]')"
+log "packages: $(pacman -Q hyprland quickshell chromium google-chrome bubblewrap wtype grim 2>&1 | tr '\n' ';')"
+log "os-release: $(grep -E '^(NAME|BUILD_ID|IMAGE_VERSION)=' /etc/os-release 2>&1 | tr '\n' ' ')"
+
+# This checkout's Hyprland rules in the session's Hyprland: its modules ahead of
+# the release's on the module path, then a reload.
+cfg="$HOME/.config/hypr/hyprland.lua"
+cp "$cfg" "$OUT/hyprland.lua.orig"
+rules_loaded=""
+sed -i "/bootstrap.lua/a package.path = \"$ROOT/?.lua;\" .. package.path" "$cfg"
+if grep -qF "package.path = \"$ROOT/?.lua;\"" "$cfg"; then
+  hyprctl reload >>"$OUT/log.txt" 2>&1
+  sleep 2
+  errors=$(hyprctl configerrors 2>&1)
+  log "configerrors after reload (raw): $(printf %q "$errors")"
+  log "package.path: $(hyprctl repl 'return package.path' 2>&1 | head -c 300)"
+  seat_ws_raw=$(hyprctl repl 'return require("default.hypr.agent-workspaces").workspace()' 2>&1 | head -c 200)
+  seat_ws=$(grep -oE '[0-9]+' <<<"$seat_ws_raw" | head -n 1)
+  log "seat workspace from agent-workspaces.lua: raw $(printf %q "$seat_ws_raw"), parsed '${seat_ws}'"
+  log "binds running omarchy-agent-seat-show: $(hyprctl binds -j | jq -c '[.[] | select((.arg // "") | test("omarchy-agent-seat-show")) | {modmask, key, dispatcher, arg}]' 2>&1 | head -c 600)"
+  trimmed=${errors//[[:space:]]/}
+  if [[ -z $trimmed || $errors == *"no errors"* ]]; then
+    rules_loaded=1
+  fi
+else
+  log "package.path line NOT inserted: no bootstrap.lua line in $cfg"
+fi
+
+# One shell on screen, this checkout's: the session's own shell (the release's)
+# is stopped with its launcher, and a scratch shell of this checkout takes over
+# the bar, the menu and the notifications.
+pkill -f omarchy-launch-shell
+[[ -n $session_path ]] && timeout 30 quickshell kill -p "$session_path/shell" --any-display >/dev/null 2>&1
+sleep 1
+log "quickshell after stopping the session's: $(quickshell list -a -j 2>&1 | jq -c '[.[].config_path]' 2>&1)"
+
+setup_scratch_shell
+mkdir -p "$SCRATCH_HOME/.local/state/omarchy" "$SCRATCH_HOME/.config"
+cp -a "$HOME/.local/state/omarchy/current" "$SCRATCH_HOME/.local/state/omarchy/" 2>>"$OUT/log.txt"
+cp -a "$HOME/.config/omarchy" "$SCRATCH_HOME/.config/" 2>>"$OUT/log.txt"
+log "seeded theme: $(readlink "$SCRATCH_HOME/.local/state/omarchy/current/theme" 2>&1)"
+start_scratch_shell
+shell_up=""
+for _ in {1..150}; do
+  [[ $(scratch_ipc shell ping 2>/dev/null || true) == "ok" ]] && { shell_up=1; break; }
+  kill -0 "$SCRATCH_PID" 2>/dev/null || break
+  sleep 0.2
+done
+log "scratch shell answers: ${shell_up:-no}"
+sleep 3
+log "quickshell now: $(quickshell list -a -j 2>&1 | jq -c '[.[].config_path]' 2>&1)"
+
+# A browser the image ships, on the seat, through the documented invocation, on
+# a local page shared read-only.
+if command -v chromium >/dev/null; then
+  browser=chromium browser_name=Chromium
+elif command -v google-chrome-stable >/dev/null; then
+  browser=google-chrome-stable browser_name="Google Chrome"
+else
+  browser="" browser_name=""
+fi
+log "browser: ${browser:-none} ($([[ -n $browser ]] && "$browser" --version 2>&1))"
+
+page_dir="$HOME/seat-page"
+mkdir -p "$page_dir"
+cat >"$page_dir/page.html" <<HTML
+<!doctype html>
+<html><head><meta charset="utf-8"><title>A page on the agent seat</title>
+<style>body{font:20px sans-serif;margin:48px;background:#fafafa;color:#222}button{font:18px sans-serif;padding:10px 18px}</style>
+</head><body><h1>A page on the agent seat</h1>
+<p>$browser_name runs sandboxed on the seat. The agent reads this page through DevTools and clicks with its own pointer.</p>
+<button>Press</button></body></html>
+HTML
+
+window="" run_code=1
+if [[ -n $browser ]]; then
+  run_code=0
+  window=$(seat omarchy agent seat run --cdp --share-ro "$page_dir" "$browser" "file://$page_dir/page.html" 2>>"$OUT/log.txt") || run_code=$?
+fi
+log "omarchy agent seat run --cdp --share-ro $page_dir $browser file://$page_dir/page.html: code $run_code, window '$window'"
+
+drawn=""
+for _ in {1..60}; do
+  if [[ $window =~ ^[0-9]+$ ]] && seat omarchy-agent-seat-state --json 2>/dev/null | jq -e --argjson w "$window" '.[] | select(.window == $w) | select(.drawn == true) | select((.title // "") | test("A page on the agent seat"))' >/dev/null 2>&1; then
+    drawn=1
+    break
+  fi
+  sleep 1
+done
+log "state (drawn and titled: ${drawn:-no}): $(seat omarchy-agent-seat-state --json 2>&1 | jq -c . 2>&1 | head -c 1500)"
+sleep 2
+seat_status=$(seat omarchy-agent-seat-status 2>&1)
+status_code=$?
+log "omarchy-agent-seat-status: code $status_code: $(tr '\n' ' ' <<<"$seat_status")"
+# The menu shots need a running seat, not the browser: without one, start foot
+# on the seat so a failed browser does not lose them.
+if (( status_code != 0 )); then
+  foot_window=$(seat omarchy agent seat run foot 2>>"$OUT/log.txt")
+  log "fallback for the menu shots: omarchy agent seat run foot: code $?, window '$foot_window'"
+  sleep 3
+  seat_status=$(seat omarchy-agent-seat-status 2>&1)
+  status_code=$?
+  log "omarchy-agent-seat-status after the fallback: code $status_code: $(tr '\n' ' ' <<<"$seat_status")"
+fi
+
+# Opens the scratch shell's menu at <route> and waits for it to map.
+summon_menu() {
+  local route="$1"
+  for _ in {1..80}; do
+    [[ $(scratch_ipc shell summon omarchy.menu "{\"menu\":\"$route\"}" 2>/dev/null || true) == "ok" ]] && break
+    sleep 0.1
+  done
+  wait_scratch_layer omarchy-menu mapped
+}
+hide_menu() {
+  scratch_ipc_quiet shell hide omarchy.menu >/dev/null 2>&1 || true
+  wait_scratch_layer omarchy-menu absent
+}
+
+# Shots 1 and 2: Trigger with the seat running, plain, then filtered by typing.
+menu_shots() {
+  if [[ -z $shell_up ]]; then
+    reason trigger-menu-seat-rows "the scratch shell did not answer"
+    reason trigger-menu-seat-rows-filtered "the scratch shell did not answer"
+    return
+  fi
+  if (( status_code != 0 )); then
+    reason trigger-menu-seat-rows "the seat is not running, so Stop Agent Seat cannot show"
+    reason trigger-menu-seat-rows-filtered "the seat is not running, so Stop Agent Seat cannot show"
+    return
+  fi
+  scratch_ipc_quiet shell call omarchy.menu refresh '{}' >/dev/null 2>&1
+  sleep 0.5
+  if summon_menu trigger; then
+    sleep 2
+    log "active workspace with the menu open: $(hyprctl activeworkspace -j | jq -c '{id, name}')"
+    shot trigger-menu-seat-rows
+    if command -v wtype >/dev/null; then
+      # Spare frames, in case the last rows sit below the fold.
+      wtype -k End
+      sleep 1
+      shot spare-trigger-menu-end
+      wtype -k Home
+      sleep 1
+      wtype "Seat"
+      sleep 2
+      shot trigger-menu-seat-rows-filtered
+    else
+      reason trigger-menu-seat-rows-filtered "no wtype in the image"
+    fi
+  else
+    reason trigger-menu-seat-rows "the menu at trigger did not map"
+    reason trigger-menu-seat-rows-filtered "the menu at trigger did not map"
+  fi
+  hide_menu
+  sleep 1
+}
+
+# Shot 3: the browser on the seat's workspace after the PR's own jump.
+window_shot() {
+  local clients agent active ws show_code=0
+  clients=$(hyprctl clients -j)
+  agent=$(jq -c '[.[] | select(.class | test("^agent-[0-9]+")) | {class, title, tags, ws: .workspace.id, monitor, address}][0] // empty' <<<"$clients")
+  log "agent client: ${agent:-none}"
+  log "active workspace before show: $(hyprctl activeworkspace -j | jq -c '{id, name}')"
+
+  seat omarchy-agent-seat-show >>"$OUT/log.txt" 2>&1 || show_code=$?
+  sleep 2
+  active=$(hyprctl activeworkspace -j | jq -r '.id')
+  ws=$(jq -r '.ws // empty' <<<"$agent")
+  log "show: code $show_code; active workspace after show: $active; activewindow: $(hyprctl activewindow -j | jq -c '{class, title, address, ws: .workspace.id}')"
+
+  if [[ -z $rules_loaded ]]; then
+    reason agent-window-outlined "this checkout's Hyprland rules did not load cleanly"
+  elif [[ -z $drawn ]]; then
+    reason agent-window-outlined "the browser window was not drawn with the page's title"
+  elif [[ -z $agent || -z $ws ]]; then
+    reason agent-window-outlined "no agent window in hyprctl clients"
+  elif ! jq -e '.tags | any(test("^agent-seat"))' <<<"$agent" >/dev/null 2>&1; then
+    reason agent-window-outlined "the agent window is not tagged agent-seat: $agent"
+  elif [[ -z $seat_ws || $ws != "$seat_ws" ]]; then
+    reason agent-window-outlined "the agent window is on workspace $ws, not the seat workspace the helper gives ('$seat_ws')"
+  elif [[ $show_code != 0 || $active != "$ws" ]]; then
+    reason agent-window-outlined "show did not land on the agent window's workspace: code $show_code, active $active, window on $ws"
+  else
+    sleep 1
+    shot agent-window-outlined
+    log "agent-window-outlined: shot after omarchy-agent-seat-show switched to workspace $ws"
+    sleep 4
+    shot spare-agent-window-outlined-late
+    log "active workspace at the late frame: $(hyprctl activeworkspace -j | jq -c '{id, name}')"
+  fi
+}
+
+menu_shots
+window_shot
+
+seat omarchy-agent-seat-stop >>"$OUT/log.txt" 2>&1
+cp "$OUT/hyprland.lua.orig" "$cfg"
+hide_menu
+stop_scratch_shell
+log "scratch shell log tail:"
+tail -n 40 "$SCRATCH_LOG" >>"$OUT/log.txt" 2>&1
+cp "$SCRATCH_LOG" "$OUT/quickshell.log" 2>/dev/null
+
+missing=0
+for name in "${WANTED[@]}"; do
+  if [[ -s $OUT/$name.png ]]; then
+    log "have $name.png"
+  else
+    log "MISSING $name.png: $(cat "$OUT/$name.reason.txt" 2>/dev/null)"
+    missing=1
+  fi
+done
+ls -la "$OUT" >>"$OUT/log.txt"
+exit "$missing"
