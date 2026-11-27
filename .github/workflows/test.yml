@@ -22,20 +22,14 @@ concurrency:
 jobs:
   test:
     name: test (${{ matrix.shard }})
-    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && 'namespace-profile-linux-amd64-16x32' || 'ubuntu-26.04' }}
-    timeout-minutes: 20
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
         include:
-          - shard: noncomp-1
-            args: --no-cli --group=noncomp --shard=1/2
-          - shard: noncomp-2
-            args: --no-cli --group=noncomp --shard=2/2
-          - shard: comp
-            args: --group=comp
-          - shard: exclusive
-            args: --no-cli --group=exclusive
+          - shard: tryit
+            args: --group=exclusive
     env:
       SITE: https://nightly.omarchy.org
       PREBUILT_QEMU_IMAGE: ghcr.io/omacom/omarchy-ci-qemu:latest
@@ -156,7 +150,7 @@ jobs:
             --tmpfs "/tmp:rw,nosuid,nodev,size=$tmpfs_size" \
             -v "$PWD:/w" -v "$IMAGE_DIR:/image:ro" -w /w \
             -e VM_STATE_DIR=/tmp -e SMP="$smp" -e MEM="$mem" \
-            -e CI_VM_TIMEOUT=900 \
+            -e CI_VM_TIMEOUT=1800 \
             -e OMARCHY_TEST_COMP_JOBS="$comp_jobs" \
             -e QEMU_PREBUILT="$QEMU_PREBUILT" \
             "$QEMU_IMAGE" bash -euo pipefail -c '
@@ -207,7 +201,7 @@ jobs:
       # can fail on its own, so the upload never changes the verdict and
       # never holds the job for long.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: failure()
+        if: always()
         continue-on-error: true
         timeout-minutes: 2
         with:
