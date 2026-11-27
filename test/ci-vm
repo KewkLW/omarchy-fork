@@ -192,6 +192,10 @@ tryit_say "tested tree: $(ssh_vm 'cd ~/src/omarchy && git log --format="%H %s" -
 date +%s >/dev/null
 ssh_vm 'date +%s.%N >~/started'
 
+# A tester's machine has its sync databases; the image has none. And the image
+# already ships both packages, so they go first, for pkg add to install them.
+tryit_say "harness: $(ssh_vm 'sudo -n pacman -Sy --noconfirm >/dev/null 2>&1 && echo synced the pacman databases; sudo -n pacman -Rdd --noconfirm bubblewrap wayland-protocols 2>&1 | tail -n 1; pacman -Q bubblewrap wayland-protocols 2>&1 | tr "\n" " "')"
+
 results=()
 tryit_phase quick && results+=("quick=ok") || results+=("quick=FAIL")
 [[ $(ssh_vm 'cat /etc/omarchy.conf') == *omarchy-agent-seat* ]] || tryit_fail "the quick phase did not link the clone; the rest needs it"
@@ -199,7 +203,7 @@ tryit_reboot
 
 # The harness's own keyboard for pressing the binding and picking menu rows:
 # not a tester's step.
-ssh_vm 'sudo -n pacman -S --noconfirm --needed wtype >/dev/null 2>&1 || sudo -n pacman -Sy --noconfirm --needed wtype >/dev/null 2>&1; pacman -Q wtype' | sed 's/^/test\/ci-vm: TEMP tryit: harness: /' || true
+ssh_vm 'sudo -n pacman -S --noconfirm --needed wtype ydotool >/dev/null 2>&1 || sudo -n pacman -Sy --noconfirm --needed wtype ydotool >/dev/null 2>&1; pacman -Q wtype ydotool | tr "\n" " "' | sed 's/^/test\/ci-vm: TEMP tryit: harness: /' || true
 tryit_phase linked && results+=("linked=ok") || results+=("linked=FAIL")
 [[ $(ssh_vm 'cat /etc/omarchy.conf') == *'"/usr/share/omarchy"'* ]] || tryit_fail "the linked phase did not unlink; the rest needs it"
 tryit_reboot

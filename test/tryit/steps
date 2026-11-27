@@ -78,6 +78,25 @@ seat_bind() {
 pressed() {
   wtype "$@" 2>&1
 }
+# Keys on a real kernel keyboard (uinput, through ydotoold), which Hyprland
+# treats like any keyboard: the harness's finger for key bindings.
+keys() {
+  YDOTOOL_SOCKET=/tmp/tryit-ydotool.sock ydotool key "$@" 2>&1
+}
+start_keyboard() {
+  command -v ydotool >/dev/null || return 1
+  sudo -n rm -f /tmp/tryit-ydotool.sock
+  sudo -n setsid -f ydotoold --socket-path=/tmp/tryit-ydotool.sock --socket-own="$(id -u):$(id -g)" >/tmp/tryit-ydotoold.log 2>&1
+  for _ in {1..50}; do
+    [[ -S /tmp/tryit-ydotool.sock ]] && break
+    sleep 0.1
+  done
+  sleep 1
+  [[ -S /tmp/tryit-ydotool.sock ]]
+}
+# Linux key codes: 125 Super, 29 Ctrl, 56 Alt, 45 X, 2 the 1 key.
+press_seat_binding() { keys 125:1 29:1 56:1 45:1 45:0 56:0 29:0 125:0; }
+press_super_1() { keys 125:1 2:1 2:0 125:0; }
 
 say "environment: OMARCHY_PATH=${OMARCHY_PATH-<unset>}; omarchy is $(command -v omarchy); $(hyprctl version | head -n 1)"
 say "chromium: $(chromium --version 2>&1 | head -n 1); google-chrome-stable: $(command -v google-chrome-stable || echo none)"
@@ -301,32 +320,57 @@ linked)
 
   bind=$(seat_bind)
   printf '%s\n' "$bind" | indent 'bind>'
-  [[ $bind == *"modmask: 76"* && $bind == *"omarchy-agent-seat-show"* ]] && ok "linked: Hyprland binds the Agent seat key with modmask 76 (Super + Ctrl + Alt) to omarchy-agent-seat-show" || bad "linked: the binding is Super + Ctrl + Alt + X to omarchy-agent-seat-show" "$bind"
+  [[ $bind == *"modmask: 76"* ]] && ok "linked: Hyprland has the Agent seat binding with modmask 76 (Super + Ctrl + Alt), a Lua dispatcher ($(sed -n 's/^[[:space:]]*dispatcher: //p' <<<"$bind"))" || bad "linked: the binding is on Super + Ctrl + Alt" "$bind"
   [[ $(sed -n 's/^[[:space:]]*key: //p' <<<"$bind") == [xX] ]] && ok "linked: the binding's key is X" || bad "linked: the binding's key is X" "$bind"
 
   first_session linked
   failure_report
 
-  # The binding, pressed on a virtual keyboard.
+  # The binding, pressed on a kernel keyboard.
   ws_before=$(active_ws)
   say "before the binding: workspace $ws_before, focused '$(active_win)'"
-  if command -v wtype >/dev/null; then
-    pressed -M logo -M ctrl -M alt -k x -m alt -m ctrl -m logo
+  if start_keyboard; then
+    say "harness: ydotoold keyboard up: $(hyprctl devices -j | jq -c '[.keyboards[].name]')"
+    press_seat_binding | indent 'ydotool>'
     for _ in {1..30}; do
       [[ $(active_win) == "agent-$w."* ]] && break
       sleep 0.1
     done
     if [[ $(active_win) == "agent-$w."* && $(active_ws) == 10 ]]; then
-      ok "linked: Super + Ctrl + Alt + X (pressed with wtype) took the user from workspace $ws_before to the seat's window on workspace 10"
+      ok "linked: Super + Ctrl + Alt + X, pressed on a kernel keyboard, took the user from workspace $ws_before to the seat's window on workspace 10"
     else
       bad "linked: Super + Ctrl + Alt + X takes the user to the seat's window" "workspace $(active_ws), focused '$(active_win)'"
       omarchy-agent-seat-show && say "the bound command, run by hand, then: workspace $(active_ws), focused '$(active_win)'"
     fi
   else
-    bad "linked: the harness has wtype to press the binding" "$(command -v wtype)"
+    bad "linked: the harness has a kernel keyboard (ydotool) to press the binding" "$(cat /tmp/tryit-ydotoold.log 2>&1)"
+    omarchy-agent-seat-show && say "the bound command, run by hand: workspace $(active_ws), focused '$(active_win)'"
   fi
   sleep 1
   shot seat-workspace
+
+  # Agent Seat while the seat runs: back to workspace 1 first, then the row.
+  press_super_1 | indent 'ydotool>'
+  sleep 0.5
+  ws_before=$(active_ws)
+  say "before Agent Seat (running): workspace $ws_before, focused '$(active_win)'"
+  omarchy menu summon trigger >/dev/null 2>&1
+  sleep 1.5
+  pressed "Agent Seat"
+  sleep 1
+  shot menu-filter-seat-running
+  pressed -k Return
+  for _ in {1..30}; do
+    [[ $(active_win) == "agent-$w."* ]] && break
+    sleep 0.1
+  done
+  if [[ $ws_before != 10 && $(active_win) == "agent-$w."* && $(active_ws) == 10 ]] && omarchy-agent-seat-status >/dev/null && [[ -n $(agent_client "$w") ]]; then
+    ok "linked: Trigger > Agent Seat, with the seat running, took the user from workspace $ws_before to the seat's window, and the seat still runs"
+  else
+    bad "linked: Trigger > Agent Seat jumps to the running seat" "was on $ws_before; now workspace $(active_ws), focused '$(active_win)'; $(omarchy-agent-seat-status 2>&1 | tr '\n' ' ')"
+  fi
+  press_super_1 >/dev/null
+  sleep 0.5
 
   # The menu rows, while the seat runs.
   omarchy menu summon trigger >/dev/null 2>&1
@@ -354,6 +398,8 @@ linked)
 
   # Agent Seat with nothing on the seat.
   omarchy-agent-seat-status >/dev/null || ok "linked: the Stop row's guard fails once the seat is stopped"
+  press_super_1 >/dev/null
+  sleep 0.5
   say "default browser: $(omarchy-cmd-default-browser 2>&1)"
   ws_before=$(active_ws)
   omarchy menu summon trigger >/dev/null 2>&1

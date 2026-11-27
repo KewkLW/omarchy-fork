@@ -1,6 +1,6 @@
 ## Try it
 
-Two ways in. The quick look runs the seat from a clone in one terminal, with no reboot and nothing changed system-wide. The full path makes the clone your Omarchy until you unlink it, which takes a reboot each way, and is the only way to see the workspace rule, the orange outline, the binding and the menu rows.
+Two ways in. The quick look runs the seat from a clone in one terminal, with no reboot and nothing changed system-wide apart from two packages. The full path makes the clone your Omarchy until you unlink it, which takes a reboot each way, and is the only way to see the workspace rule, the orange outline, the binding and the menu rows.
 
 ### 1. Quick look
 
@@ -12,11 +12,11 @@ omarchy pkg add bubblewrap wayland-protocols
 
 The branch adds those two packages to `install/omarchy-base.packages` and installs them in migration `1795744236.sh`; `omarchy pkg add` asks for sudo and installs only what is missing. Then run the first session (section 3) in this terminal.
 
-What this does not show: your session still runs the installed Omarchy, so Hyprland has none of the seat's rules. The browser opens on the workspace you are on and takes your focus, without the orange outline, and `Super + Ctrl + Alt + X` and the menu rows don't exist yet. The commands themselves, and the agent's own pointer and keyboard, are the same as on the full path.
+What this does not show: your session still runs the installed Omarchy, so Hyprland has none of the seat's rules. The browser opens on the workspace you are on and takes your focus, without the orange outline (so `state` also says `the user is typing here`), and `Super + Ctrl + Alt + X` and the menu rows don't exist yet. The commands themselves, and the agent's own pointer and keyboard, are the same as on the full path.
 
 ### 2. Full path
 
-In the same terminal, so the clone's own `omarchy dev link` runs:
+After step 1, in the same terminal, so the clone's own `omarchy dev link` runs:
 
 ```bash
 omarchy dev link ~/omarchy-agent-seat
@@ -27,7 +27,7 @@ It asks for sudo, then offers to reboot: accept. After the reboot, run the first
 - `Super + Ctrl + Alt + X` takes you to the seat's window.
 - `Super + Space` > Trigger shows **Agent Seat** and, while the seat runs, **Stop Agent Seat**. Agent Seat jumps to the seat, or first opens your default browser there when nothing is on it.
 
-After the reboot a notification may say Omarchy has pending migrations: those are the clone's, which your install hasn't run. Leave them, and don't run `omarchy update` while linked, as it runs them.
+After the reboot a notification offers to run pending Omarchy migrations: those are the clone's, which your install hasn't run. Leave them, and don't run `omarchy update` while linked, as it runs them.
 
 To go back:
 
