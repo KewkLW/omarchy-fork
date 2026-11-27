@@ -391,6 +391,12 @@
   "trigger.tests": {
     "label": "Speed Test"
   },
+  "trigger.agent-seat": {
+    "label": "Agent Seat"
+  },
+  "trigger.agent-seat-stop": {
+    "label": "Stop Agent Seat"
+  },
   "trigger.hardware.laptop-display-on": {
     "label": "Laptop Display On"
   },
