@@ -122,6 +122,16 @@ claude)
   command=(claude --dangerously-skip-permissions)
   [[ -n ${prompt:-} ]] && command+=(-- "$prompt")
   ;;
+agy)
+  # agy asks "do you trust this folder" for every new folder, even with
+  # permissions skipped, so the folder it starts in is pre-trusted.
+  agy_settings=$HOME/.gemini/antigravity-cli/settings.json
+  if [[ -f $agy_settings ]] && ! jq -e --arg d "$PWD" '(.trustedWorkspaces // []) | index($d)' "$agy_settings" >/dev/null 2>&1; then
+    jq --arg d "$PWD" '.trustedWorkspaces = ((.trustedWorkspaces // []) + [$d])' "$agy_settings" >"$agy_settings.tmp" && chmod --reference="$agy_settings" "$agy_settings.tmp" && mv "$agy_settings.tmp" "$agy_settings"
+  fi
+  command=(agy --dangerously-skip-permissions)
+  [[ -n ${prompt:-} ]] && command+=(--prompt-interactive "$prompt")
+  ;;
 grok)
   command=(grok --permission-mode bypassPermissions)
   [[ -n ${prompt:-} ]] && command+=(-- "$prompt")
