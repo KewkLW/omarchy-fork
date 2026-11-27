@@ -43,6 +43,12 @@ copy_boundary_file install/helpers/pacman.sh
 # Channel changes copy the platform's templates; the copy itself is a stand-in.
 cp -r "$ROOT/default/pacman" "$SUDO_TEST_ROOT/default/"
 
+# The update prints its messages through omarchy-i18n, in English here.
+copy_boundary_file bin/omarchy-i18n
+mkdir -p "$SUDO_TEST_ROOT/default/i18n/en"
+cp "$ROOT/default/i18n/en/cli.json" "$SUDO_TEST_ROOT/default/i18n/en/"
+cp "$ROOT/default/i18n/plural.jq" "$ROOT/default/i18n/locales.json" "$SUDO_TEST_ROOT/default/i18n/"
+
 # Channel changes ask for the platform. x86 unless a test says otherwise, so no
 # test reads the host's hardware.
 cat >"$SUDO_TEST_ROOT/bin/omarchy-hw-platform" <<'STUB'
@@ -50,6 +56,19 @@ cat >"$SUDO_TEST_ROOT/bin/omarchy-hw-platform" <<'STUB'
 echo "${SUDO_TEST_PLATFORM:-x86}"
 STUB
 chmod +x "$SUDO_TEST_ROOT/bin/omarchy-hw-platform"
+
+# omarchy update lists the units that had already failed and the boot loader
+# Omarchy manages. Neither comes from the host, and neither is a step: the
+# event log stays as it was. Limine unless a test says otherwise.
+cat >"$SUDO_TEST_ROOT/bin/systemctl" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+cat >"$SUDO_TEST_ROOT/bin/omarchy-boot-backend" <<'STUB'
+#!/bin/bash
+echo "${SUDO_TEST_BOOT_BACKEND:-limine}"
+STUB
+chmod +x "$SUDO_TEST_ROOT/bin/systemctl" "$SUDO_TEST_ROOT/bin/omarchy-boot-backend"
 
 cat >"$SUDO_TEST_ROOT/mock/sudo" <<'STUB'
 #!/bin/bash
@@ -123,7 +142,7 @@ case "$step" in
 esac
 STUB
 chmod +x "$SUDO_TEST_ROOT/bin/test-step"
-for step in omarchy-update-lock omarchy-update-requires-free-space omarchy-update-confirm omarchy-update-pkg-prune omarchy-snapshot omarchy-update-stay-awake omarchy-update-dev omarchy-update-boot omarchy-update-keyring omarchy-update-system-pkgs omarchy-migrate omarchy-hook omarchy-update-aur-pkgs omarchy-update-mise omarchy-update-orphan-pkgs omarchy-update-analyze-logs omarchy-shell omarchy-update-restart omarchy-pkg-aur-accessible omarchy-notification-dismiss omarchy-restart-shell pacman systemd-run cp yay; do
+for step in omarchy-update-lock omarchy-update-requires-free-space omarchy-update-confirm omarchy-update-pkg-prune omarchy-snapshot omarchy-update-stay-awake omarchy-update-dev omarchy-update-boot omarchy-update-keyring omarchy-update-system-pkgs omarchy-migrate omarchy-hook omarchy-update-aur-pkgs omarchy-update-mise omarchy-update-orphan-pkgs omarchy-update-analyze-logs omarchy-shell omarchy-update-restart omarchy-update-health omarchy-pkg-aur-accessible omarchy-notification-dismiss omarchy-restart-shell pacman systemd-run cp yay; do
   ln -s test-step "$SUDO_TEST_ROOT/bin/$step"
 done
 ln -s ../bin/test-step "$SUDO_TEST_ROOT/mock/pacman"
@@ -131,5 +150,5 @@ ln -s ../bin/test-step "$SUDO_TEST_ROOT/mock/pacman"
 reset_boundary() {
   : >"$SUDO_TEST_LOG"
   /usr/bin/rm -f "$SUDO_TEST_CACHE"
-  unset SUDO_TEST_FAIL_STEP SUDO_TEST_SIGNAL_STEP SUDO_TEST_SUDO_FAIL SUDO_TEST_PLATFORM
+  unset SUDO_TEST_FAIL_STEP SUDO_TEST_SIGNAL_STEP SUDO_TEST_SUDO_FAIL SUDO_TEST_PLATFORM SUDO_TEST_BOOT_BACKEND
 }

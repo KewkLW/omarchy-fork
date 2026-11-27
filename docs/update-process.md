@@ -21,7 +21,7 @@ The design goal is:
 
 | Path | Owner | Purpose |
 | --- | --- | --- |
-| `${XDG_RUNTIME_DIR:-/tmp}/omarchy-update.lock` | user | Prevent overlapping update runs. Owned by `omarchy-update-lock`; compatibility wrappers inherit/respect it. |
+| `${XDG_RUNTIME_DIR}/omarchy-update.lock` | user | Prevent overlapping update runs. Owned by `omarchy-update-lock`; compatibility wrappers inherit/respect it. If no runtime directory is available, the helper uses the validated mode-0700 `/tmp/omarchy-$UID/` fallback. |
 | `${XDG_RUNTIME_DIR}/omarchy-update-stay-awake/` | user | Private mode-0700 inhibitor coordination state. If no runtime directory is available, the helper uses the validated mode-0700 `/tmp/omarchy-$UID/` fallback. |
 | `/tmp/omarchy-update.log` | user | Transcript of `omarchy update`, used by `omarchy-update-analyze-logs`. |
 | `~/.local/state/omarchy/current/` | user | Generated active theme, selected theme name, and current background symlink. |
@@ -141,6 +141,8 @@ omarchy-update
   │    └─ the platform's boot package proves the boot files boot the updated system
   ├─ omarchy-update-stay-awake stop
   │    └─ release the sleep inhibitor and restore shell idle state, if changed
+  ├─ omarchy-update-health
+  │    └─ report whether the desktop and services answer; never prompts or fails
   └─ offer the unprivileged reboot prompt, only when the boot files were verified
 ```
 
@@ -160,6 +162,7 @@ Important behavior:
   `omarchy-migrate` after pacman finishes.
 - A failure should leave enough output in `/tmp/omarchy-update.log` and the
   terminal transcript to debug.
+- `omarchy-update-health` runs read-only probes after every other step and before the reboot offer: Hyprland, the Omarchy shell and the notification server answer, PipeWire answers with WirePlumber connected, NetworkManager reports a connected state, no system or user units have failed during the update, `pacman -Dkq` finds the package database consistent, and `omarchy-version` prints a version. Each probe runs under a timeout (`OMARCHY_UPDATE_HEALTH_TIMEOUT`, a positive number of seconds, default 5) and passes, fails, or is skipped with its reason; only its stdout is read as its answer, and stderr is kept as the reason when it fails (for the package database, also as the list of problems pacman found). Nothing is started by asking: Hyprland is probed through the session's instance signature, or the newest instance whose socket is still there when the inherited one is stale or unset; the shell and notifications are probed only when a Wayland display socket exists, the shell through the session's `OMARCHY_PATH` from the user manager and notifications with `busctl --auto-start=no`, skipped rather than failed when no server answers and the shell reports its own turned off (`omarchy plugin disable omarchy.notifications`); audio only when `pipewire.service` and `wireplumber.service` are already running, since PipeWire is socket activated and its socket exists on every TTY or SSH login. An update from a TTY or over SSH with no desktop running therefore skips Hyprland, the shell, notifications and audio. At its start `omarchy-update` lists the units that had already failed, system and user, and the problems `pacman -Dkq` already reported, in a temporary directory passed as `OMARCHY_UPDATE_HEALTH_BASELINE` and removed on exit; those units and problems are noted, not failed. Run on its own, as `omarchy update health`, the report has no such list: it fails every failed unit with a note that it may predate any update, and every package database problem. The report is information only: it never prompts, needs no privilege, exits 0, and the update ignores its status, so `-y` runs are unaffected. When a check fails and the update took a snapshot on a machine whose boot loader Omarchy manages (`omarchy-boot-backend` is not `none`; `OMARCHY_UPDATE_HEALTH_SNAPSHOT=1`), the summary says to reboot, pick that snapshot in the boot menu, then run `omarchy snapshot restore`, which makes the booted snapshot the system on Limine and on systemd-boot alike; without one it offers no rollback. Nothing is rolled back automatically, because a snapshot restore rewinds `/` without rewinding the migration markers in `$HOME` (#9828).
 - The boot check is the [lifecycle dispatch](lifecycle-dispatch.md) operation `update-verify`, a no-op on platforms whose boot chain needs no handling of its own, x86 included: nothing runs and nothing asks for root. It is the last sudo-capable step, after AUR packages, so it also covers the initramfs rebuilds they trigger. When it fails, the update finishes its remaining steps, then exits non-zero without the reboot prompt: the update is not finished. A machine without its platform's boot package at all predates it: the update warns that its boot files were not verified and finishes. There is no check before the packages change: where `omarchy-hw-platform` can't tell the platform, the update installs its packages, and the update then fails verification, without the reboot prompt.
 
 ## Path 2: direct `sudo pacman -Syu` attempt
@@ -194,11 +197,7 @@ definition already being applied a step away. It checks again after waiting for
 the notification server, since that wait is long enough for an update to start
 underneath it.
 
-The notifier reads only its own user's runtime directory, never the `/tmp` path
-`omarchy-update` falls back to when `XDG_RUNTIME_DIR` is unset. A shared lock
-file belongs to whoever created it first, so honouring it would let one user
-silence another user's notification. Missing an update and showing a redundant
-toast is the better failure.
+The notifier reads only its own user's runtime directory. When `XDG_RUNTIME_DIR` is unset, `omarchy-update-lock` falls back to `/tmp/omarchy-$UID/omarchy-update.lock` in a validated mode-0700 directory; the notifier does not probe that fallback. An update started without a runtime directory can therefore leave a redundant migration toast, while never trusting a shared `/tmp` lock.
 
 Suppression is why `omarchy-update-stay-awake` starts its sleep inhibitor with
 the lock descriptor closed. That inhibitor outlives the step that starts it, so
@@ -244,6 +243,7 @@ omarchy-update-available
 - new upstream commits for the active dev-linked checkout
 - `omarchy-dev`, when installed
 - otherwise `omarchy`, when installed
+- any repository package, until this user's first `omarchy update` has upgraded the system (the `first-update` done marker). A machine installed from older media needs that first update even when Omarchy's own package is current, so this is how first boot prompts for it instead of a toast.
 
 The dev check fetches the checkout's configured upstream before comparing it
 with `HEAD`. A failed fetch is quiet and falls back to the existing remote-
@@ -306,6 +306,7 @@ scripts.
 | `omarchy-update-orphan-pkgs` | Lists orphans and prompts before removal unless passed `-y`, as the update pipeline does; standalone noninteractive mode only reports. | **Keep for now.** Automates cleanup during updates and supports standalone review. |
 | `omarchy-update-analyze-logs` | Scans `/tmp/omarchy-update.log` for known failure patterns, currently initramfs generation. | **Keep/expand.** Useful safety net; should grow only for high-signal checks. |
 | `omarchy-update-boot` | Hidden helper that runs the platform's `update-verify` lifecycle operation through `omarchy-lifecycle-dispatch`, with `sudo` only when the platform implements it. | **Keep internal/hidden.** Keeps platform boot checks out of the pipeline and stubbable in tests. |
+| `omarchy-update-health` | Read-only post-update probes for the desktop, audio, network, failed units, package database and Omarchy version; each passes, fails, or is skipped under a timeout. Information only: never prompts, always exits 0. | **Keep.** Also useful on its own as `omarchy update health`. |
 | `omarchy-update-restart` | Restarts components selected by `restart-*-required` markers, always restarts the shell, and prompts for reboot after kernel/Hyprland updates. Internal phase flags let the update finish sudo-capable restarts before user hooks and defer only the unprivileged reboot prompt. | **Keep.** Important final step; may eventually include service-restart checks. |
 | `omarchy-update-firmware` | Manual firmware update command using fwupd. Not part of the normal update pipeline. | **Keep separate.** Firmware is not a routine system update step. |
 | `omarchy-update-time` | Restarts `systemd-timesyncd`. | **Question.** Not really an update command. Consider renaming/moving under system/time maintenance. |

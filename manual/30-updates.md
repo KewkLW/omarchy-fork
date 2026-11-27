@@ -18,11 +18,11 @@ Before any new major release, we'll be doing final validation using the RC chann
 
 Finally, there's the dev channel, which links Omarchy directly to a git checkout of the source code in `~/omarchy`, combined with the edge packages. You should only use this channel if you're an experienced Linux user, working directly on Omarchy, and willing to tolerate breakage.
 
-You can switch between channels using _Update > Channel_ from the Omarchy menu (or `omarchy-channel-set` in the terminal).
+You can switch between channels using _Update > Channel_ from the Omarchy menu (or `omarchy channel set <stable|rc|edge|dev>` in the terminal, with `omarchy channel current` to see where you are).
 
 ### Switching kernels
 
-Omarchy boots its own `linux-omarchy` kernel, but you can keep others installed next to it, like the stock Arch `linux` kernel or an experimental build you're testing. When there's more than one, _Update > Kernel_ in the Omarchy menu lists them with a check next to the one that boots by default. Pick another, enter your password once, and it'll boot after the next restart. The other kernels stay in the boot menu, so you can still pick one by hand if the new default gives you trouble. In the terminal, it's `omarchy-kernel` to see the current default, `omarchy-kernel list` for what's installed, and `omarchy-kernel set <kernel>` to switch.
+Omarchy boots its own `linux-omarchy` kernel, but you can keep others installed next to it, like the stock Arch `linux` kernel or an experimental build you're testing. When there's more than one, _Update > Kernel_ in the Omarchy menu lists them with a check next to the one that boots by default. Pick another, enter your password once, and it'll boot after the next restart. The other kernels stay in the boot menu, so you can still pick one by hand if the new default gives you trouble. In the terminal, it's `omarchy kernel` to see the current default, `omarchy kernel list` for what's installed, and `omarchy kernel set <kernel>` to switch.
 
 ### Firmware updates
 
@@ -34,10 +34,14 @@ When you need to change a setting in the BIOS itself, hold `Alt` in the system m
 
 If you're already familiar with Arch, you might be tempted to just run `pacman -Syu` or `yay -Syu` yourself, but if you do that, you'll miss the snapshot, migrations, and configuration updates that Omarchy runs together with new packages. That's why Omarchy will actually stop a direct system upgrade and point you to `omarchy update` instead. (If you really know what you're doing, the guard will tell you how to bypass it for a single transaction.)
 
+### Checking the update landed
+
+At the end of every update that completes, Omarchy checks that Hyprland, the shell, notifications, audio and the network still answer, that no services have failed during the update, and that the package database is consistent, and lists anything that didn't pass. A service that had already failed before the update, or a package database problem that was already there, is noted rather than counted against it. The check only reports, never stops the update, and you can run it again any time with `omarchy update health`; run on its own, it can't tell which failures predate the last update.
+
 ### Rolling back bad updates
 
 If you ever have a problem after doing an update, you can rollback your system to the snapshot taken before the update. Just restart and pick the snapshot in the boot loading menu from before you started the update.
 
 ![bootloader](images/bootloader.webp)
 
-If somehow your configuration files have been corrupted, you can also perform an Omarchy reinstall using `omarchy reinstall` in the terminal. This will reinstall all the default Omarchy packages, put you on stable and downgrade any packages that are too new, and reset all the configuration files. Note that all your user config changes to the Omarchy defaults will be overwritten doing this!
+If somehow your configuration files have been corrupted, you can also perform an Omarchy reinstall using `omarchy reinstall` in the terminal. This will reinstall all the default Omarchy packages, put you on stable (edge on Apple Silicon) and downgrade any packages that are too new, and reset all the configuration files. Note that all your user config changes to the Omarchy defaults will be overwritten doing this!
