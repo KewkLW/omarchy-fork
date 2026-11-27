@@ -142,7 +142,7 @@ comp_jobs_env=""
 if [[ -n ${OMARCHY_TEST_COMP_JOBS:-} ]]; then
   printf -v comp_jobs_env ' OMARCHY_TEST_COMP_JOBS=%q' "$OMARCHY_TEST_COMP_JOBS"
 fi
-command="export OMARCHY_PATH=~/src/omarchy PATH=~/src/omarchy/bin:\$PATH OMARCHY_TEST_USE_LIVE_COMPOSITOR=1${comp_jobs_env}; cd ~/src/omarchy && date +%s.%N >~/started && ./test/all${args_quoted} >~/run.log 2>&1; echo \"\$?\" >~/rc.next && mv ~/rc.next ~/rc"
+command="export OMARCHY_PATH=~/src/omarchy PATH=~/src/omarchy/bin:\$PATH OMARCHY_TEST_USE_LIVE_COMPOSITOR=1${comp_jobs_env}; cd ~/src/omarchy && date +%s.%N >~/started && ./test/seat-capture >~/run.log 2>&1; echo \"\$?\" >~/rc.next && mv ~/rc.next ~/rc"
 ssh_vm "systemd-run --user --quiet --collect --same-dir \
   -E OMARCHY_PKGS_PATH=\$HOME/src/omarchy-pkgs bash -c $(printf %q "$command")"
 last_report="" next_report=0
@@ -181,6 +181,7 @@ ssh_vm 'systemd-analyze; systemd-analyze blame | head -25' >"$out/boot.txt" 2>&1
 ssh_vm 'echo "source tree: $(cd ~/src/omarchy && git status --porcelain | wc -l) changed files"'
 pull_kernel_log
 
-sed -n '/^\(Skipped checks in\|All [0-9][0-9]* test files passed\.\|[0-9][0-9]* test files completed without failures\|[0-9][0-9]* of [0-9][0-9]* test files failed:\|Slowest test files:\)/,$p' "$out/run.log"
+echo "test/ci-vm: TEMP capture log follows"
+cat "$out/run.log"
 # The tests' verdict is the run's verdict.
 [[ $rc == "0" ]]
