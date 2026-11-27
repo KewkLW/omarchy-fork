@@ -59,6 +59,8 @@ Icons are resolved in the shell, the way the dock resolves its own, by each card
 3. The icon of a desktop entry matching the hint, source or app (`DesktopEntries.heuristicLookup`); for a site, only the browser's, since a fuzzy match on a domain label would put Google Contacts on `mail.google.com`.
 4. The glyph an Omarchy sender asked for, else the first letter of the source.
 
+When Qt's themed lookup misses a name, the card also checks the app library's file index, which refreshes when desktop entries change. This picks up newly installed app icons without restarting the shell, including names whose earlier lookup failed. The index contains app and device icons across installed themes and `/usr/share/pixmaps`; it is checked only when the active theme misses. Copying an icon file alone does not trigger a rescan. A missing name still falls through to the glyph or letter.
+
 An icon named `*-symbolic`, or a file under a `symbolic/` directory, is a one-colour mark and is tinted with the theme's text colour.
 
 A site's icon is never fetched: the site name comes from the notification body and a browser is recognised by its self-asserted app name, so fetching would let any sender make the host contact a server of its choosing.
@@ -215,6 +217,7 @@ Everything goes through the same sender contract, so the pieces are small:
   after `graphical-session.target`) waits for the server, then sends a
   critical toast whose click opens a terminal running `omarchy-migrate`,
   falling back to printing in the terminal if the hand-off fails.
+- **Memory watchdog** — `omarchy-memory-watch` (opt-in, via `omarchy-toggle-memory-watch`) samples `/proc/meminfo`, `/proc/pressure/memory` and app.slice's own `memory.pressure`. Two samples past the warning line (swap 50% with RAM 80%, RAM 90% with a 20% stall, or a 25% stall at any RAM use, since oomd's stall line has none; never swap alone, since oomd's swap line needs RAM past 90% too and pages stay in swap long after RAM frees up) send a critical toast naming the largest process group, at most every five minutes. systemd-oomd only kills whole units in app.slice, never the compositor or anything else in session.slice, and only once RAM and swap are both more than 90% used or app.slice's stall holds 50% for 20s. `omarchy-memory-oomd-kills` follows the user journal for the user manager's "systemd-oomd killed" message and sends a critical toast naming the app, from the snapshot the watcher took while memory was tight, and why, from the system journal when this user can read it. The watcher starts the follower again if it stops. Its brake (swap 75% with RAM 85%, or RAM 97% with a 40% stall, on one sample; or a 40% stall at any RAM use held for three samples; never swap alone, for the same reasons) sends a critical toast when it pauses a process group, saying `omarchy memory resume` undoes it, unless the watcher is being stopped as it pauses (a TERM mid-brake): then only `watch.log` and `frozen.tsv` record the pause, and turning the watchdog off resumes it anyway. It pauses one group at a time, of at least 1 GiB (RSS plus swap, an approximate ranking that counts shared pages once per process), and nothing more while that one is still paused. A pause frees no memory; it only stops the climb. What `omarchy memory resume` let go of is left alone for five minutes.
 
 ## Reminders
 
