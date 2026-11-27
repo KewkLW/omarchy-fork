@@ -14,8 +14,19 @@ mkdir -p "$OUT"
 WANTED=(trigger-menu-seat-rows trigger-menu-seat-rows-filtered agent-window-outlined)
 log() { printf 'capture: %s\n' "$*" | tee -a "$OUT/log.txt"; }
 reason() { printf '%s\n' "$2" >"$OUT/$1.reason.txt"; log "NO $1: $2"; }
+# The image's own first-login toasts (welcome, keybindings, agent setup) land
+# on the scratch shell a minute or so after login; clear every card before
+# each frame so none covers what the frame is of.
+clear_toasts() {
+  [[ -n $SCRATCH_ROOT ]] || return 0
+  local result
+  result=$(scratch_ipc notifications dismissAll 2>&1)
+  sleep 1
+  log "dismissAll before the frame: $result"
+}
 shot() {
   local name="$1"
+  clear_toasts
   if grim "$OUT/$name.png" 2>>"$OUT/log.txt"; then
     log "shot $name.png ($(stat -c %s "$OUT/$name.png") bytes)"
   else
@@ -61,13 +72,13 @@ fi
 pkill -f omarchy-launch-shell
 [[ -n $session_path ]] && timeout 30 quickshell kill -p "$session_path/shell" --any-display >/dev/null 2>&1
 sleep 1
-log "quickshell after stopping the session's: $(quickshell list -a -j 2>&1 | jq -c '[.[].config_path]' 2>&1)"
+log "quickshell after stopping the session's: $(quickshell list -a -j 2>&1 | head -c 300)"
 
 setup_scratch_shell
 mkdir -p "$SCRATCH_HOME/.local/state/omarchy" "$SCRATCH_HOME/.config"
 cp -a "$HOME/.local/state/omarchy/current" "$SCRATCH_HOME/.local/state/omarchy/" 2>>"$OUT/log.txt"
 cp -a "$HOME/.config/omarchy" "$SCRATCH_HOME/.config/" 2>>"$OUT/log.txt"
-log "seeded theme: $(readlink "$SCRATCH_HOME/.local/state/omarchy/current/theme" 2>&1)"
+log "seeded theme: $(ls -la "$SCRATCH_HOME/.local/state/omarchy/current/" 2>&1 | head -c 400 | tr '\n' ' ')"
 start_scratch_shell
 shell_up=""
 for _ in {1..150}; do
@@ -77,7 +88,21 @@ for _ in {1..150}; do
 done
 log "scratch shell answers: ${shell_up:-no}"
 sleep 3
-log "quickshell now: $(quickshell list -a -j 2>&1 | jq -c '[.[].config_path]' 2>&1)"
+log "quickshell now: $(quickshell list -a -j 2>&1 | head -c 300)"
+
+# Let the image's first run send its toasts before the frames: its done marker,
+# then its detached network step, which sends the agent setup toast.
+for _ in {1..120}; do
+  [[ -e $HOME/.local/state/omarchy/done/first-run-user ]] && break
+  sleep 1
+done
+for _ in {1..60}; do
+  pgrep -f 'first-run/wifi.sh' >/dev/null || break
+  sleep 1
+done
+sleep 3
+log "first run: done markers $(ls "$HOME/.local/state/omarchy/done" 2>&1 | tr '\n' ' '); wifi.sh still running: $(pgrep -fa 'first-run/wifi.sh' | head -c 200)"
+clear_toasts
 
 # A browser the image ships, on the seat, through the documented invocation, on
 # a local page shared read-only.
