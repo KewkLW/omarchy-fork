@@ -63,6 +63,19 @@ if [[ ${agent:-} == claude-* ]]; then
   export CLAUDE_CONFIG_DIR="${dir/#\~/$HOME}"
   agent=claude
 fi
+# agy-<id> is an extra agy (Antigravity) Google account from agy-accounts.json:
+# its own data directory under ~/.gemini (login, history, settings) with the
+# token kept in a file there instead of the one shared keyring slot.
+agy_dir=antigravity-cli
+if [[ ${agent:-} == agy-* ]]; then
+  accounts="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/agents/agy-accounts.json"
+  agy_dir=$(jq -r --arg id "${agent#agy-}" '.[]? | select(.id == $id) | .dir // empty' "$accounts" 2>/dev/null)
+  if [[ -z $agy_dir ]]; then
+    echo "Unknown agy account: ${agent#agy-}. List it in $accounts" >&2
+    exit 1
+  fi
+  agent=agy
+fi
 [[ -n ${agent:-} ]] || agent=$(omarchy-default-agent)
 
 # Every agent spawns with a specific, stable name for its project's life, and
@@ -125,11 +138,15 @@ claude)
 agy)
   # agy asks "do you trust this folder" for every new folder, even with
   # permissions skipped, so the folder it starts in is pre-trusted.
-  agy_settings=$HOME/.gemini/antigravity-cli/settings.json
+  agy_settings=$HOME/.gemini/$agy_dir/settings.json
   if [[ -f $agy_settings ]] && ! jq -e --arg d "$PWD" '(.trustedWorkspaces // []) | index($d)' "$agy_settings" >/dev/null 2>&1; then
     jq --arg d "$PWD" '.trustedWorkspaces = ((.trustedWorkspaces // []) + [$d])' "$agy_settings" >"$agy_settings.tmp" && chmod --reference="$agy_settings" "$agy_settings.tmp" && mv "$agy_settings.tmp" "$agy_settings"
   fi
   command=(agy --dangerously-skip-permissions)
+  if [[ $agy_dir != antigravity-cli ]]; then
+    export AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1
+    command+=(--app_data_dir="$agy_dir")
+  fi
   [[ -n ${prompt:-} ]] && command+=(--prompt-interactive "$prompt")
   ;;
 grok)
